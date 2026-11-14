@@ -1,5 +1,5 @@
 FROM python:3.12-slim-bookworm
-COPY dist/amd64/ctf-runner /usr/local/bin/ctf-runner
+COPY dist/amd64/p3y-box /usr/local/bin/p3y-box
 EXPOSE 8790
 VOLUME ["/state"]
-ENTRYPOINT ["/usr/local/bin/ctf-runner"]
+ENTRYPOINT ["/usr/local/bin/p3y-box"]

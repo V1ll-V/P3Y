@@ -13,10 +13,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/artifacts"
-	pgdb "github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/traffic"
+	"p3y/agent"
+	"p3y/artifacts"
+	pgdb "p3y/db"
+	"p3y/traffic"
 )
 
 const taskArchivePollInterval = 2 * time.Second

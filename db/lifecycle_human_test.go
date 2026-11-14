@@ -36,25 +36,12 @@ func TestLifecycleHumanAdoptionRecordsOneDecisionAndOneEvent(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, f, _ := newGuardFixture(t, d, t.Name())
-	run, conv, _, err := d.CreateFindingReview(t.Context(), f.FindingID, "check bounded scope", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = d.StartFindingRetest(t.Context(), run.ID); err != nil {
-		t.Fatal(err)
-	}
-	if err = d.RecordFindingReviewResult(t.Context(), conv.ID, FindingReviewConfirmed, "high", "bounded support", "local proof", "", "", ""); err != nil {
-		t.Fatal(err)
-	}
-	if err = d.FinishFindingRetest(run.ID, "completed", ""); err != nil {
-		t.Fatal(err)
-	}
 	row, _, err := d.FindingVerdictByID(t.Context(), f.FindingID)
 	if err != nil || row.HumanRevision != 0 || FindingVerdictEffective(row.State()) {
-		t.Fatalf("model review adopted itself: %+v %v", row, err)
+		t.Fatalf("unexpected initial verdict: %+v %v", row, err)
 	}
 	status := FindingConfirmed
-	if _, err = d.SetFindingReviewDecision(t.Context(), f.FindingID, FindingReviewConfirmed, "human adopted", &run.ID, &status, nil); err != nil {
+	if _, err = d.SetFindingReviewDecision(t.Context(), f.FindingID, FindingReviewConfirmed, "human adopted", nil, &status, nil); err != nil {
 		t.Fatal(err)
 	}
 	row, _, err = d.FindingVerdictByID(t.Context(), f.FindingID)

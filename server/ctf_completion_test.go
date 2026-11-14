@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/artex/ctf"
-	"github.com/Autumn-27/artex/db"
+	"p3y/ctf"
+	"p3y/db"
 	"github.com/google/uuid"
 )
 

@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/artex/config"
+	"p3y/config"
 	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib" // pgx database/sql driver ("pgx")
 )
@@ -87,7 +87,7 @@ func coordinateWithSchemaMigration(tx *sql.Tx) error {
 }
 
 // DSN resolves the PostgreSQL connection string and reports where it came from.
-// Precedence: env ARTEX_PG_DSN > config file (config.json). There is no
+// Precedence: env P3Y_PG_DSN > config file (config.json). There is no
 // built-in default — it errors if neither source is configured.
 func DSN() (dsn, source string, err error) {
 	return config.PostgresDSN()
@@ -278,9 +278,6 @@ ON CONFLICT (name) DO NOTHING`,
 	}
 	if err := d.seedDefaultInterceptRulesV3(); err != nil {
 		return fmt.Errorf("seed intercept rules v3: %w", err)
-	}
-	if err := d.seedDefaultAssetInterceptRules(); err != nil {
-		return fmt.Errorf("seed asset intercept rules: %w", err)
 	}
 	// V1 历史过渡:升级前已存在的 finding 标 legacy 来源,已判误报的转为可追溯的
 	// 人工否定。由 settings 守卫只跑一次(不能放进幂等的 schema.sql)。

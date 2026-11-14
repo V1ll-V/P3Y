@@ -3,9 +3,9 @@ package ctf
 import (
 	"context"
 	"fmt"
-	"github.com/Autumn-27/artex/artifacts"
-	"github.com/Autumn-27/artex/ctfrunner"
-	"github.com/Autumn-27/artex/db"
+	"p3y/artifacts"
+	"p3y/ctfrunner"
+	"p3y/db"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -16,10 +16,10 @@ import (
 // Opt-in: this test compiles and solves its own tiny binaries in the same
 // resource-limited containers used by real tasks. It never uses the app host shell.
 func TestPwnREExecutionEvidenceWPAndArchive(t *testing.T) {
-	if os.Getenv("ARTEX_CTF_DOCKER_TEST") != "1" {
-		t.Skip("set ARTEX_CTF_DOCKER_TEST=1 with a test PostgreSQL and Docker socket")
+	if os.Getenv("P3Y_BOX_DOCKER_TEST") != "1" {
+		t.Skip("set P3Y_BOX_DOCKER_TEST=1 with a test PostgreSQL and Docker socket")
 	}
-	dsn := os.Getenv("ARTEX_PG_DSN")
+	dsn := os.Getenv("P3Y_PG_DSN")
 	if dsn == "" {
 		t.Fatal("test database required")
 	}
@@ -40,10 +40,10 @@ func TestPwnREExecutionEvidenceWPAndArchive(t *testing.T) {
 	}
 	defer pg.DeleteTask(task.ID)
 	root := t.TempDir()
-	runner := &ctfrunner.Client{URL: os.Getenv("ARTEX_CTF_TEST_RUNNER_URL"), Token: os.Getenv("ARTEX_CTF_TEST_RUNNER_TOKEN")}
+	runner := &ctfrunner.Client{URL: os.Getenv("P3Y_BOX_TEST_URL"), Token: os.Getenv("P3Y_BOX_TEST_TOKEN")}
 	var engine *ctfrunner.Engine
 	if runner.URL == "" {
-		engine = ctfrunner.DockerEngine("/var/run/docker.sock", "autumn27/artex-ctf-tools:20261109")
+		engine = ctfrunner.DockerEngine("/var/run/docker.sock", "p3y/p3y-box-tools:20261109")
 		controller := &ctfrunner.Server{Engine: engine, Token: strings.Repeat("test-", 8), StateDir: t.TempDir()}
 		httpServer := httptest.NewServer(controller.Handler())
 		defer httpServer.Close()
@@ -54,7 +54,7 @@ func TestPwnREExecutionEvidenceWPAndArchive(t *testing.T) {
 	source := `#include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
-void win(void){ puts("flag{artex_synthetic_ret2win}"); fflush(stdout); _exit(0); }
+void win(void){ puts("flag{p3y_synthetic_ret2win}"); fflush(stdout); _exit(0); }
 void vuln(void){ char b[32]; read(0,b,256); }
 int check(unsigned char x){ return (x ^ 0x55) == 0x12; }
 int main(void){ vuln(); return 0; }
@@ -66,9 +66,9 @@ int main(void){ vuln(); return 0; }
 	m, _ := store.Inputs(task.ID, s.EffectiveSessionIntent(t.Context(), task.ID, 101))
 	spec := ctfrunner.SessionSpec{TaskID: task.ID, IntentID: s.EffectiveSessionIntent(t.Context(), task.ID, 101), InputHash: Hash(m)}
 	if engine != nil {
-		defer engine.Remove(context.Background(), "artex-ctf-"+spec.Key())
+		defer engine.Remove(context.Background(), "p3y-box-"+spec.Key())
 	} else {
-		t.Logf("external runner session: artex-ctf-%s", spec.Key())
+		t.Logf("external runner session: p3y-box-%s", spec.Key())
 	}
 	exec := func(command string, timeout int) *db.CTFExecution {
 		t.Helper()
@@ -92,7 +92,7 @@ int main(void){ vuln(); return 0; }
 		t.Fatal("Ghidra did not decompile checker")
 	}
 	exec("ctf-python-re -c 'from angr import claripy; x=claripy.BVS(\"x\",8); s=claripy.Solver(); s.add(x ^ 0x55 == 0x12); print(s.eval(x,1))'", 60)
-	exec("test ! -e /var/run/docker.sock; test ! -e /app/config.json; test -z \"${ARTEX_PG_DSN:-}\"; test ! -w /usr/bin; test ! -w "+s.LogicalPath(a), 30)
+	exec("test ! -e /var/run/docker.sock; test ! -e /app/config.json; test -z \"${P3Y_PG_DSN:-}\"; test ! -w /usr/bin; test ! -w "+s.LogicalPath(a), 30)
 	solver := `from pwn import *
 context.binary = elf = ELF('./challenge', checksec=False)
 rop = ROP(elf)
@@ -104,7 +104,7 @@ print(p.recvall(timeout=3).decode())
 		t.Fatal(err)
 	}
 	solved := exec("python solve.py", 60)
-	if !strings.Contains(solved.StdoutExcerpt, "flag{artex_synthetic_ret2win}") {
+	if !strings.Contains(solved.StdoutExcerpt, "flag{p3y_synthetic_ret2win}") {
 		t.Fatal("pwntools did not solve sample")
 	}
 	if _, err = s.Execute(t.Context(), task.ID, 101, "echo should-wait-for-submission", 10); err == nil {

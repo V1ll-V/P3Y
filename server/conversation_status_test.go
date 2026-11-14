@@ -9,7 +9,7 @@ import (
 func TestConversationListRunningState(t *testing.T) {
 	s, _ := newRetestServer(t)
 	var ids []int64
-	for _, key := range []string{"auto", "reporter", "retester"} {
+	for _, key := range []string{"auto", "planner", "worker"} {
 		c, err := s.m.pg.CreateConversation(key, "runtime status test", nil)
 		if err != nil {
 			t.Fatal(err)

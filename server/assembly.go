@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/traffic"
+	"p3y/agent"
+	"p3y/db"
+	"p3y/traffic"
 	"github.com/Autumn-27/norma/skill"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -356,7 +356,7 @@ func buildDomainReg(as *db.AssetStore) map[string]actool.CoreTool {
 		return nil
 	}
 	serverTS := agent.NewToolSet(nil, "")
-	serverTS.SetAssetStore(as, as.Companies())
+	serverTS.SetAssetStore(as)
 	reg := make(map[string]actool.CoreTool)
 	for _, t := range serverTS.AllDomainTools() {
 		reg[t.Name()] = t

@@ -901,13 +901,6 @@ DROP TRIGGER IF EXISTS trg_mcp_upd ON mcp_servers;
 CREATE TRIGGER trg_mcp_upd BEFORE UPDATE ON mcp_servers
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
--- 默认数据源占位：ScopeSentry 资产同步 MCP（地址与认证均留空、未启用）。
--- 供「资产同步」页检测数据源是否已配置；用户在页面填入 url 与 X-API-Key 后再启用。
--- 仅在缺失时插入，绝不覆盖用户已配置/已启用的服务器（schema.sql 每次启动都会 Exec）。
-INSERT INTO mcp_servers (name, transport, url, env, enabled)
-VALUES ('ScopeSentry', 'http', NULL, '{"X-API-Key":""}', false)
-ON CONFLICT (name) DO NOTHING;
-
 CREATE TABLE IF NOT EXISTS mcp_tools_cache (
     id            BIGSERIAL PRIMARY KEY,
     server_id     BIGINT NOT NULL REFERENCES mcp_servers(id) ON DELETE CASCADE,
@@ -1692,3 +1685,92 @@ CREATE TABLE IF NOT EXISTS verification_config_migrations (
     result JSONB NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- p3y Stage 3: Phase-0 Precheck, 3-Tier Shared Board, Reusable Kits & Distilled Tips
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS precheck_result JSONB;
+
+CREATE TABLE IF NOT EXISTS board_items (
+    id          BIGSERIAL PRIMARY KEY,
+    task_id     BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    parent_id   BIGINT,
+    kind        TEXT NOT NULL CHECK (kind IN ('fact','step','savepoint','deadend')),
+    title       TEXT NOT NULL DEFAULT '',
+    summary     TEXT NOT NULL DEFAULT '',
+    detail      TEXT NOT NULL DEFAULT '',
+    snapshot_id TEXT NOT NULL DEFAULT '',
+    check_cmd   TEXT NOT NULL DEFAULT '',
+    verified    BOOLEAN NOT NULL DEFAULT FALSE,
+    meta_json   JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_board_items_task ON board_items(task_id, id);
+CREATE INDEX IF NOT EXISTS idx_board_items_kind ON board_items(task_id, kind);
+
+CREATE TABLE IF NOT EXISTS board_kits (
+    id           BIGSERIAL PRIMARY KEY,
+    task_id      BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    savepoint_id BIGINT,
+    name         TEXT NOT NULL,
+    path         TEXT NOT NULL DEFAULT '',
+    summary      TEXT NOT NULL DEFAULT '',
+    sha256       TEXT NOT NULL DEFAULT '',
+    verified     BOOLEAN NOT NULL DEFAULT FALSE,
+    meta_json    JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (task_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_board_kits_task ON board_kits(task_id, id);
+
+CREATE TABLE IF NOT EXISTS tips_cards (
+    id             BIGSERIAL PRIMARY KEY,
+    category       TEXT NOT NULL DEFAULT 'auto',
+    tags_json      JSONB NOT NULL DEFAULT '[]'::jsonb,
+    title          TEXT NOT NULL,
+    pitfall        TEXT NOT NULL DEFAULT '',
+    pattern_code   TEXT NOT NULL DEFAULT '',
+    source_task_id BIGINT,
+    hit_count      BIGINT NOT NULL DEFAULT 0,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_tips_cards_category ON tips_cards(category, hit_count DESC, id DESC);
+
+-- ============================================================
+--  Stage 5 — 自主攻防 (Attack-Defense: ad_weapons / ad_events)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS ad_weapons (
+    id             BIGSERIAL PRIMARY KEY,
+    task_id        BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    target_service TEXT NOT NULL DEFAULT '',
+    script_path    TEXT NOT NULL DEFAULT '',
+    check_cmd      TEXT NOT NULL DEFAULT '',
+    status         TEXT NOT NULL DEFAULT 'active', -- active | blocked | paused
+    targets_json   JSONB NOT NULL DEFAULT '[]'::jsonb,
+    flag_regex     TEXT NOT NULL DEFAULT '',
+    submit_url     TEXT NOT NULL DEFAULT '',
+    submit_token   TEXT NOT NULL DEFAULT '',
+    interval_sec   INTEGER NOT NULL DEFAULT 60,
+    success_count  BIGINT NOT NULL DEFAULT 0,
+    fail_count     BIGINT NOT NULL DEFAULT 0,
+    consecutive_fails INTEGER NOT NULL DEFAULT 0,
+    last_flag      TEXT NOT NULL DEFAULT '',
+    last_error     TEXT NOT NULL DEFAULT '',
+    last_run_at    TIMESTAMPTZ,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_ad_weapons_task ON ad_weapons(task_id, id);
+CREATE INDEX IF NOT EXISTS idx_ad_weapons_active ON ad_weapons(status, last_run_at);
+
+CREATE TABLE IF NOT EXISTS ad_events (
+    id          BIGSERIAL PRIMARY KEY,
+    task_id     BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    weapon_id   BIGINT,
+    role        TEXT NOT NULL, -- lead | scout | breaker | repeater | catcher | patcher
+    kind        TEXT NOT NULL, -- round_hit | alert | patch_test | lead_decision
+    target      TEXT NOT NULL DEFAULT '',
+    summary     TEXT NOT NULL,
+    detail_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_ad_events_task ON ad_events(task_id, id DESC);
+
+

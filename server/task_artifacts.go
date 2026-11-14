@@ -10,8 +10,8 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/Autumn-27/artex/artifacts"
-	"github.com/Autumn-27/artex/ctf"
+	"p3y/artifacts"
+	"p3y/ctf"
 )
 
 func (s *Server) artifactStore() artifacts.Store { return artifacts.Store{Root: s.m.dir} }

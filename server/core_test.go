@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
+	"p3y/db"
 )
 
 // TestCoreTaskLifecyclePG exercises the migrated core (tasks/exploration on PG)
@@ -37,7 +37,7 @@ func TestCoreTaskLifecyclePG(t *testing.T) {
 	query := uri.Query()
 	query.Set("search_path", schema)
 	uri.RawQuery = query.Encode()
-	t.Setenv("ARTEX_PG_DSN", uri.String())
+	t.Setenv("P3Y_PG_DSN", uri.String())
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)

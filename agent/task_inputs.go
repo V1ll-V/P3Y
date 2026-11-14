@@ -10,10 +10,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/artex/artifacts"
-	"github.com/Autumn-27/artex/ctf"
-	"github.com/Autumn-27/artex/ctfrunner"
-	"github.com/Autumn-27/artex/db"
+	"p3y/artifacts"
+	"p3y/ctf"
+	"p3y/ctfrunner"
+	"p3y/db"
 )
 
 // Constructed on every run, outside compactable conversation history. Binary
@@ -72,6 +72,25 @@ func taskInputContextForRole(root string, ts *db.ExplorationStore, taskID, inten
 		} else {
 			fmt.Fprintf(&b, "\n\n【CTF 任务模式】题型=%s | 验收方式=%s。采用 CTF 专用的求解和提交交接流程；最终目标以题目要求和用户目标为准。纯附件题不推断网络资产或扩展扫描范围。工具缺失须明确说明；历史题解和模型文本只是线索，不能代替真实输出或平台验证。\n", challenge, verifyDesc)
 			b.WriteString(ctfCategoryPrompt(challenge, m.Files))
+		}
+		if preRaw, perr := ts.Database().TaskPrecheck(context.Background(), taskID); perr == nil && len(preRaw) > 0 {
+			var pre ctf.PrecheckResult
+			if json.Unmarshal(preRaw, &pre) == nil {
+				fmt.Fprintf(&b, "\n【Phase-0 0-LLM Precheck 化验单】%s\n", pre.Summary)
+				if len(pre.Targets) > 0 {
+					fmt.Fprintf(&b, "识别靶标: %s\n", strings.Join(pre.Targets, ", "))
+				}
+				if len(pre.MatchedTips) > 0 {
+					b.WriteString("【命中避坑卡 Tips】\n")
+					limit := min(len(pre.MatchedTips), 3)
+					for _, tip := range pre.MatchedTips[:limit] {
+						fmt.Fprintf(&b, "- [%s] %s：%s\n", tip.Category, tip.Title, tip.Pitfall)
+					}
+				}
+			}
+		}
+		if boardIdx := ts.Database().RenderBoardIndex(context.Background(), taskID); boardIdx != "" {
+			b.WriteString(boardIdx)
 		}
 		if vpnCfg, vpnHash, vpnFilename, vpnErr := ts.Database().TaskCTFVPN(context.Background(), taskID); vpnErr == nil && vpnHash != "" {
 			if prof, parseErr := ctfrunner.ParseWireGuardConfig(vpnCfg); parseErr == nil {

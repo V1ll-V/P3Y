@@ -115,7 +115,7 @@ def probe_target(target_str, timeout=10.0):
     else:
         if hint_scheme in ("http", "https") or port in (80, 8080, 8000, 8888, 5000):
             try:
-                http_req = f"GET / HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: ARTEX-CTF-Probe/1.0\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+                http_req = f"GET / HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: P3Y-CTF-Probe/1.0\r\nAccept: */*\r\nConnection: close\r\n\r\n"
                 sock.sendall(http_req.encode())
                 sock.settimeout(3.0)
                 resp = sock.recv(16384)

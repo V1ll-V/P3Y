@@ -28,10 +28,6 @@ const ReporterDefaultPrompt = `你是授权渗透测试系统中的报告撰写�
 `
 
 func verificationContractFor(key string) string {
-	switch key {
-	case "planner", "worker", "goals", "mainagent", "auto", "pentest":
-		return VerificationLifecycleContract
-	}
 	return ""
 }
 

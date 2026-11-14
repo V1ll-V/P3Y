@@ -1,5 +1,5 @@
-# Reuse existing local artex-ctf-tools base image; adds protobuf-c toolchain, offline glibc pool, and updated Pwn/Probe scripts.
-ARG CTF_TOOLS_BASE=autumn27/artex-ctf-tools:20261109
+# Reuse existing local p3y-box-tools base image; adds protobuf-c toolchain, offline glibc pool, and updated Pwn/Probe scripts.
+ARG CTF_TOOLS_BASE=p3y/p3y-box-tools:20261109
 FROM ${CTF_TOOLS_BASE}
 
 USER root

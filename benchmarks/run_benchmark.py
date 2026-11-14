@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ARTEX CTF Automated Benchmark Suite (Node R3)
+p3y CTF Automated Benchmark Suite (Node R3)
 Evaluates end-to-end solving capabilities across:
 - Crypto (RSA, Affine, XOR)
 - Reverse (Obfuscation, UPX, angr/Z3)
@@ -20,8 +20,8 @@ import tarfile
 import io
 
 def _load_env_fallback():
-    url = os.environ.get("ARTEX_CTF_RUNNER_URL", "")
-    token = os.environ.get("ARTEX_CTF_RUNNER_TOKEN", "")
+    url = os.environ.get("P3Y_BOX_URL", "")
+    token = os.environ.get("P3Y_BOX_TOKEN", "")
     env_file = os.path.join("data", "ctf-preview.env")
     if (not token or not url) and os.path.isfile(env_file):
         with open(env_file, "r", encoding="utf-8", errors="ignore") as f:
@@ -31,9 +31,9 @@ def _load_env_fallback():
                     continue
                 k, v = line.split("=", 1)
                 k, v = k.strip(), v.strip().strip("'\"")
-                if k == "ARTEX_CTF_RUNNER_TOKEN" and not token:
+                if k == "P3Y_BOX_TOKEN" and not token:
                     token = v
-                elif k == "ARTEX_CTF_RUNNER_URL" and not url:
+                elif k == "P3Y_BOX_URL" and not url:
                     url = v
     return url or "http://127.0.0.1:8790", token
 
@@ -426,12 +426,12 @@ sleep 0.5
 
 def run_benchmark(save_report=False):
     print("=" * 80)
-    print("      ARTEX CTF Automated Benchmark Suite (Node R3)")
+    print("      p3y CTF Automated Benchmark Suite (Node R3)")
     print("      12 Multi-Disciplinary CTF Challenges Evaluation")
     print("=" * 80)
 
     if not TOKEN:
-        print("[!] ARTEX_CTF_RUNNER_TOKEN is not set (and data/ctf-preview.env was not found).")
+        print("[!] P3Y_BOX_TOKEN is not set (and data/ctf-preview.env was not found).")
         sys.exit(1)
 
     client = BenchmarkClient(RUNNER_URL, TOKEN)
@@ -440,8 +440,8 @@ def run_benchmark(save_report=False):
         sess_key = client.setup_session(task_id=9888)
         print(f"[+] Session established: {sess_key}\n")
     except Exception as e:
-        print(f"[!] Failed to connect to CTF runner at {RUNNER_URL}: {e}")
-        print("    If running outside Docker network, pass ARTEX_CTF_RUNNER_URL=http://localhost:8790")
+        print(f"[!] Failed to connect to p3y-box at {RUNNER_URL}: {e}")
+        print("    If running outside Docker network, pass P3Y_BOX_URL=http://localhost:8790")
         sys.exit(1)
 
     results = []

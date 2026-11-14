@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/notify"
+	"p3y/db"
+	"p3y/notify"
 )
 
 // 本文件是推送功能的 HTTP 接口。全部路由挂在 requireAuth 之后（见 Handler()），
@@ -474,8 +474,8 @@ func (s *Server) notifyListDeliveries(w http.ResponseWriter, r *http.Request) {
 	if v := r.URL.Query().Get("channel_id"); v != "" {
 		f.ChannelID = int64(atoiDefault(v, 0))
 	}
-	page := queryInt(r, "page", 1)
-	pageSize := queryInt(r, "page_size", 50)
+	page := atoiDefault(r.URL.Query().Get("page"), 1)
+	pageSize := atoiDefault(r.URL.Query().Get("page_size"), 50)
 	items, total, err := pg.ListNotificationDeliveries(r.Context(), f, page, pageSize)
 	if err != nil {
 		writeErr(w, 500, err.Error())

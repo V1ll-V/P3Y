@@ -15,14 +15,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/artifacts"
-	"github.com/Autumn-27/artex/ctf"
-	pgdb "github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/enrich"
-	"github.com/Autumn-27/artex/guard"
-	"github.com/Autumn-27/artex/intercept"
-	"github.com/Autumn-27/artex/traffic"
+	"p3y/agent"
+	"p3y/artifacts"
+	"p3y/ctf"
+	pgdb "p3y/db"
+	"p3y/enrich"
+	"p3y/guard"
+	"p3y/intercept"
+	"p3y/traffic"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
@@ -245,7 +245,6 @@ type Manager struct {
 	enrich      *enrich.Engine         // engine-side asset auto-completion (DNS/HTTP)
 	interceptor *intercept.Interceptor // user-configured tool-call interception rules
 
-	companyMu sync.Mutex // serializes task/company-scope commits with live handle registration
 	// taskStateMu preserves commit order between PostgreSQL lifecycle writes and
 	// their in-memory mirrors. lifecycleMu makes snapshots race-free, but without
 	// this outer write lock an older request could commit first and publish last.
@@ -384,10 +383,6 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	pg, err := pgdb.Open(dsn)
 	if err != nil {
 		return nil, err
-	}
-	if err := pg.RecoverFindingRetests(); err != nil {
-		pg.Close()
-		return nil, fmt.Errorf("recover finding retests: %w", err)
 	}
 	if err := pg.EnsureLLMRecordsTable(); err != nil {
 		log.Printf("[llmrec] create table: %v", err)
@@ -913,10 +908,6 @@ func (m *Manager) CreateTask(description, goal string, llmProfileID *int64, time
 }
 
 func (m *Manager) CreateTaskWithOptions(description, goal string, opts pgdb.TaskCreateOptions) (*Task, error) {
-	if len(opts.CompanyIDs) > 0 {
-		m.companyMu.Lock()
-		defer m.companyMu.Unlock()
-	}
 	pt, err := m.pg.CreateTaskWithOptions(description, goal, opts)
 	if err != nil {
 		return nil, err
@@ -1046,33 +1037,6 @@ func (m *Manager) SetTasksCategory(taskIDs []string, categoryID *int64) (map[str
 		})
 	}
 	return updated, category, nil
-}
-
-// DeleteCompanyWithAssets keeps the database cascade and live task handles in
-// one manager-level critical section. This closes the gap where a task could
-// commit its company scope immediately before registration and miss the
-// post-delete in-memory sweep.
-func (m *Manager) DeleteCompanyWithAssets(id int64, deleteAssets bool) (int64, error) {
-	m.companyMu.Lock()
-	defer m.companyMu.Unlock()
-	assetsDeleted, err := m.pg.Companies().DeleteCompanyWithAssets(id, deleteAssets)
-	if err != nil {
-		return 0, err
-	}
-	m.mu.Lock()
-	for _, task := range m.tasks {
-		task.updateLifecycle(func(state *taskLifecycleState) {
-			companyIDs := make([]int64, 0, len(state.CompanyIDs))
-			for _, companyID := range state.CompanyIDs {
-				if companyID != id {
-					companyIDs = append(companyIDs, companyID)
-				}
-			}
-			state.CompanyIDs = companyIDs
-		})
-	}
-	m.mu.Unlock()
-	return assetsDeleted, nil
 }
 
 // ReplaceTaskLLMProfiles resets a task's ordered provider chain and mirrors the

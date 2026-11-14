@@ -2,10 +2,42 @@ package server
 
 import (
 	"fmt"
+	"net"
 	"net/http"
+	"strings"
 
-	"github.com/Autumn-27/artex/db"
+	"p3y/db"
 )
+
+type assetInterceptRuleReq struct {
+	Enabled bool   `json:"enabled"`
+	Kind    string `json:"kind"`
+	Pattern string `json:"pattern"`
+	Note    string `json:"note"`
+}
+
+// validateAssetInterceptRuleReq normalizes and validates a task-level rule.
+func validateAssetInterceptRuleReq(req *assetInterceptRuleReq) error {
+	req.Pattern = strings.TrimSpace(req.Pattern)
+	if req.Pattern == "" {
+		return fmt.Errorf("pattern 不能为空")
+	}
+	switch req.Kind {
+	case "exact_domain", "exact_url", "fuzzy_domain", "fuzzy_ip", "fuzzy_url":
+		// free-form, no format check
+	case "exact_ip":
+		if net.ParseIP(req.Pattern) == nil {
+			return fmt.Errorf("exact_ip 不是有效 IP 地址：%s", req.Pattern)
+		}
+	case "cidr":
+		if _, _, err := net.ParseCIDR(req.Pattern); err != nil {
+			return fmt.Errorf("cidr 不是有效网段（形如 192.168.0.0/16）：%s", req.Pattern)
+		}
+	default:
+		return fmt.Errorf("kind 无效：%s", req.Kind)
+	}
+	return nil
+}
 
 // 任务级资产拦截/允许规则的 CRUD。规则按 task_id 归属，仅对该任务生效：
 // action=block 拦截(禁止测试)，action=allow 允许(白名单)。执行判定见 db.EvaluateAssetGate。

@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/artex/artifacts"
-	"github.com/Autumn-27/artex/ctfrunner"
+	"p3y/artifacts"
+	"p3y/ctfrunner"
 )
 
 type benchmarkCase struct {
@@ -143,14 +143,14 @@ sleep 0.3
 }
 
 func TestCTFBenchmarkSuite(t *testing.T) {
-	if os.Getenv("ARTEX_CTF_DOCKER_TEST") != "1" {
-		t.Skip("skipping benchmark suite; set ARTEX_CTF_DOCKER_TEST=1")
+	if os.Getenv("P3Y_BOX_DOCKER_TEST") != "1" {
+		t.Skip("skipping benchmark suite; set P3Y_BOX_DOCKER_TEST=1")
 	}
 
-	runner := &ctfrunner.Client{URL: os.Getenv("ARTEX_CTF_TEST_RUNNER_URL"), Token: os.Getenv("ARTEX_CTF_TEST_RUNNER_TOKEN")}
+	runner := &ctfrunner.Client{URL: os.Getenv("P3Y_BOX_TEST_URL"), Token: os.Getenv("P3Y_BOX_TEST_TOKEN")}
 	var engine *ctfrunner.Engine
 	if runner.URL == "" {
-		engine = ctfrunner.DockerEngine("/var/run/docker.sock", "autumn27/artex-ctf-tools:20261109")
+		engine = ctfrunner.DockerEngine("/var/run/docker.sock", "p3y/p3y-box-tools:20261109")
 		controller := &ctfrunner.Server{Engine: engine, Token: strings.Repeat("test-", 8), StateDir: t.TempDir()}
 		httpServer := httptest.NewServer(controller.Handler())
 		defer httpServer.Close()
@@ -165,7 +165,7 @@ func TestCTFBenchmarkSuite(t *testing.T) {
 	key := spec.Key()
 	defer func() { _ = runner.Delete(context.Background(), key) }()
 	if engine != nil {
-		defer engine.Remove(context.Background(), "artex-ctf-"+key)
+		defer engine.Remove(context.Background(), "p3y-box-"+key)
 	}
 
 	_, err := runner.Prepare(t.Context(), spec)

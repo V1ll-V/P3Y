@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
+	"p3y/db"
 )
 
 // Scheduler drives P3 triggers: on each tick it fires due interval triggers and

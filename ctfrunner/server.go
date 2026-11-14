@@ -21,10 +21,13 @@ import (
 )
 
 type SessionSpec struct {
-	TaskID    int64  `json:"task_id"`
-	IntentID  int64  `json:"intent_id"`
-	InputHash string `json:"input_hash"`
-	VPNHash   string `json:"vpn_hash,omitempty"`
+	TaskID        int64             `json:"task_id"`
+	IntentID      int64             `json:"intent_id"`
+	InputHash     string            `json:"input_hash"`
+	VPNHash       string            `json:"vpn_hash,omitempty"`
+	HostWorkDir   string            `json:"host_work_dir,omitempty"`
+	HostInputsDir string            `json:"host_inputs_dir,omitempty"`
+	Env           map[string]string `json:"env,omitempty"`
 }
 type Session struct {
 	Spec        SessionSpec `json:"spec"`
@@ -88,7 +91,7 @@ func (s *Server) load(key string) (*Session, error) {
 	}
 	var v Session
 	err = json.Unmarshal(b, &v)
-	if err != nil || !v.Spec.Valid() || v.Spec.Key() != key || v.Name != "artex-ctf-"+key {
+	if err != nil || !v.Spec.Valid() || v.Spec.Key() != key || v.Name != "p3y-box-"+key {
 		return nil, errors.New("invalid session state")
 	}
 	return &v, nil
@@ -117,7 +120,7 @@ func (s *Server) Handler() http.Handler {
 	s.registerVPNRoutes(mux)
 	mux.HandleFunc("POST /sessions", func(w http.ResponseWriter, r *http.Request) {
 		var spec SessionSpec
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&spec); err != nil || !spec.Valid() {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&spec); err != nil || !spec.Valid() {
 			fail(w, errors.New("invalid session specification"))
 			return
 		}
@@ -130,9 +133,19 @@ func (s *Server) Handler() http.Handler {
 			return
 		}
 		if v == nil {
-			v = &Session{Spec: spec, Name: "artex-ctf-" + key}
+			v = &Session{Spec: spec, Name: "p3y-box-" + key}
+		} else {
+			v.Spec = spec
 		}
-		id, err := s.Engine.EnsureSession(r.Context(), v.Name, fmt.Sprint(spec.TaskID), spec.InputHash, strings.TrimSpace(spec.VPNHash))
+		id, err := s.Engine.EnsureSessionWithOptions(r.Context(), SessionContainerOptions{
+			Name:          v.Name,
+			Task:          fmt.Sprint(spec.TaskID),
+			InputHash:     spec.InputHash,
+			VPNHash:       strings.TrimSpace(spec.VPNHash),
+			HostWorkDir:   spec.HostWorkDir,
+			HostInputsDir: spec.HostInputsDir,
+			ExtraEnv:      spec.Env,
+		})
 		if err != nil {
 			fail(w, err)
 			return
@@ -156,6 +169,8 @@ func (s *Server) Handler() http.Handler {
 	})
 	mux.HandleFunc("PUT /sessions/{id}/inputs", func(w http.ResponseWriter, r *http.Request) { s.putFiles(w, r, true) })
 	mux.HandleFunc("PUT /sessions/{id}/work", func(w http.ResponseWriter, r *http.Request) { s.putFiles(w, r, false) })
+	mux.HandleFunc("POST /sessions/{id}/savepoints", s.createSavepoint)
+	mux.HandleFunc("POST /sessions/{id}/rewind", s.rewindSavepoint)
 	mux.HandleFunc("POST /sessions/{id}/jobs", s.startJob)
 	mux.HandleFunc("GET /sessions/{id}/jobs", s.listJobs)
 	mux.HandleFunc("GET /sessions/{id}/jobs/{job_id}", s.getJob)
@@ -197,7 +212,7 @@ func (s *Server) Handler() http.Handler {
 		result, err := s.Engine.Exec(ctx, v.ContainerID, wrapTimeout(in.Command, timeout))
 		if err == nil && result.ExitCode == 124 {
 			result.Error = fmt.Sprintf("command timed out after %d seconds", timeout)
-			note := fmt.Sprintf("\n[ARTEX] 命令超过 %d 秒已被终止（退出码 124）；容器与工作文件保留。长任务请改为后台运行（nohup ... &）并轮询日志。\n", timeout)
+			note := fmt.Sprintf("\n[p3y-box] 命令超过 %d 秒已被终止（退出码 124）；容器与工作文件保留。长任务请改为后台运行（nohup ... &）并轮询日志。\n", timeout)
 			result.Stderr = append(result.Stderr, note...)
 		}
 		if err != nil {
@@ -360,7 +375,7 @@ func copyWorkspace(w io.Writer, r io.Reader) error {
 			return err
 		}
 		name := strings.TrimPrefix(h.Name, "work/")
-		if name == "work" || name == "." || name == ".inputs" || strings.HasPrefix(name, ".inputs/") || name == ".cache" || strings.HasPrefix(name, ".cache/") || name == ".ghidra" || strings.HasPrefix(name, ".ghidra/") || name == ".jobs" || strings.HasPrefix(name, ".jobs/") || name == ".interactive" || strings.HasPrefix(name, ".interactive/") {
+		if name == "work" || name == "." || name == ".inputs" || strings.HasPrefix(name, ".inputs/") || name == ".snapshots" || strings.HasPrefix(name, ".snapshots/") || name == ".cache" || strings.HasPrefix(name, ".cache/") || name == ".ghidra" || strings.HasPrefix(name, ".ghidra/") || name == ".jobs" || strings.HasPrefix(name, ".jobs/") || name == ".interactive" || strings.HasPrefix(name, ".interactive/") {
 			continue
 		}
 		if !safeRelative(name) || (h.Typeflag != tar.TypeReg && h.Typeflag != tar.TypeDir) {

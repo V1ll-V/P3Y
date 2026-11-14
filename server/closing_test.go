@@ -3,7 +3,7 @@ package server
 import (
 	"testing"
 
-	"github.com/Autumn-27/artex/db"
+	"p3y/db"
 )
 
 // TestIntentFinalStateOnClosing 锁定"取消原因决定终态"这条约定。

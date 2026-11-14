@@ -146,9 +146,6 @@ func TestLifecycleArchiveFreezesAndIncludesAllHistory(t *testing.T) {
 	if _, err := d.SetFindingName(x.f.FindingID, "late edit"); !errors.Is(err, ErrTaskArchiveState) {
 		t.Fatal(err)
 	}
-	if _, _, _, err := d.CreateFindingReview(t.Context(), x.f.FindingID, "late review", nil); !errors.Is(err, ErrTaskArchiveState) {
-		t.Fatal(err)
-	}
 }
 
 func TestLifecycleArchiveRestoreFencesOldExecutionsAndKeepsEffectiveScope(t *testing.T) {

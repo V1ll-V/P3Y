@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/Autumn-27/artex/artifacts"
+	"p3y/artifacts"
 )
 
 // ctfCategoryPrompt returns specialized methodology guidelines based on challenge type.
@@ -73,7 +73,7 @@ func ctfCategoryPrompt(challenge string, files []artifacts.Artifact) string {
    - 运行 "file" 确认二进制架构（ELF 32/64、PE x86/x64、ARM、MIPS）与链接方式；"strings" 提取明文字符串与导入函数。
    - 查壳脱壳：UPX 壳优先尝试 "upx -d"；如被抹去特征先手动修复特征头再脱壳。
 2. 静态分析与反编译：
-   - 使用 Ghidra 后台无头分析（ctf_run_background）反编译，或通过 objdump 反汇编。
+   - 优先使用 "ctf_decompile" 调用 Ghidra headless（analyzeHeadless ... -postScript ExportFunctions.java）直接反编译目标函数（自动复用持久项目缓存，首跑约 15s、后续单函数约 5s；超大固件/程序预计超时再用 ctf_run_background 后台执行 analyzeHeadless），必要时辅以 "ctf_radare2"，避免用 objdump 盲看海量汇编。
    - 定位 main 函数与关键校验函数，梳理输入变换逻辑与常量数组。
 3. 约束求解器自动化：
    - 面对复杂的逐字节变换、线性混淆或约束方程组，优先使用 Python z3-solver 建立模型求解输入，避免手工人肉反推。
@@ -108,7 +108,7 @@ func ctfCategoryPrompt(challenge string, files []artifacts.Artifact) string {
 【Web（Web 安全）专精求解指引】
 核心思路：优先轻量请求与源码审计，避免盲目重型扫描；针对性构造 exploit 脚本。
 1. 轻量化请求优先：
-   - 优先使用 ctf_http 工具测试目标 HTTP 响应头、Cookie、页面内容及回显，严禁无针对性盲目发起重型目录爆破。
+   - 优先使用 ctf_http / http_send 工具测试目标 HTTP 响应头、Cookie、页面内容及回显（启用抓包时流量自动入库，可用 traffic_search/traffic_get 检索），严禁无针对性盲目发起重型目录爆破；遇复杂 JS 渲染/多步浏览器交互可通过 Skill 加载 playwright-cli。
 2. 源码审计与敏感泄露：
    - 检查源码泄露：.git/、.svn/、.DS_Store、备份文件（.index.php.swp、www.zip）。
    - PHP 特性审计：extract() 变量覆盖、弱类型比较（== vs ===）、md5 0e 绕过、PHP 伪协议（php://filter/read=convert.base64-encode/resource=...）、反序列化 POP 链构造。

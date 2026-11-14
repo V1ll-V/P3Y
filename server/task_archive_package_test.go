@@ -4,13 +4,13 @@ import (
 	"archive/tar"
 	"bytes"
 	"encoding/json"
-	"github.com/Autumn-27/artex/artifacts"
+	"p3y/artifacts"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	pgdb "github.com/Autumn-27/artex/db"
+	pgdb "p3y/db"
 	"github.com/klauspost/compress/zstd"
 )
 

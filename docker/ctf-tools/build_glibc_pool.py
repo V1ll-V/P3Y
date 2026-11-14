@@ -85,7 +85,7 @@ def download_deb(deb_name, dest_file):
             url = base + deb_name
             tmp_part = dest_file + ".part"
             try:
-                req = urllib.request.Request(url, headers={"User-Agent": "artex-ctf-tools/1.0"})
+                req = urllib.request.Request(url, headers={"User-Agent": "p3y-box-tools/1.0"})
                 with urllib.request.urlopen(req, timeout=180) as resp, open(tmp_part, "wb") as out:
                     shutil.copyfileobj(resp, out)
                 if os.path.getsize(tmp_part) > 1024:

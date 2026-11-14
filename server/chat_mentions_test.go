@@ -13,8 +13,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db"
+	"p3y/agent"
+	"p3y/db"
 	"github.com/Autumn-27/norma/llm"
 )
 

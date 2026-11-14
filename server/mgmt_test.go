@@ -23,7 +23,20 @@ func TestMgmtAPI(t *testing.T) {
 	defer cancel()
 	td := t.TempDir()
 	s := New(ctx, m, td, td, td)
-	defer func() { cancel(); s.archiveWG.Wait(); <-s.side.done }()
+	defer func() {
+		cancel()
+		m.mu.RLock()
+		var ids []string
+		for id := range m.tasks {
+			ids = append(ids, id)
+		}
+		m.mu.RUnlock()
+		for _, id := range ids {
+			s.engine.StopTask(id)
+		}
+		s.archiveWG.Wait()
+		<-s.side.done
+	}()
 	h := s.Handler()
 	tok, err := signJWT(s.jwtKey)
 	if err != nil {

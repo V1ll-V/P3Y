@@ -7,10 +7,10 @@ import (
 )
 
 func TestTimeoutDoesNotKillContainerIntegration(t *testing.T) {
-	if os.Getenv("ARTEX_CTF_DOCKER_TEST") != "1" {
-		t.Skip("skipping docker integration test; set ARTEX_CTF_DOCKER_TEST=1")
+	if os.Getenv("P3Y_BOX_DOCKER_TEST") != "1" {
+		t.Skip("skipping docker integration test; set P3Y_BOX_DOCKER_TEST=1")
 	}
-	engine := DockerEngine("/var/run/docker.sock", "autumn27/artex-ctf-tools:20261109")
+	engine := DockerEngine("/var/run/docker.sock", "p3y/p3y-box-tools:20261109")
 	id, err := engine.Ensure(t.Context(), "artex-test-timeout-container", "999", "0000000000000000000000000000000000000000000000000000000000000000")
 	if err != nil {
 		t.Fatalf("Ensure failed: %v", err)

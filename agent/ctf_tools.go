@@ -10,37 +10,138 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/artex/ctf"
-	"github.com/Autumn-27/artex/db"
+	"p3y/ctf"
+	"p3y/db"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
-type ctfRunKey struct{}
+type (
+	ctfRunKey       struct{}
+	ctfWebSkillsKey struct{}
+	ctfProxyKey     struct{}
+	ctfDeferredKey  struct{}
+)
+
+type ctfProxyVal struct {
+	addr   string
+	caCert string
+}
+
+type ctfDeferredVal struct {
+	deferred []string
+	unlock   *actool.UnlockSet
+	packs    map[string][]string
+	targets  *[]*actool.UnlockSet
+}
+
+// WithCTFProxy attaches optional MITM proxy coordinates so CTF container tools
+// can route HTTP/HTTPS traffic through the host's recording proxy.
+func WithCTFProxy(ctx context.Context, addr, caCert string) context.Context {
+	addr = strings.TrimSpace(addr)
+	caCert = strings.TrimSpace(caCert)
+	if addr == "" && caCert == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, ctfProxyKey{}, ctfProxyVal{addr: addr, caCert: caCert})
+}
+
+func ctfProxyFromContext(ctx context.Context) (string, string) {
+	if ctx == nil {
+		return "", ""
+	}
+	v, _ := ctx.Value(ctfProxyKey{}).(ctfProxyVal)
+	return v.addr, v.caCert
+}
+
+const (
+	ctfPackAll        = "all"
+	ctfPackBinary     = "binary"
+	ctfPackWeb        = "web"
+	ctfPackCryptoMisc = "crypto_misc"
+)
+
+func ctfToolPackForChallenge(challenge string) string {
+	switch strings.ToLower(strings.TrimSpace(challenge)) {
+	case "pwn", "reverse":
+		return ctfPackBinary
+	case "web":
+		return ctfPackWeb
+	case "crypto", "misc":
+		return ctfPackCryptoMisc
+	default:
+		return ctfPackAll
+	}
+}
+
+func ctfToolPackOf(name string) string {
+	switch name {
+	case "ctf_binary_info", "ctf_pwn_triage", "ctf_gdb", "ctf_decompile", "ctf_radare2", "diff_local_remote":
+		return ctfPackBinary
+	case "ctf_http", "http_send", "http_fuzz_diff":
+		return ctfPackWeb
+	case "ctf_pcap_analyze":
+		return ctfPackCryptoMisc
+	default:
+		return ""
+	}
+}
 
 // CTF runs cannot acquire a second, application-host shell through MCP or the
-// configurable shell_* catalog. Network and traffic tools in base remain usable.
+// configurable shell_* catalog. Web CTF challenges may load safe skills
+// (such as playwright-cli) while host shells remain strictly blocked.
 func ctfBase(ctx context.Context, root string, ts *db.ExplorationStore, task, intent int64, base []actool.CoreTool) (context.Context, []actool.CoreTool) {
 	if ts == nil {
 		return ctx, base
 	}
-	mode, _, _, err := ts.TaskInputMetadata()
+	mode, challenge, _, err := ts.TaskInputMetadata()
 	if err != nil || mode != "ctf" {
 		return ctx, base
 	}
 	service := ctf.New(root, ts.Database())
+	if proxyAddr, proxyCA := ctfProxyFromContext(ctx); proxyAddr != "" {
+		service.WithProxy(proxyAddr, proxyCA)
+	}
 	verifyMode, _ := ts.Database().TaskCTFVerifyMode(ctx, task)
 	out := []actool.CoreTool{}
 	for _, t := range base {
 		switch t.Name() {
-		case "Bash", "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "LS":
+		case "Bash", "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "LS", "http_send":
 			continue
 		case "report_finding", "update_finding_report":
 			continue // CTF answers use their own evidence/WP flow, not vulnerability reports.
 		}
 		out = append(out, t)
 	}
-	out = append(out, ctfTools(service, task, intent, verifyMode)...)
-	return context.WithValue(ctx, ctfRunKey{}, true), out
+	unlock := actool.NewUnlockSet()
+	targets := []*actool.UnlockSet{unlock}
+	built := ctfToolsWithUnlock(service, task, intent, verifyMode, &targets)
+	activePack := ctfToolPackForChallenge(challenge)
+	packs := map[string][]string{}
+	var deferred []string
+	for _, tl := range built {
+		pack := ctfToolPackOf(tl.Name())
+		if pack == "" {
+			continue
+		}
+		packs[pack] = append(packs[pack], tl.Name())
+		if activePack != ctfPackAll && pack != activePack {
+			deferred = append(deferred, tl.Name())
+		}
+	}
+	out = append(out, built...)
+	ctx = context.WithValue(ctx, ctfRunKey{}, true)
+	if strings.EqualFold(strings.TrimSpace(challenge), "web") {
+		ctx = context.WithValue(ctx, ctfWebSkillsKey{}, true)
+	}
+	if len(deferred) > 0 {
+		ctx = context.WithValue(ctx, ctfDeferredKey{}, ctfDeferredVal{
+			deferred: deferred,
+			unlock:   unlock,
+			packs:    packs,
+			targets:  &targets,
+		})
+	}
+	return ctx, out
 }
 
 func stripCTFPlannerBase(base []actool.CoreTool) []actool.CoreTool {
@@ -51,8 +152,11 @@ func stripCTFPlannerBase(base []actool.CoreTool) []actool.CoreTool {
 			continue
 		}
 		switch name {
-		case "Bash", "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "LS",
-			"report_finding", "update_finding_report", "add_task_scope", "add_company_scope", "list_untested_assets":
+		case "Bash", "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "LS", "http_send",
+			"http_fuzz_diff", "diff_local_remote", "py_repl",
+			"ask_helper", "plateau_fork",
+			"board_mark_savepoint", "board_rewind", "board_save_kit",
+			"report_finding", "update_finding_report":
 			continue
 		}
 		out = append(out, t)
@@ -73,7 +177,7 @@ func ctfBaseForPlanner(ctx context.Context, ts *db.ExplorationStore, base []acto
 	return context.WithValue(ctx, ctfRunKey{}, true), stripCTFPlannerBase(base)
 }
 
-var ctfExecutionTools = []string{"Bash", "Write", "Edit", "ctf_http", "ctf_binary_info", "ctf_pwn_triage", "ctf_gdb", "ctf_python", "ctf_decompile", "ctf_radare2", "Read", "LS", "ctf_tools", "ctf_run_background", "ctf_job_status", "ctf_job_stop", "ctf_probe_target", "ctf_session_start", "ctf_session_send", "ctf_session_read", "ctf_session_close", "ctf_pcap_analyze"}
+var ctfExecutionTools = []string{"Bash", "Write", "Edit", "Grep", "Glob", "ctf_http", "http_send", "http_fuzz_diff", "diff_local_remote", "py_repl", "ask_helper", "plateau_fork", "ctf_binary_info", "ctf_pwn_triage", "ctf_gdb", "ctf_python", "ctf_decompile", "ctf_radare2", "Read", "LS", "ctf_tools", "ctf_unlock_toolpack", "ctf_run_background", "ctf_job_status", "ctf_job_stop", "ctf_probe_target", "ctf_session_start", "ctf_session_send", "ctf_session_read", "ctf_session_close", "ctf_pcap_analyze", "board_mark_savepoint", "board_rewind", "board_save_kit"}
 
 func ctfCatalogTools() []actool.CoreTool {
 	out := []actool.CoreTool{}
@@ -86,6 +190,10 @@ func ctfCatalogTools() []actool.CoreTool {
 }
 func quote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
 func ctfTools(s *ctf.Service, task, intent int64, verifyMode string) []actool.CoreTool {
+	return ctfToolsWithUnlock(s, task, intent, verifyMode, nil)
+}
+
+func ctfToolsWithUnlock(s *ctf.Service, task, intent int64, verifyMode string, unlockTargets *[]*actool.UnlockSet) []actool.CoreTool {
 	run := func(ctx context.Context, command string, timeout int) (actool.Result, error) {
 		if s == nil {
 			return actool.Errorf("CTF 工具仅在 CTF 任务上下文可用"), nil
@@ -110,6 +218,28 @@ func ctfTools(s *ctf.Service, task, intent int64, verifyMode string) []actool.Co
 			return run(ctx, cmd, timeout)
 		})
 	}
+	readCommandTool := func(name, desc string, schema map[string]any, build func(map[string]json.RawMessage) (string, int, error)) actool.CoreTool {
+		return readTool(name, desc, schema, func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+			var a map[string]json.RawMessage
+			if err := json.Unmarshal(in, &a); err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			cmd, timeout, err := build(a)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			return run(ctx, cmd, timeout)
+		})
+	}
+	httpSchema := obj(map[string]any{
+		"url": str("用户提供的完整题目 URL"), "method": str("GET、POST、HEAD、PUT、PATCH、DELETE 或 OPTIONS；有正文时默认 POST"),
+		"headers": map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}, "description": "请求头名称与值"},
+		"query":   map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}, "description": "自动 URL 编码的查询参数；需要特殊原始编码时直接写入 URL"},
+		"form":    map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}, "description": "自动编码的表单字段，不能与 body 同时提供"},
+		"body":    str("原始请求正文，最多 64 KiB"), "timeout_seconds": intp("超时秒数，默认 30，最多 120"),
+		"follow_redirects": map[string]any{"type": "boolean", "description": "仅当重定向仍属于题目范围时设为 true，最多 3 次"},
+		"use_cookies":      map[string]any{"type": "boolean", "description": "保留本意图的 Cookie，默认 true"},
+	}, "url")
 	text := func(a map[string]json.RawMessage, k string) string {
 		var v string
 		_ = json.Unmarshal(a[k], &v)
@@ -133,16 +263,9 @@ func ctfTools(s *ctf.Service, task, intent int64, verifyMode string) []actool.Co
 		return v, nil
 	}
 	tools := []actool.CoreTool{
-		commandTool("ctf_http", "在本题独立容器中请求 HTTP/HTTPS 题目，保存响应头、正文、状态码及实际执行 ID。响应中的 Flag 自动成为待确认候选。支持 GET/POST、URL 编码 query/form、请求头和意图内 Cookie；默认不跟随重定向，响应上限 8 MiB。Web 题优先使用此工具保留可复现证据。", obj(map[string]any{
-			"url": str("用户提供的完整题目 URL"), "method": str("GET、POST、HEAD、PUT、PATCH、DELETE 或 OPTIONS；有正文时默认 POST"),
-			"headers": map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}, "description": "请求头名称与值"},
-			"query":   map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}, "description": "自动 URL 编码的查询参数；需要特殊原始编码时直接写入 URL"},
-			"form":    map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}, "description": "自动编码的表单字段，不能与 body 同时提供"},
-			"body":    str("原始请求正文，最多 64 KiB"), "timeout_seconds": intp("超时秒数，默认 30，最多 120"),
-			"follow_redirects": map[string]any{"type": "boolean", "description": "仅当重定向仍属于题目范围时设为 true，最多 3 次"},
-			"use_cookies":      map[string]any{"type": "boolean", "description": "保留本意图的 Cookie，默认 true"},
-		}, "url"), ctfHTTPCommand),
-		commandTool("Bash", "在本题专属 Pwn/RE 容器 /work 中执行 Bash。具备 GDB、pwntools、Ghidra、radare2、angr 等；日志和脚本自动进入 WP。无法访问 ARTEX 的配置、密钥或 Docker。超时会终止该容器的进程。", obj(map[string]any{"command": str("命令；附件路径见输入清单"), "timeout": intp("超时毫秒，最多 300000")}, "command"), func(a map[string]json.RawMessage) (string, int, error) {
+		commandTool("ctf_http", "在本题独立容器中请求 HTTP/HTTPS 题目，保存响应头、正文、状态码及实际执行 ID。响应中的 Flag 自动成为待确认候选；启用流量录制时同步进入 MITM FTS5 流量库。支持 GET/POST、URL 编码 query/form、请求头和意图内 Cookie；默认不跟随重定向，响应上限 8 MiB。", httpSchema, ctfHTTPCommand),
+		commandTool("http_send", "统一 HTTP/HTTPS 探测与重放工具（容器内执行，自动保留响应头/正文/execution_id 并同步进入流量录制与 Flag 自动提取）。", httpSchema, ctfHTTPCommand),
+		commandTool("Bash", "在本题专属 Pwn/RE/Web 容器 /work 中执行 Bash。具备 GDB、pwntools、Ghidra、radare2、angr 等；日志和脚本自动进入 WP。无法访问 p3y 的配置、密钥或 Docker。超时会终止该容器的进程。", obj(map[string]any{"command": str("命令；附件路径见输入清单"), "timeout": intp("超时毫秒，最多 300000")}, "command"), func(a map[string]json.RawMessage) (string, int, error) {
 			return text(a, "command"), min(num(a, "timeout", 120000)/1000, 300), nil
 		}),
 		commandTool("ctf_binary_info", "真实检查 ELF/PE 架构、依赖、符号及保护；不执行样本。", obj(map[string]any{"path": str("二进制路径")}, "path"), func(a map[string]json.RawMessage) (string, int, error) {
@@ -527,6 +650,140 @@ func ctfTools(s *ctf.Service, task, intent int64, verifyMode string) []actool.Co
 			}
 			return "mkdir -p -- " + quote(path.Dir(p)) + "; printf %s " + quote(base64.StdEncoding.EncodeToString([]byte(text(a, "content")))) + " | base64 -d > " + quote(p), 30, err
 		}),
+		commandTool("Edit", "精准修改本题 /work 工作区内的文本文件（如调整 exp.py 偏移或脚本参数），避免重写整文件。", obj(map[string]any{
+			"file_path":   str("/work 内路径"),
+			"old_string":  str("要替换的精确原文本片段"),
+			"new_string":  str("替换后的新文本"),
+			"replace_all": map[string]any{"type": "boolean", "description": "是否替换全部匹配（默认 false，要求唯一匹配）"},
+		}, "file_path", "old_string", "new_string"), func(a map[string]json.RawMessage) (string, int, error) {
+			p, err := scopedPath(a)
+			if err != nil {
+				return "", 30, err
+			}
+			if strings.HasPrefix(p, "/work/.inputs") {
+				return "", 30, fmt.Errorf("原始附件只读，请复制到工作区")
+			}
+			oldStr := text(a, "old_string")
+			newStr := text(a, "new_string")
+			if oldStr == "" {
+				return "", 30, fmt.Errorf("old_string 不能为空")
+			}
+			if oldStr == newStr {
+				return "", 30, fmt.Errorf("new_string 与 old_string 相同")
+			}
+			replaceAll := false
+			if rawAll, ok := a["replace_all"]; ok {
+				_ = json.Unmarshal(rawAll, &replaceAll)
+			}
+			py := `import base64, os, sys
+p = sys.argv[1]
+old = base64.b64decode(sys.argv[2]).decode("utf-8")
+new = base64.b64decode(sys.argv[3]).decode("utf-8")
+rep_all = sys.argv[4] == "1"
+if not os.path.isfile(p):
+    sys.stderr.write(f"file not found: {p}\n")
+    sys.exit(2)
+with open(p, "r", encoding="utf-8") as f:
+    data = f.read()
+cnt = data.count(old)
+if cnt == 0:
+    sys.stderr.write("old_string not found in file\n")
+    sys.exit(3)
+if not rep_all and cnt > 1:
+    sys.stderr.write(f"old_string matched {cnt} times; provide more context or set replace_all=true\n")
+    sys.exit(4)
+updated = data.replace(old, new) if rep_all else data.replace(old, new, 1)
+tmp = p + ".p3y.tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    f.write(updated)
+os.replace(tmp, p)
+print(f"edited {p} ({cnt if rep_all else 1} replacement(s))")`
+			allFlag := "0"
+			if replaceAll {
+				allFlag = "1"
+			}
+			cmd := fmt.Sprintf("python3 -c %s %s %s %s %s",
+				quote(py),
+				quote(p),
+				quote(base64.StdEncoding.EncodeToString([]byte(oldStr))),
+				quote(base64.StdEncoding.EncodeToString([]byte(newStr))),
+				quote(allFlag),
+			)
+			return cmd, 30, nil
+		}),
+		readCommandTool("Grep", "在本题 /work 工作区或 /work/.inputs 中检索文本/符号（优先 rg，自动跳过缓存目录）。", obj(map[string]any{
+			"pattern":     str("要搜索的正则或文本模式"),
+			"path":        str("/work 内搜索目录或文件路径，默认 /work"),
+			"glob":        str("可选文件名过滤，如 *.py 或 *.c"),
+			"ignore_case": map[string]any{"type": "boolean", "description": "是否忽略大小写"},
+			"max_results": intp("最多返回行数，默认 50，最多 200"),
+		}, "pattern"), func(a map[string]json.RawMessage) (string, int, error) {
+			if text(a, "path") == "" && text(a, "file_path") == "" {
+				a["path"] = json.RawMessage(`"/work"`)
+			}
+			p, err := scopedPath(a)
+			if err != nil {
+				return "", 30, err
+			}
+			pat := text(a, "pattern")
+			if strings.TrimSpace(pat) == "" {
+				return "", 30, fmt.Errorf("pattern 不能为空")
+			}
+			maxRes := min(num(a, "max_results", 50), 200)
+			var ig bool
+			if rawIC, ok := a["ignore_case"]; ok {
+				_ = json.Unmarshal(rawIC, &ig)
+			}
+			globPat := strings.TrimSpace(text(a, "glob"))
+			rgFlags := "-n --no-heading"
+			grepFlags := "-rnE"
+			if ig {
+				rgFlags += " -i"
+				grepFlags += " -i"
+			}
+			if globPat != "" {
+				rgFlags += " -g " + quote(globPat)
+				grepFlags += " --include=" + quote(globPat)
+			}
+			cmd := fmt.Sprintf(
+				"if command -v rg >/dev/null 2>&1; then rg %s -g '!.snapshots/**' -g '!.ghidra/**' -g '!.cache/**' -g '!.jobs/**' -g '!.interactive/**' -- %s %s; else grep %s --exclude-dir=.snapshots --exclude-dir=.ghidra --exclude-dir=.cache --exclude-dir=.jobs --exclude-dir=.interactive -- %s %s; fi | head -n %d || true",
+				rgFlags, quote(pat), quote(p), grepFlags, quote(pat), quote(p), maxRes,
+			)
+			return cmd, 30, nil
+		}),
+		readCommandTool("Glob", "按通配符列出本题 /work 工作区或 /work/.inputs 中的文件。", obj(map[string]any{
+			"pattern":     str("匹配模式，如 *.py、**/*.elf 或 libc*"),
+			"path":        str("/work 内根目录，默认 /work"),
+			"max_results": intp("最多返回文件路径数，默认 100，最多 500"),
+		}, "pattern"), func(a map[string]json.RawMessage) (string, int, error) {
+			if text(a, "path") == "" && text(a, "file_path") == "" {
+				a["path"] = json.RawMessage(`"/work"`)
+			}
+			p, err := scopedPath(a)
+			if err != nil {
+				return "", 30, err
+			}
+			pat := strings.TrimSpace(text(a, "pattern"))
+			if pat == "" {
+				return "", 30, fmt.Errorf("pattern 不能为空")
+			}
+			maxRes := min(num(a, "max_results", 100), 500)
+			py := `import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+pat = sys.argv[2]
+cap = int(sys.argv[3])
+skip = {".snapshots", ".ghidra", ".cache", ".jobs", ".interactive", ".git"}
+it = root.glob(pat) if ("/" in pat or pat.startswith("**")) else root.rglob(pat)
+out = []
+for item in sorted(it):
+    if any(part in skip for part in item.parts):
+        continue
+    out.append(str(item))
+    if len(out) >= cap:
+        break
+print("\n".join(out))`
+			return fmt.Sprintf("python3 -c %s %s %s %d", quote(py), quote(p), quote(pat), maxRes), 30, nil
+		}),
 		commandTool("LS", "列出本题 /work 工作区文件。", obj(map[string]any{"path": str("/work 内目录，默认 /work")}), func(a map[string]json.RawMessage) (string, int, error) {
 			if text(a, "path") == "" {
 				a["path"] = json.RawMessage(`"/work"`)
@@ -534,7 +791,45 @@ func ctfTools(s *ctf.Service, task, intent int64, verifyMode string) []actool.Co
 			p, err := scopedPath(a)
 			return "ls -lah -- " + quote(p), 30, err
 		}),
+		writeTool("ctf_unlock_toolpack", "当当前题型需要跨领域工具时按需解锁对应工具包（例如 Web 题遇到 ELF 附件需解锁 binary，或 Pwn 题需要 Web/流量分析工具）。可选 pack：binary (ctf_binary_info/ctf_pwn_triage/ctf_gdb/ctf_decompile/ctf_radare2)、web (ctf_http/http_send)、crypto_misc (ctf_pcap_analyze)、all。", obj(map[string]any{
+			"pack": str("要解锁的领域工具包：binary | web | crypto_misc | all"),
+		}, "pack"), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+			var a map[string]json.RawMessage
+			_ = json.Unmarshal(in, &a)
+			pack := strings.ToLower(strings.TrimSpace(text(a, "pack")))
+			packTools := map[string][]string{
+				ctfPackBinary:     {"ctf_binary_info", "ctf_pwn_triage", "ctf_gdb", "ctf_decompile", "ctf_radare2", "diff_local_remote"},
+				ctfPackWeb:        {"ctf_http", "http_send", "http_fuzz_diff"},
+				ctfPackCryptoMisc: {"ctf_pcap_analyze"},
+			}
+			var unlockNames []string
+			switch pack {
+			case ctfPackBinary, ctfPackWeb, ctfPackCryptoMisc:
+				unlockNames = packTools[pack]
+			case ctfPackAll:
+				for _, names := range packTools {
+					unlockNames = append(unlockNames, names...)
+				}
+			default:
+				return actool.Errorf(fmt.Sprintf("未知工具包 %q，可选: binary | web | crypto_misc | all", pack)), nil
+			}
+			if unlockTargets != nil {
+				for _, u := range *unlockTargets {
+					if u != nil {
+						u.Add(unlockNames...)
+					}
+				}
+			}
+			return actool.Text(fmt.Sprintf("已解锁工具包 %s: %s（下轮起可直接调用）", pack, strings.Join(unlockNames, ", "))), nil
+		}),
 	)
+	var pg *db.DB
+	if s != nil {
+		pg = s.DB
+	}
+	tools = append(tools, ctfBoardTools(s, pg, task, intent)...)
+	tools = append(tools, ctfNeuroTools(s, task, intent)...)
+	tools = append(tools, askHelperTool(), plateauForkTool())
 	filtered := make([]actool.CoreTool, 0, len(tools))
 	for _, tl := range tools {
 		if verifyMode == db.CTFVerifyExploitProof && tl.Name() == "ctf_submit_flag" {

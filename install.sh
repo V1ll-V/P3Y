@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ARTEX 安装脚本：① 全部 Docker（本地构建镜像）  ② 本地编译运行
+# p3y 安装脚本：① 全部 Docker（本地构建镜像）  ② 本地编译运行
 set -euo pipefail
 cd "$(cd "$(dirname "$0")" && pwd)"
 
@@ -45,11 +45,11 @@ build_linux_binary(){
   local arch="$1"
   command -v go >/dev/null 2>&1 || return 1
   command -v npm >/dev/null 2>&1 || return 1
-  info "未找到 dist/${arch}/artex，尝试从源码构建（可能需要几分钟）…"
+  info "未找到 dist/${arch}/p3y，尝试从源码构建（可能需要几分钟）…"
   ( cd web && npm ci && npm run build:static )
   rm -rf server/webui/dist && cp -r web/out server/webui/dist
   CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" \
-    go build -tags embedui -trimpath -o "dist/${arch}/artex" ./cmd/artex
+    go build -tags embedui -trimpath -o "dist/${arch}/p3y" ./cmd/p3y
 }
 
 install_docker(){
@@ -69,34 +69,34 @@ install_docker(){
 
   local arch tag="local"
   arch="${TARGETARCH:-$(host_arch)}"
-  if grep -q '^ARTEX_TAG=' .env; then
-    sed -i.bak "s|^ARTEX_TAG=.*|ARTEX_TAG=${tag}|" .env && rm -f .env.bak
+  if grep -q '^P3Y_TAG=' .env; then
+    sed -i.bak "s|^P3Y_TAG=.*|P3Y_TAG=${tag}|" .env && rm -f .env.bak
   else
-    printf '\nARTEX_TAG=%s\n' "$tag" >> .env
+    printf '\nP3Y_TAG=%s\n' "$tag" >> .env
   fi
-  ok "ARTEX_TAG=${tag}（使用本地构建的镜像）"
+  ok "P3Y_TAG=${tag}（使用本地构建的镜像）"
 
-  if [ ! -f "dist/${arch}/artex" ]; then
+  if [ ! -f "dist/${arch}/p3y" ]; then
     build_linux_binary "$arch" || true
   fi
-  if [ -f "dist/${arch}/artex" ]; then
-    info "本地构建镜像 autumn27/artex:${tag} …"
-    docker build --build-arg TARGETARCH="${arch}" -t "autumn27/artex:${tag}" .
+  if [ -f "dist/${arch}/p3y" ]; then
+    info "本地构建镜像 p3y/p3y:${tag} …"
+    docker build --build-arg TARGETARCH="${arch}" -t "p3y/p3y:${tag}" .
   else
-    warn "未找到 dist/${arch}/artex，无法本地构建镜像。"
+    warn "未找到 dist/${arch}/p3y，无法本地构建镜像。"
     info "请先按 README「快速开始（本分支）」准备二进制，例如："
-    info "  CGO_ENABLED=0 GOOS=linux GOARCH=${arch} go build -tags embedui -o dist/${arch}/artex ./cmd/artex"
+    info "  CGO_ENABLED=0 GOOS=linux GOARCH=${arch} go build -tags embedui -o dist/${arch}/p3y ./cmd/p3y"
     if [ "$(ask '仍要拉取上游镜像（不包含本分支改动）? (y/n)' n)" = y ]; then
-      docker compose pull artex || true
+      docker compose pull p3y || true
     else
-      die "已取消：请先构建 dist/${arch}/artex，或在有网环境执行 docker build。"
+      die "已取消：请先构建 dist/${arch}/p3y，或在有网环境执行 docker build。"
     fi
   fi
 
   info "启动…"
   docker compose up -d
   ok "启动完成 → http://localhost:8787"
-  info "查看日志：docker compose logs -f artex"
+  info "查看日志：docker compose logs -f p3y"
 }
 
 # ── ② 本地编译运行 ──────────────────────────────
@@ -146,15 +146,15 @@ JSON
     ( cd web && npm ci && npm run build:static )
     rm -rf server/webui/dist && cp -r web/out server/webui/dist
     info "编译内嵌单二进制…"
-    CGO_ENABLED=0 go build -tags embedui -trimpath -o artex ./cmd/artex
+    CGO_ENABLED=0 go build -tags embedui -trimpath -o p3y ./cmd/p3y
   else
     warn "未检测到 npm：将编译**不内嵌前端**的后端（前端需另跑 npm run dev）"
-    CGO_ENABLED=0 go build -o artex ./cmd/artex
+    CGO_ENABLED=0 go build -o p3y ./cmd/p3y
   fi
-  ok "编译完成 → ./artex"
+  ok "编译完成 → ./p3y"
 
   info "启动…（Ctrl-C 退出）"
-  ./artex
+  ./p3y
 }
 
 echo "=============================="

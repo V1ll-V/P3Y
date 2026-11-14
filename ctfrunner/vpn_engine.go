@@ -28,25 +28,25 @@ func lockVPNTask(taskID string) func() {
 }
 
 func vpnContainerName(taskID string) string {
-	return "artex-ctf-wg-" + taskID
+	return "p3y-box-wg-" + taskID
 }
 
 func (e *Engine) wgImage() string {
-	if v := strings.TrimSpace(os.Getenv("ARTEX_CTF_WG_IMAGE")); v != "" {
+	if v := strings.TrimSpace(os.Getenv("P3Y_VPN_WG_IMAGE")); v != "" {
 		return v
 	}
-	return "autumn27/artex-ctf-wg:0.8.1"
+	return "p3y/p3y-box-wg:0.9.0"
 }
 
 func (e *Engine) vpnNetworkName() string {
-	if v := strings.TrimSpace(os.Getenv("ARTEX_CTF_VPN_NETWORK")); v != "" {
+	if v := strings.TrimSpace(os.Getenv("P3Y_VPN_NETWORK")); v != "" {
 		return v
 	}
-	return "artex-ctf-vpn"
+	return "p3y-box-vpn"
 }
 
 func (e *Engine) vpnSubnet() string {
-	if v := strings.TrimSpace(os.Getenv("ARTEX_CTF_VPN_SUBNET")); v != "" {
+	if v := strings.TrimSpace(os.Getenv("P3Y_VPN_SUBNET")); v != "" {
 		return v
 	}
 	return "10.220.0.0/16"
@@ -69,8 +69,8 @@ func (e *Engine) EnsureVPNNetwork(ctx context.Context) error {
 		"Driver":         "bridge",
 		"CheckDuplicate": true,
 		"Labels": map[string]string{
-			"artex.ctf.managed": "true",
-			"artex.ctf.role":    "vpn-net",
+			"p3y.box.managed": "true",
+			"p3y.box.role":    "vpn-net",
 		},
 		"IPAM": map[string]any{
 			"Driver": "default",
@@ -108,10 +108,10 @@ func (e *Engine) requireVPNContainer(ctx context.Context, task, vpnHash string) 
 	if err != nil {
 		return Container{}, fmt.Errorf("任务 #%s 的 WireGuard VPN 容器未就绪：%w", task, err)
 	}
-	if c.Config.Labels["artex.ctf.managed"] != "true" ||
-		c.Config.Labels["artex.ctf.role"] != "wg" ||
-		c.Config.Labels["artex.ctf.task"] != task ||
-		c.Config.Labels["artex.ctf.vpn"] != vpnHash {
+	if c.Config.Labels["p3y.box.managed"] != "true" ||
+		c.Config.Labels["p3y.box.role"] != "wg" ||
+		c.Config.Labels["p3y.box.task"] != task ||
+		c.Config.Labels["p3y.box.vpn"] != vpnHash {
 		return Container{}, fmt.Errorf("任务 #%s 的 WireGuard VPN 容器配置版本不一致，需要重新同步", task)
 	}
 	if !c.State.Running {
@@ -145,10 +145,10 @@ func (e *Engine) EnsureVPN(ctx context.Context, taskID, expectedHash, rawConfig 
 
 	name := vpnContainerName(taskID)
 	if existing, err := e.Container(ctx, name); err == nil {
-		if existing.Config.Labels["artex.ctf.managed"] == "true" &&
-			existing.Config.Labels["artex.ctf.role"] == "wg" &&
-			existing.Config.Labels["artex.ctf.task"] == taskID &&
-			existing.Config.Labels["artex.ctf.vpn"] == prof.Hash {
+		if existing.Config.Labels["p3y.box.managed"] == "true" &&
+			existing.Config.Labels["p3y.box.role"] == "wg" &&
+			existing.Config.Labels["p3y.box.task"] == taskID &&
+			existing.Config.Labels["p3y.box.vpn"] == prof.Hash {
 			if !existing.State.Running {
 				if startErr := e.json(ctx, "POST", "/containers/"+existing.ID+"/start", nil, nil); startErr == nil {
 					if readyErr := e.waitVPNReady(ctx, existing.ID); readyErr == nil {
@@ -182,10 +182,10 @@ func (e *Engine) EnsureVPN(ctx context.Context, taskID, expectedHash, rawConfig 
 		"Image": wgImg,
 		"User":  "0:0",
 		"Labels": map[string]string{
-			"artex.ctf.managed": "true",
-			"artex.ctf.role":    "wg",
-			"artex.ctf.task":    taskID,
-			"artex.ctf.vpn":     prof.Hash,
+			"p3y.box.managed": "true",
+			"p3y.box.role":    "wg",
+			"p3y.box.task":    taskID,
+			"p3y.box.vpn":     prof.Hash,
 		},
 		"HostConfig": map[string]any{
 			"Memory":      int64(128 << 20),
@@ -306,7 +306,7 @@ func (e *Engine) ProbeVPN(ctx context.Context, taskID string) (VPNStatus, error)
 	st.Active = true
 	st.Running = c.State.Running
 	st.ContainerID = c.ID
-	st.Hash = c.Config.Labels["artex.ctf.vpn"]
+	st.Hash = c.Config.Labels["p3y.box.vpn"]
 	if !c.State.Running {
 		st.Error = "WireGuard Sidecar 容器未处于运行状态"
 		return st, nil
@@ -438,7 +438,7 @@ type dockerListedContainer struct {
 
 func (e *Engine) listTaskContainers(ctx context.Context, taskID string) ([]string, error) {
 	filterBytes, _ := json.Marshal(map[string][]string{
-		"label": {"artex.ctf.managed=true", "artex.ctf.task=" + taskID},
+		"label": {"p3y.box.managed=true", "p3y.box.task=" + taskID},
 	})
 	var list []dockerListedContainer
 	if err := e.json(ctx, "GET", "/containers/json?all=1&filters="+url.QueryEscape(string(filterBytes)), nil, &list); err != nil {
@@ -453,7 +453,7 @@ func (e *Engine) listTaskContainers(ctx context.Context, taskID string) ([]strin
 
 func (e *Engine) removeTaskToolContainers(ctx context.Context, taskID string) error {
 	filterBytes, _ := json.Marshal(map[string][]string{
-		"label": {"artex.ctf.managed=true", "artex.ctf.task=" + taskID},
+		"label": {"p3y.box.managed=true", "p3y.box.task=" + taskID},
 	})
 	var list []dockerListedContainer
 	if err := e.json(ctx, "GET", "/containers/json?all=1&filters="+url.QueryEscape(string(filterBytes)), nil, &list); err != nil {
@@ -461,7 +461,7 @@ func (e *Engine) removeTaskToolContainers(ctx context.Context, taskID string) er
 	}
 	var errs []error
 	for _, c := range list {
-		if c.Labels["artex.ctf.role"] == "wg" {
+		if c.Labels["p3y.box.role"] == "wg" {
 			continue
 		}
 		if err := e.removeContainerOnly(ctx, c.ID); err != nil {
@@ -473,7 +473,7 @@ func (e *Engine) removeTaskToolContainers(ctx context.Context, taskID string) er
 
 func (e *Engine) removeTaskToolContainersWithWrongVPN(ctx context.Context, taskID, vpnHash, wgID string) error {
 	filterBytes, _ := json.Marshal(map[string][]string{
-		"label": {"artex.ctf.managed=true", "artex.ctf.task=" + taskID},
+		"label": {"p3y.box.managed=true", "p3y.box.task=" + taskID},
 	})
 	var list []dockerListedContainer
 	if err := e.json(ctx, "GET", "/containers/json?all=1&filters="+url.QueryEscape(string(filterBytes)), nil, &list); err != nil {
@@ -481,10 +481,10 @@ func (e *Engine) removeTaskToolContainersWithWrongVPN(ctx context.Context, taskI
 	}
 	var errs []error
 	for _, c := range list {
-		if c.Labels["artex.ctf.role"] == "wg" {
+		if c.Labels["p3y.box.role"] == "wg" {
 			continue
 		}
-		if c.Labels["artex.ctf.vpn"] == vpnHash && c.Labels["artex.ctf.wg_id"] == wgID {
+		if c.Labels["p3y.box.vpn"] == vpnHash && c.Labels["p3y.box.wg_id"] == wgID {
 			continue
 		}
 		if err := e.removeContainerOnly(ctx, c.ID); err != nil {
@@ -496,7 +496,7 @@ func (e *Engine) removeTaskToolContainersWithWrongVPN(ctx context.Context, taskI
 
 func (e *Engine) listTaskVolumes(ctx context.Context, taskID string) ([]string, error) {
 	filterBytes, _ := json.Marshal(map[string][]string{
-		"label": {"artex.ctf.managed=true", "artex.ctf.task=" + taskID},
+		"label": {"p3y.box.managed=true", "p3y.box.task=" + taskID},
 	})
 	var res struct {
 		Volumes []struct {

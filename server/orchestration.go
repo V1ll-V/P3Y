@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db"
+	"p3y/agent"
+	"p3y/db"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -40,8 +40,6 @@ func jsonResult(v any) (actool.Result, error) {
 //nolint:unused // used as the hostTools provider in wireAgentAugment
 func (s *Server) hostTools() ([]actool.CoreTool, map[string][]string) {
 	tools := append(s.m.HostTools(), s.orchestrationTools()...)
-	tools = append(tools, s.findingRetestTools()...)
-	tools = append(tools, s.findingReviewTools()...)
 	tools = append(tools, s.platformTools()...) // 平台操作工具(建改 skill/工具/MCP，给 Auto 用)
 	custom, err := s.customTools()
 	if err != nil {
@@ -166,7 +164,7 @@ func (s *Server) delegateToTask(ctx context.Context, in json.RawMessage, pick fu
 	inner, _ := json.Marshal(m)
 	tsx := agent.NewToolSet(t.Store, "orchestrator")
 	if s.m.Assets() != nil {
-		tsx.SetAssetStore(s.m.Assets(), s.m.Assets().Companies())
+		tsx.SetAssetStore(s.m.Assets())
 	}
 	tsx.SetNotify(t.Notify)         // 通用唤醒（无专用回调的写操作走它；读工具为 no-op）
 	tsx.SetNotifyHint(t.NotifyHint) // add_hint → 记一条「人新增了 N 条战略提示：…」触发并唤醒 planner
@@ -482,11 +480,7 @@ func (s *Server) seedOrchestrationTools() {
 	autoAgents, _ := json.Marshal([]string{"auto"})
 	for _, t := range s.orchestrationTools() {
 		schema, _ := json.Marshal(t.InputSchema())
-		bindings := autoAgents
-		if t.Name() == "bind_finding_traffic" {
-			bindings = json.RawMessage(`["reporter"]`)
-		}
-		_ = s.m.PG().SeedTool(t.Name(), t.Description(), schema, bindings)
+		_ = s.m.PG().SeedTool(t.Name(), t.Description(), schema, autoAgents)
 	}
 	for _, t := range s.platformTools() {
 		schema, _ := json.Marshal(t.InputSchema())
@@ -495,14 +489,12 @@ func (s *Server) seedOrchestrationTools() {
 	s.refreshBuiltinToolSchemas()
 	s.seedAutoDefaultBindings()
 	s.seedPlannerListAssetsBinding()
-	s.seedCompanyScopeRebind()
-	s.seedWorkerReadToolsUnbind() // list_facts/list_companies/list_worker_traces 从 worker 默认解绑(一次性)
+	s.seedWorkerReadToolsUnbind() // list_facts/list_worker_traces 从 worker 默认解绑(一次性)
 	s.seedWorkerReadbackRebind()  // 修复旧迁移误删：把 search_all_worker_traces/get_worker_trace/node_detail 补绑回 worker(一次性)
-	s.seedReporterAgent()         // 预置报告 agent；正式报告仅从持久化验收事件进入
 	s.seedFindingTrafficTools()   // 增加可选证据参数及只读证据工具，保留用户配置
 	s.seedFindingWorkflowTools()
 	// 注：pentest 的默认工具绑定无需迁移——BuiltinToolSeeds 在全新初始化时就把
-	// list_assets/insert_assets/report_finding/list_findings/list_companies 连同
+	// list_assets/insert_assets/report_finding/list_findings 连同
 	// pentest 一起 seed 好了（项目尚无旧库，不做迁移）。
 }
 
@@ -563,23 +555,6 @@ const reporterToolCallMessageV1 = "上面刚有一个漏洞被 report_finding �
 	"（工具返回 \"finding recorded: <id>\" 里的数字）与任务 id，按你的职责撰写该漏洞的详细报告，" +
 	"最后调用 update_finding_report(finding_id, report) 保存。"
 
-// seedReporterAgent preserves occupied/deleted keys and commits agent, prompt,
-// bindings and the one-time marker atomically. No discovery trigger is created.
-func (s *Server) seedReporterAgent() {
-	seedCtx := s.ctx
-	if seedCtx == nil {
-		seedCtx = context.Background()
-	}
-	seedCtx, cancel := context.WithTimeout(context.WithoutCancel(seedCtx), 30*time.Second)
-	defer cancel()
-	if err := s.m.pg.SeedVerificationReporter(seedCtx, agent.ReporterDefaultPrompt, []string{
-		"update_finding_report", "get_task_node_detail", "list_task_findings",
-		"get_task_worker_trace", "list_task_worker_traces", "search_task_worker_traces", "get_task_graph",
-	}); err != nil {
-		log.Printf("[reporter] atomic seed failed: %v", err)
-	}
-}
-
 // seedPlannerListAssetsBinding adds "planner" to list_assets's binding ONCE
 // (guarded by a settings flag), so existing DBs — whose list_assets row was seeded
 // as auto/pentest-only — also let the planner query the asset store by DSL. Fresh
@@ -592,28 +567,6 @@ func (s *Server) seedPlannerListAssetsBinding() {
 	}
 	if err := s.m.pg.AddAgentToToolBinding("planner", []string{"list_assets"}); err != nil {
 		log.Printf("[planner] list_assets 默认绑定失败: %v", err)
-		return
-	}
-	_ = s.m.pg.SetSetting(flag, "true")
-}
-
-// seedCompanyScopeRebind changes add_company_scope's default binding ONCE on
-// existing DBs (guarded by a settings flag): the tool moves off worker and onto
-// planner — defining a company's asset scope is a planning/main/auto concern, not
-// something a worker does mid-exploration. Fresh DBs already get planner via
-// PlannerTools() and lack worker via WorkerTools(); this only backfills old rows.
-// One-shot + flag-guarded so a user who later re-binds worker isn't overridden.
-func (s *Server) seedCompanyScopeRebind() {
-	const flag = "company_scope_rebind_v1" // worker→planner 默认绑定切换
-	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
-		return
-	}
-	if err := s.m.pg.AddAgentToToolBinding("planner", []string{"add_company_scope"}); err != nil {
-		log.Printf("[planner] add_company_scope 默认绑定失败: %v", err)
-		return
-	}
-	if err := s.m.pg.RemoveAgentFromTool("worker", "add_company_scope"); err != nil {
-		log.Printf("[worker] add_company_scope 解绑失败: %v", err)
 		return
 	}
 	_ = s.m.pg.SetSetting(flag, "true")
@@ -637,7 +590,7 @@ func (s *Server) seedWorkerReadToolsUnbind() {
 		return
 	}
 	for _, k := range []string{
-		"list_facts", "list_companies", "list_worker_traces",
+		"list_facts", "list_worker_traces",
 	} {
 		if err := s.m.pg.RemoveAgentFromTool("worker", k); err != nil {
 			log.Printf("[worker] %s 从 worker 解绑失败: %v", k, err)
@@ -684,8 +637,8 @@ func (s *Server) seedAutoDefaultBindings() {
 		keys = append(keys, t.Name())
 	}
 	keys = append(keys, platformToolKeys...)
-	// 资产工具：Auto 操作平台常要看/登记资产、管理公司范围。
-	keys = append(keys, "insert_assets", "add_company_scope", "list_assets")
+	// 资产工具：Auto 操作平台常要看/登记资产。
+	keys = append(keys, "insert_assets", "list_assets")
 	if err := s.m.pg.AddAgentToToolBinding("auto", keys); err != nil {
 		log.Printf("[auto] 默认绑定失败: %v", err)
 		return

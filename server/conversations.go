@@ -13,10 +13,10 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/intercept"
-	"github.com/Autumn-27/artex/sidequestion"
+	"p3y/agent"
+	"p3y/db"
+	"p3y/intercept"
+	"p3y/sidequestion"
 )
 
 const (
@@ -501,54 +501,12 @@ func (s *Server) runConversationTurn(ctx context.Context, cancel context.CancelC
 		delete(s.chatCancel, busyKey)
 		s.chatMu.Unlock()
 	}()
-	// Only the first turn executes a historical run. Follow-up conversation
-	// turns may explain the sealed result; the result tool refuses to overwrite it.
-	finishStatus, finishReason := "failed", "复核/复测未能启动"
-	if c.AgentKey == db.FindingRetestAgentKey || c.AgentKey == db.FindingReviewAgentKey {
-		// Read without the run cancellation so an immediate stop still seals pending.
-		r, err := s.m.pg.FindingRetestForConversation(context.Background(), c.ID)
-		if err != nil {
-			// The sealing defer below needs r.ID, which we do not have here. Seal by
-			// conversation instead, otherwise the row stays 'pending' forever.
-			log.Printf("[conv %d] load retest: %v", c.ID, err)
-			if err := s.m.pg.FailPendingRetestForConversation(c.ID, "复核/复测状态读取失败，请重新发起"); err != nil {
-				log.Printf("[conv %d] seal retest: %v", c.ID, err)
-			}
-			return
-		}
-		// Review runs narrow their tool set by scope (evidence-only => no shell /
-		// no WebFetch). Set on every turn so a follow-up question cannot regain
-		// network access the operator withheld.
-		if c.AgentKey == db.FindingReviewAgentKey && r != nil {
-			ctx = agent.WithReviewMode(ctx, reviewModeFromScope(r.Scope))
-		}
-		if r != nil && r.Status == "pending" {
-			defer func() {
-				if ctx.Err() != nil {
-					finishStatus, finishReason = "stopped", "复核/复测已停止或服务已关闭"
-				}
-				s.finishRetest(r.ID, finishStatus, finishReason)
-			}()
-			if ctx.Err() != nil {
-				return
-			}
-			started, err := s.m.pg.StartFindingRetest(ctx, r.ID)
-			if err != nil {
-				finishReason = err.Error()
-				return
-			}
-			if !started {
-				return
-			}
-		}
-	}
 	if ctx.Err() != nil {
 		return
 	}
 	// precedence: the conversation agent's own binding → this conversation's pin → global.
 	ca := s.resolveChatAgent(c)
 	if ca == nil {
-		finishReason = s.chatUnavailableReason()
 		return
 	}
 	pg := s.m.pg
@@ -567,13 +525,10 @@ func (s *Server) runConversationTurn(ctx context.Context, cancel context.CancelC
 	// On a manual stop ctx is cancelled; Chat already emits a clean "已手动停止"
 	// step, so skip the raw-error entry — only surface genuine failures.
 	if _, err := ca.Chat(ctx, c.AgentKey, sessionID, msg, maxTurns, maxDuration, webSearch, emit); err != nil {
-		finishReason = err.Error()
 		if ctx.Err() == nil {
 			_, _ = pg.AppendConvActivity(c.ID, db.Activity{Worker: c.AgentKey, Kind: "text", IsError: true,
 				Summary: "（出错：" + err.Error() + "）", Detail: err.Error()})
 		}
-	} else {
-		finishStatus, finishReason = "completed", ""
 	}
 	_ = pg.TouchConversation(c.ID)
 }

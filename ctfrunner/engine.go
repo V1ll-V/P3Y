@@ -1,11 +1,13 @@
 // Package ctfrunner manages isolated, credential-free CTF tool containers.
-// Only this controller talks to Docker; the ARTEX application has no socket.
+// Only this controller talks to Docker; the p3y application has no socket.
 package ctfrunner
 
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 )
@@ -85,6 +88,43 @@ func toolEnvironment() []string {
 	return []string{"HOME=/work", "XDG_CACHE_HOME=/work/.cache", "XDG_CONFIG_HOME=/work/.config", "JAVA_TOOL_OPTIONS=-Duser.home=/work", "PYTHONPYCACHEPREFIX=/tmp/pycache", "PWNLIB_NOTERM=1", "TERM=dumb"}
 }
 
+func mergeToolEnvironment(extra map[string]string) ([]string, string) {
+	base := toolEnvironment()
+	if len(extra) == 0 {
+		return base, ""
+	}
+	keys := make([]string, 0, len(extra))
+	for k := range extra {
+		if strings.TrimSpace(k) != "" {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	if len(keys) == 0 {
+		return base, ""
+	}
+	h := sha256.New()
+	merged := make([]string, 0, len(base)+len(keys))
+	merged = append(merged, base...)
+	for _, k := range keys {
+		v := extra[k]
+		merged = append(merged, k+"="+v)
+		_, _ = h.Write([]byte(k + "=" + v + "\n"))
+	}
+	return merged, hex.EncodeToString(h.Sum(nil))[:16]
+}
+
+// SessionContainerOptions configures an isolated tool container for a session.
+type SessionContainerOptions struct {
+	Name          string
+	Task          string
+	InputHash     string
+	VPNHash       string
+	HostWorkDir   string
+	HostInputsDir string
+	ExtraEnv      map[string]string
+}
+
 func (e *Engine) Container(ctx context.Context, name string) (Container, error) {
 	var c Container
 	err := e.json(ctx, "GET", "/containers/"+url.PathEscape(name)+"/json", nil, &c)
@@ -96,16 +136,34 @@ func (e *Engine) Ensure(ctx context.Context, name, task, inputHash string) (stri
 }
 
 func (e *Engine) EnsureSession(ctx context.Context, name, task, inputHash, vpnHash string) (string, error) {
+	return e.EnsureSessionWithOptions(ctx, SessionContainerOptions{
+		Name:      name,
+		Task:      task,
+		InputHash: inputHash,
+		VPNHash:   vpnHash,
+	})
+}
+
+func (e *Engine) EnsureSessionWithOptions(ctx context.Context, opts SessionContainerOptions) (string, error) {
+	name, task, inputHash, vpnHash := opts.Name, opts.Task, opts.InputHash, opts.VPNHash
+	hostWork := strings.TrimSpace(opts.HostWorkDir)
+	hostInputs := strings.TrimSpace(opts.HostInputsDir)
+	envList, envHash := mergeToolEnvironment(opts.ExtraEnv)
+
 	netMode, wgID, err := e.resolveSessionNetwork(ctx, task, vpnHash)
 	if err != nil {
 		return "", err
 	}
 	c, err := e.Container(ctx, name)
 	if err == nil {
-		if c.Config.Labels["artex.ctf.managed"] != "true" || c.Config.Labels["artex.ctf.task"] != task || c.Config.Labels["artex.ctf.input"] != inputHash {
+		if c.Config.Labels["p3y.box.managed"] != "true" || c.Config.Labels["p3y.box.task"] != task || c.Config.Labels["p3y.box.input"] != inputHash {
 			return "", errors.New("CTF container ownership/input mismatch")
 		}
-		if c.Config.Labels["artex.ctf.vpn"] != vpnHash || c.Config.Labels["artex.ctf.wg_id"] != wgID {
+		if c.Config.Labels["p3y.box.vpn"] != vpnHash ||
+			c.Config.Labels["p3y.box.wg_id"] != wgID ||
+			c.Config.Labels["p3y.box.work_mount"] != hostWork ||
+			c.Config.Labels["p3y.box.inputs_mount"] != hostInputs ||
+			c.Config.Labels["p3y.box.env_hash"] != envHash {
 			if err = e.removeContainerOnly(ctx, name); err != nil {
 				return "", err
 			}
@@ -120,20 +178,38 @@ func (e *Engine) EnsureSession(ctx context.Context, name, task, inputHash, vpnHa
 	} else if !strings.Contains(err.Error(), ": 404 ") {
 		return "", err
 	}
-	volume := name + "-work"
-	if err = e.json(ctx, "POST", "/volumes/create", map[string]any{"Name": volume, "Labels": map[string]string{"artex.ctf.managed": "true", "artex.ctf.task": task}}, nil); err != nil {
-		return "", err
+	mounts := make([]map[string]any, 0, 2)
+	if hostWork != "" {
+		mounts = append(mounts, map[string]any{"Type": "bind", "Source": hostWork, "Target": "/work"})
+	} else {
+		volume := name + "-work"
+		if err = e.json(ctx, "POST", "/volumes/create", map[string]any{"Name": volume, "Labels": map[string]string{"p3y.box.managed": "true", "p3y.box.task": task}}, nil); err != nil {
+			return "", err
+		}
+		mounts = append(mounts, map[string]any{"Type": "volume", "Source": volume, "Target": "/work"})
 	}
-	labels := map[string]string{"artex.ctf.managed": "true", "artex.ctf.task": task, "artex.ctf.input": inputHash}
+	if hostInputs != "" {
+		mounts = append(mounts, map[string]any{"Type": "bind", "Source": hostInputs, "Target": "/work/.inputs", "ReadOnly": true})
+	}
+	labels := map[string]string{"p3y.box.managed": "true", "p3y.box.task": task, "p3y.box.input": inputHash}
 	if vpnHash != "" {
-		labels["artex.ctf.vpn"] = vpnHash
-		labels["artex.ctf.wg_id"] = wgID
+		labels["p3y.box.vpn"] = vpnHash
+		labels["p3y.box.wg_id"] = wgID
+	}
+	if hostWork != "" {
+		labels["p3y.box.work_mount"] = hostWork
+	}
+	if hostInputs != "" {
+		labels["p3y.box.inputs_mount"] = hostInputs
+	}
+	if envHash != "" {
+		labels["p3y.box.env_hash"] = envHash
 	}
 	config := map[string]any{
 		"Image": e.Image, "User": "1000:1000", "WorkingDir": "/work", "Entrypoint": []string{"sleep"}, "Cmd": []string{"infinity"},
-		"Env":        toolEnvironment(),
+		"Env":        envList,
 		"Labels":     labels,
-		"HostConfig": map[string]any{"ReadonlyRootfs": true, "Memory": int64(3 << 30), "NanoCpus": int64(2e9), "PidsLimit": int64(256), "CapDrop": []string{"ALL"}, "CapAdd": []string{"SYS_PTRACE"}, "SecurityOpt": []string{"no-new-privileges:true"}, "NetworkMode": netMode, "Tmpfs": map[string]string{"/tmp": "rw,nosuid,size=512m,mode=1777"}, "Mounts": []map[string]any{{"Type": "volume", "Source": volume, "Target": "/work"}}},
+		"HostConfig": map[string]any{"ReadonlyRootfs": true, "Memory": int64(3 << 30), "NanoCpus": int64(2e9), "PidsLimit": int64(256), "CapDrop": []string{"ALL"}, "CapAdd": []string{"SYS_PTRACE"}, "SecurityOpt": []string{"no-new-privileges:true"}, "NetworkMode": netMode, "Tmpfs": map[string]string{"/tmp": "rw,nosuid,size=512m,mode=1777"}, "Mounts": mounts},
 	}
 	var result struct{ ID string }
 	if err = e.json(ctx, "POST", "/containers/create?name="+url.QueryEscape(name), config, &result); err != nil {
@@ -268,7 +344,7 @@ func (e *Engine) Remove(ctx context.Context, name string) error {
 		}
 		return err
 	}
-	if c.Config.Labels["artex.ctf.managed"] != "true" {
+	if c.Config.Labels["p3y.box.managed"] != "true" {
 		return errors.New("refusing unmanaged container")
 	}
 	if err = e.json(ctx, "DELETE", "/containers/"+c.ID+"?force=1&v=1", nil, nil); err != nil {

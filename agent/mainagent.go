@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/intercept"
+	"p3y/db"
+	"p3y/intercept"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
@@ -114,19 +114,18 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	tsx := NewToolSet(ts, "human")
 	tsx.SetFindingRecorder(m.findingRecorder)
 	if as != nil {
-		tsx.SetAssetStore(as, as.Companies())
+		tsx.SetAssetStore(as)
 	}
 	tsx.SetTaskID(taskID)
-	tsx.SetCoverageEnabled(as == nil || as.CoverageEnabled(taskID))
 	tsx.SetNotify(notify)         // 通用唤醒（无专用回调的写操作走它，debounced）
 	tsx.SetResumeTask(resume)     // set_goals 新增目标 → 把已完成/暂停的任务拉回 running
 	tsx.SetNotifyGoal(notifyGoal) // set_goals 新增目标 → 给 planner 记一条「人新增了目标：…」触发
 	tsx.SetNotifyHint(notifyHint) // add_hint 新增提示 → 给 planner 记一条「人新增了 N 条战略提示：…」触发
 	tsx.steerWork = m.steerWork   // enable steer_work tool (nil = unavailable)
 	// 领域工具 + 基础默认工具集（Read/Write/Edit/MultiEdit/LS/Glob/Grep/Bash）
-	// 资产覆盖度功能关闭时剔除 add_task_scope/list_untested_assets（不入 prompt）。
-	base := append(tsx.DropCoverageTools(tsx.MainAgentTools()), actool.DefaultTools()...)
+	base := append(tsx.MainAgentTools(), actool.DefaultTools()...)
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts)})
+	ctx = WithCTFProxy(ctx, m.proxyAddr, m.proxyCACert)
 	ctx, base = ctfBase(ctx, m.workDir, ts, taskID, 0, base)
 	tools, def, cleanup := AugmentTools(ctx, "mainagent", base)
 	defer cleanup()

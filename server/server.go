@@ -19,24 +19,24 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/intercept"
-	"github.com/Autumn-27/artex/llmpool"
-	"github.com/Autumn-27/artex/llmrec"
-	"github.com/Autumn-27/artex/report"
-	"github.com/Autumn-27/artex/traffic"
+	"p3y/agent"
+	"p3y/db"
+	"p3y/intercept"
+	"p3y/llmpool"
+	"p3y/llmrec"
+	"p3y/report"
+	"p3y/traffic"
 	"github.com/Autumn-27/norma/llm"
 	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
 )
 
-// BuildVersion is the backend application version, injected from cmd/artex at
+// BuildVersion is the backend application version, injected from cmd/p3y at
 // startup (which in turn gets it from -ldflags "-X main.version=<tag>").
 // Defaults to "dev" for local builds. Exposed to the frontend via GET /api/health.
 var BuildVersion = "dev"
 
-// Server exposes the ARTEX backend over a JSON HTTP API for the shadcn/ui
+// Server exposes the p3y backend over a JSON HTTP API for the Next.js
 // frontend.
 type Server struct {
 	m      *Manager
@@ -62,9 +62,8 @@ type Server struct {
 	llmCfg    agent.Config // current LLM config (key not exposed)
 	llmOn     bool
 	// verifier 是验收器实现(测试注入假实现;nil 且 llmProv 非 nil 时用 LLM 构造)。
-	verifier     agent.Verifier
-	reportWriter agent.ReportWriter
-	llmProf      string // active LLM profile name (for llmrec tagging)
+	verifier agent.Verifier
+	llmProf  string // active LLM profile name (for llmrec tagging)
 
 	// chatBusy guards the per-task main-agent run: the chat handler launches the
 	// agent on the server's background ctx (not the request ctx) and returns
@@ -156,7 +155,6 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		profChatAgents: map[int64]*agent.ChatAgent{},
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
 		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
-	s.engine.lifecycleReady = s.lifecycleRunnable
 	s.initSideQuestions()
 	// 熔断阈值/冷却是失败路径上的热参数，启动时把全局重试策略推给 Registry 一次；
 	// 之后每次保存策略再推一次（saveLLMRetryPolicy）。
@@ -227,20 +225,10 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		domainReg := buildDomainReg(m.Assets())
 		wireTools(m.pg, domainReg) // 内置工具表：按 agent 过滤 + 覆盖描述/schema + 注入默认值
 		seedPrompts(m.pg)          // 内置 agent 默认提示词正文播种进 agent_prompts(仅空时)
+		if err := m.pg.SeedDefaultTips(ctx); err != nil && ctx.Err() == nil {
+			log.Printf("[tips] seed defaults failed: %v", err)
+		}
 		s.seedOrchestrationTools() // P2 跨任务编排工具 seed 进 tools 表(可按 agent 绑定)
-		if err := s.seedFindingRetester(); err != nil {
-			log.Printf("[retester] seed: %v", err)
-		}
-		if err := s.seedFindingReviewer(); err != nil {
-			log.Printf("[reviewer] seed: %v", err)
-		}
-		migrationCtx, migrationCancel := context.WithTimeout(context.WithoutCancel(s.ctx), 30*time.Second)
-		if result, err := s.migrateVerificationConfig(migrationCtx); err != nil {
-			log.Printf("[verification] configuration migration failed; retry available: %v", err)
-		} else if result.State != "ready" {
-			log.Printf("[verification] configuration preserved for review; inspect /api/verification/config-migration")
-		}
-		migrationCancel()
 		go s.evidenceStore().RunGC(s.ctx)
 		s.seedPythonInterpreter()     // 自定义脚本工具:开机检测 python 解释器入库(仅空时)
 		go newScheduler(s).Run(s.ctx) // P3 触发器调度(定时/finding/目标事件),仅自定义 agent
@@ -271,6 +259,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	s.restoreTaskRuntimes()
 	go s.reconcileConcurrency()
 	s.startTaskArchiveWorker()
+	s.startADRepeaterLoop()
 	s.wireInterceptReviewer() // LLM 兜底审批:未命中拦截规则的命令交给模型判定
 	return s
 }
@@ -725,8 +714,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/task-archives/restore/batch", s.restoreTaskArchivesBatch)
 	mux.HandleFunc("DELETE /api/task-archives/{id}", s.queueTaskArchiveDelete)
 	mux.HandleFunc("POST /api/task-archives/delete/batch", s.deleteTaskArchivesBatch)
-	mux.HandleFunc("GET /api/tasks/{id}/coverage", s.taskCoverage)
-	mux.HandleFunc("GET /api/tasks/{id}/coverage-graph", s.taskCoverageGraph)
 	mux.HandleFunc("GET /api/tasks/{id}/asset-refs", s.taskAssetRefs)
 	mux.HandleFunc("POST /api/tasks/{id}/assets", s.attachTaskAssets)
 	mux.HandleFunc("DELETE /api/tasks/{id}/assets/{assetID}", s.detachTaskAsset)
@@ -781,13 +768,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/assets", s.insertAssets)
 	mux.HandleFunc("DELETE /api/assets", s.deleteAssets)
 
-	// company system
-	mux.HandleFunc("GET /api/companies", s.listCompanies)
-	mux.HandleFunc("POST /api/companies", s.createCompany)
-	mux.HandleFunc("GET /api/companies/{id}", s.getCompany)
-	mux.HandleFunc("DELETE /api/companies/{id}", s.deleteCompany)
-	mux.HandleFunc("POST /api/companies/{id}/scope", s.addCompanyScope)
-	mux.HandleFunc("POST /api/companies/reattribute", s.reattribute)
 
 	mux.HandleFunc("GET /api/exploration/frontier", s.frontier)
 	mux.HandleFunc("GET /api/exploration/findings", s.findings)
@@ -799,18 +779,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/exploration/findings/{id}", s.getFinding)
 	mux.HandleFunc("GET /api/exploration/findings/{id}/lineage", s.findingLineage)
 	mux.HandleFunc("POST /api/exploration/findings/{id}/deepen", s.deepenFinding)
-	mux.HandleFunc("GET /api/exploration/findings/{id}/retests", s.listFindingRetests)
-	mux.HandleFunc("GET /api/exploration/findings/retests/active", s.listActiveFindingRetests)
-	mux.HandleFunc("POST /api/exploration/findings/{id}/retests", s.startFindingRetest)
-	mux.HandleFunc("GET /api/exploration/findings/{id}/reviews", s.listFindingReviews)
-	mux.HandleFunc("POST /api/exploration/findings/{id}/reviews", s.startFindingReview)
-	mux.HandleFunc("PATCH /api/exploration/findings/{id}/review", s.decideFindingReview)
-	mux.HandleFunc("POST /api/exploration/findings/{id}/verification", s.requestFindingVerification)
-	mux.HandleFunc("GET /api/verification/config-migration", s.getVerificationConfigMigration)
-	mux.HandleFunc("GET /api/verification/readiness", s.getLifecycleReadiness)
-	mux.HandleFunc("POST /api/verification/lifecycle", s.setLifecycleEnabled)
-	mux.HandleFunc("PUT /api/verification/models", s.setVerificationModels)
-	mux.HandleFunc("POST /api/verification/config-migration/retry", s.retryVerificationConfigMigration)
 	mux.HandleFunc("PATCH /api/exploration/findings/{id}", s.patchFinding)
 	mux.HandleFunc("DELETE /api/exploration/findings/{id}", s.deleteFinding)
 	mux.HandleFunc("GET /api/exploration/intents", s.intents)
@@ -871,6 +839,24 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/tasks/{id}/ctf/vpn", s.ctfVPNPut)
 	mux.HandleFunc("DELETE /api/tasks/{id}/ctf/vpn", s.ctfVPNDelete)
 	mux.HandleFunc("POST /api/tasks/{id}/ctf/vpn/check", s.ctfVPNCheck)
+	mux.HandleFunc("GET /api/tasks/{id}/ctf/precheck", s.taskPrecheckGet)
+	mux.HandleFunc("POST /api/tasks/{id}/ctf/precheck", s.taskPrecheckRun)
+	mux.HandleFunc("GET /api/tasks/{id}/board", s.taskBoardGet)
+	mux.HandleFunc("GET /api/tasks/{id}/board/items/{itemID}", s.taskBoardItemGet)
+	mux.HandleFunc("POST /api/tasks/{id}/board/savepoints", s.taskBoardSavepointCreate)
+	mux.HandleFunc("POST /api/tasks/{id}/board/rewind", s.taskBoardRewind)
+	mux.HandleFunc("GET /api/kits", s.listGlobalKits)
+	mux.HandleFunc("GET /api/tips", s.listTips)
+	mux.HandleFunc("POST /api/tips", s.createTip)
+	mux.HandleFunc("DELETE /api/tips/{tipID}", s.deleteTip)
+	mux.HandleFunc("POST /api/tasks/{id}/tips/crystallize", s.taskTipsCrystallize)
+	mux.HandleFunc("GET /api/tasks/{id}/ad", s.taskADOverview)
+	mux.HandleFunc("POST /api/tasks/{id}/ad/weapons", s.taskADWeaponCreate)
+	mux.HandleFunc("PATCH /api/tasks/{id}/ad/weapons/{weaponID}", s.taskADWeaponUpdate)
+	mux.HandleFunc("DELETE /api/tasks/{id}/ad/weapons/{weaponID}", s.taskADWeaponDelete)
+	mux.HandleFunc("POST /api/tasks/{id}/ad/repeater/run", s.taskADRepeaterRun)
+	mux.HandleFunc("POST /api/tasks/{id}/ad/catcher/scan", s.taskADCatcherScan)
+	mux.HandleFunc("POST /api/tasks/{id}/ad/patcher/verify", s.taskADPatcherVerify)
 	mux.HandleFunc("GET /api/chat/mentions", s.searchChatMentions)
 	mux.HandleFunc("POST /api/chat", s.chat)
 	mux.HandleFunc("POST /api/chat/upload", s.chatUpload) // 方式1 文件上传:落到会话/任务工作目录 uploads/
@@ -928,12 +914,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/mcp/{id}", s.pgDeleteMCP)
 	mux.HandleFunc("GET /api/mcp/{id}/tools", s.pgMCPTools)
 	mux.HandleFunc("POST /api/mcp/{id}/refresh", s.pgRefreshMCP)
-	// 资产同步 — ScopeSentry 数据源
-	mux.HandleFunc("GET /api/sync/scopesentry/status", s.syncSSStatus)
-	mux.HandleFunc("POST /api/sync/scopesentry/datasource", s.syncSSDatasource)
-	mux.HandleFunc("GET /api/sync/scopesentry/projects", s.syncSSProjects)
-	mux.HandleFunc("GET /api/sync/scopesentry/tasks", s.syncSSTasks)
-	mux.HandleFunc("POST /api/sync/scopesentry/sync", s.syncSSRun)
 	// Skill CRUD (文件系统)
 	mux.HandleFunc("GET /api/skills", s.fsListSkills)
 	mux.HandleFunc("POST /api/skills", s.fsCreateSkill)
@@ -973,11 +953,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/intercept/rules/{id}/toggle", s.interceptToggleRule)
 
 	// 资产拦截规则管理（全局黑名单：域名/IP/URL/CIDR）
-	mux.HandleFunc("GET /api/asset-intercept/rules", s.assetInterceptListRules)
-	mux.HandleFunc("POST /api/asset-intercept/rules", s.assetInterceptCreateRule)
-	mux.HandleFunc("PUT /api/asset-intercept/rules/{id}", s.assetInterceptUpdateRule)
-	mux.HandleFunc("DELETE /api/asset-intercept/rules/{id}", s.assetInterceptDeleteRule)
-	mux.HandleFunc("POST /api/asset-intercept/rules/{id}/toggle", s.assetInterceptToggleRule)
 
 	mux.HandleFunc("GET /api/intercept/pending", s.interceptListPending)
 	mux.HandleFunc("GET /api/intercept/pending/{id}", s.interceptGetOne)
@@ -1005,7 +980,7 @@ func (s *Server) Handler() http.Handler {
 // --- handlers ---
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{"ok": true, "service": "artex", "version": BuildVersion})
+	writeJSON(w, 200, map[string]any{"ok": true, "service": "p3y", "version": BuildVersion})
 }
 
 func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
@@ -1631,7 +1606,6 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	s.launchTask(t, req.Description+" "+req.Goal, req.SeedFirstIntent != nil && *req.SeedFirstIntent)
 	dto := taskDTO(t, s.resolvedTaskStatus(t))
 	dto.InputsBlockedReason = s.taskInputsBlockReason(t)
-	dto.ExecutionBlockedReason = s.taskExecutionBlockReason(t)
 	writeJSON(w, 201, dto)
 }
 
@@ -1837,55 +1811,6 @@ func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
 	archiveBlockers, _ := s.m.PG().TaskArchiveBlockers()
 	applyTaskArchiveBlocker(&dto, archiveBlockers)
 	writeJSON(w, 200, dto)
-}
-
-// taskCoverage returns a task's rough asset test coverage (denominator/tested/backlog).
-func (s *Server) taskCoverage(w http.ResponseWriter, r *http.Request) {
-	t, ok := s.m.Task(r.PathValue("id"))
-	if !ok {
-		writeErr(w, 404, "task not found")
-		return
-	}
-	as := s.m.Assets()
-	if as == nil {
-		writeErr(w, 503, "asset store 未启用")
-		return
-	}
-	// 资产覆盖度功能关闭 → 短路返回 {enabled:false}，前端据此隐藏覆盖度卡片/进度。
-	if !t.CoverageEnabled {
-		writeJSON(w, 200, &db.Coverage{Enabled: false, ByType: []db.CoverageByType{}})
-		return
-	}
-	taskID, _ := strconv.ParseInt(t.ID, 10, 64)
-	cov, err := as.TaskCoverageWithSources(taskID)
-	if err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	cov.Enabled = true
-	writeJSON(w, 200, cov)
-}
-
-// taskCoverageGraph returns the force-directed asset coverage graph for a task:
-// all in-scope assets (每种类型) + 连接用的根域名/公司节点, each carrying tested/in_scope.
-func (s *Server) taskCoverageGraph(w http.ResponseWriter, r *http.Request) {
-	t, ok := s.m.Task(r.PathValue("id"))
-	if !ok {
-		writeErr(w, 404, "task not found")
-		return
-	}
-	as := s.m.Assets()
-	if as == nil {
-		writeErr(w, 503, "asset store 未启用")
-		return
-	}
-	taskID, _ := strconv.ParseInt(t.ID, 10, 64)
-	g, err := as.BuildCoverageGraph(taskID, t.ExpID)
-	if err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	writeJSON(w, 200, g)
 }
 
 // taskAssetRefs returns the intents / facts / findings in this task anchored to a

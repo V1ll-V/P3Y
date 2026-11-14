@@ -13,9 +13,9 @@ import (
 	"strconv"
 	"unicode/utf8"
 
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/evidence"
+	"p3y/agent"
+	"p3y/db"
+	"p3y/evidence"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
@@ -68,11 +68,6 @@ func (s *Server) seedFindingTrafficTools() {
 WHERE key=$1 AND system AND NOT(COALESCE(schema->'properties','{}'::jsonb) ? $2)`, key, name, string(properties[name]))
 		if err != nil {
 			log.Printf("[evidence] upgrade tool %s: %v", key, err)
-			return
-		}
-	}
-	if reporter, _ := s.m.pg.GetAgentByKey("reporter"); reporter != nil {
-		if err := s.m.pg.AddAgentToToolBinding("reporter", []string{"get_finding_traffic"}); err != nil {
 			return
 		}
 	}

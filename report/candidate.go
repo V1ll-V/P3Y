@@ -3,7 +3,7 @@ package report
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/Autumn-27/artex/db"
+	"p3y/db"
 	"strings"
 )
 

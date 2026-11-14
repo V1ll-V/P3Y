@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"runtime/debug"
+	"strings"
 
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -43,7 +44,8 @@ func AugmentTools(ctx context.Context, agentKey string, base []actool.CoreTool) 
 		out     = base
 	)
 	ctfScoped, _ := ctx.Value(ctfRunKey{}).(bool)
-	if ToolAugment != nil && !ctfScoped {
+	ctfWebSkills, _ := ctx.Value(ctfWebSkillsKey{}).(bool)
+	if ToolAugment != nil && (!ctfScoped || ctfWebSkills) {
 		var extra []actool.CoreTool
 		var cl func()
 		extra, def, cl = ToolAugment(ctx, agentKey)
@@ -68,11 +70,24 @@ func AugmentTools(ctx context.Context, agentKey string, base []actool.CoreTool) 
 		}
 		filtered := make([]actool.CoreTool, 0, len(out))
 		for _, t := range out {
-			if allowed[t.Name()] {
+			name := t.Name()
+			if allowed[name] || (ctfWebSkills && isSafeWebCTFSkillTool(name)) {
 				filtered = append(filtered, t)
 			}
 		}
 		out = filtered
+		if ctfWebSkills {
+			def.Deferred = filterToolNames(def.Deferred, isSafeWebCTFSkillTool)
+			def.GlobalNames = filterToolNames(def.GlobalNames, isSafeWebCTFSkillTool)
+		}
+	}
+	if ctfDef, ok := ctx.Value(ctfDeferredKey{}).(ctfDeferredVal); ok && len(ctfDef.deferred) > 0 {
+		def.Deferred = append(def.Deferred, ctfDef.deferred...)
+		if def.Unlock == nil {
+			def.Unlock = ctfDef.unlock
+		} else if ctfDef.targets != nil {
+			*ctfDef.targets = append(*ctfDef.targets, def.Unlock)
+		}
 	}
 	out, def.FindingGuidance = findingWorkflowTools(agentKey, out)
 	for i, t := range out {
@@ -98,4 +113,24 @@ func (g *guardedTool) Call(ctx context.Context, in json.RawMessage, tc *actool.T
 		}
 	}()
 	return g.CoreTool.Call(ctx, in, tc)
+}
+
+func isSafeWebCTFSkillTool(name string) bool {
+	if name == "Skill" {
+		return true
+	}
+	return strings.HasPrefix(name, "mcp__") && !strings.Contains(strings.ToLower(name), "shell")
+}
+
+func filterToolNames(names []string, keep func(string) bool) []string {
+	if len(names) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		if keep(n) {
+			out = append(out, n)
+		}
+	}
+	return out
 }

@@ -224,7 +224,7 @@ func get(ctx context.Context, c *http.Client, rawURL string) (io.ReadCloser, err
 	if err := checkURL(req.URL); err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "artex-selfupdate")
+	req.Header.Set("User-Agent", "p3y-selfupdate")
 	resp, err := c.Do(req)
 	if err != nil {
 		return nil, err
@@ -236,14 +236,14 @@ func get(ctx context.Context, c *http.Client, rawURL string) (io.ReadCloser, err
 	return resp.Body, nil
 }
 
-// extractBinary 从发布包里取出 artex 可执行文件。
+// extractBinary 从发布包里取出 p3y 可执行文件。
 //
-// 包内结构是 artex-<版本>-<os>-<arch>/artex，但这里按**基名**匹配而不是拼完整
+// 包内结构是 p3y-<版本>-<os>-<arch>/p3y，但这里按**基名**匹配而不是拼完整
 // 路径：版本号在包名里出现过一次，拼错一个字符就整个升级失败，按基名找更耐改。
 func extractBinary(zipPath, dst string) error {
-	want := "artex"
+	want := "p3y"
 	if runtime.GOOS == "windows" {
-		want = "artex.exe"
+		want = "p3y.exe"
 	}
 	zr, err := zip.OpenReader(zipPath)
 	if err != nil {
@@ -285,7 +285,7 @@ func extractBinary(zipPath, dst string) error {
 // checkWritable 提前确认目录可写。没有这一步，非 root 运行、或二进制被放在系统
 // 目录时，会在下载完几十 MB 之后才在换装那一刻失败。
 func checkWritable(dir string) error {
-	probe, err := os.CreateTemp(dir, ".artex-update-probe-*")
+	probe, err := os.CreateTemp(dir, ".p3y-update-probe-*")
 	if err != nil {
 		return fmt.Errorf("程序目录 %s 不可写，无法自动更新（请检查权限或改用手动升级）: %w", dir, err)
 	}

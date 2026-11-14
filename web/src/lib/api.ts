@@ -110,11 +110,21 @@ import type {
   UsageStats,
   WorkspaceFile,
   WorkspaceListing,
+  TipCard,
+  PrecheckResult,
+  BoardItem,
+  BoardKit,
+  BoardRewindResult,
+  ADWeapon,
+  ADOverview,
+  RepeaterRunResult,
+  CatcherScanResult,
+  PatchVerifyResult,
 } from "@/lib/types";
 
 function getToken(): string | null {
   if (typeof window === "undefined") return null;
-  return localStorage.getItem("artex_token");
+  return localStorage.getItem("p3y_token");
 }
 
 export async function http<T>(path: string, init?: RequestInit): Promise<T> {
@@ -130,8 +140,8 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (r.status === 401) {
     if (typeof window !== "undefined") {
-      localStorage.removeItem("artex_token");
-      document.cookie = "artex_token=; path=/; max-age=0";
+      localStorage.removeItem("p3y_token");
+      document.cookie = "p3y_token=; path=/; max-age=0";
       window.location.href = "/login";
     }
     throw new Error("未授权");
@@ -1404,4 +1414,83 @@ export const api = {
   // 202 即返回，实际下载在后台跑，进度走 /api/update/stream。
   applyUpdate: () => post<{ ok: boolean; target: string }>(`/update/apply`),
   rollbackUpdate: () => post<{ ok: boolean }>(`/update/rollback`),
+
+  // ---- Stage 3-5: Precheck / Board / Kits / Tips / Attack-Defense ----
+  taskPrecheckGet: (taskId: string) => get<PrecheckResult>(`/tasks/${taskId}/ctf/precheck`),
+  taskPrecheckRun: (taskId: string) => post<PrecheckResult>(`/tasks/${taskId}/ctf/precheck`),
+
+  taskBoard: (taskId: string) =>
+    get<{ items: BoardItem[]; kits: BoardKit[] }>(`/tasks/${taskId}/board`).then((r) => ({
+      items: arr(r.items),
+      kits: arr(r.kits),
+    })),
+  taskBoardItem: (taskId: string, itemId: number) =>
+    get<BoardItem>(`/tasks/${taskId}/board/items/${itemId}`),
+  taskBoardSavepoint: (
+    taskId: string,
+    body: { title: string; summary?: string; detail?: string; check_cmd?: string; intent_id?: number },
+  ) => post<BoardItem>(`/tasks/${taskId}/board/savepoints`, body),
+  taskBoardRewind: (
+    taskId: string,
+    body: { savepoint_id: number; deadend_title?: string; deadend_reason?: string; detail?: string; intent_id?: number },
+  ) => post<BoardRewindResult>(`/tasks/${taskId}/board/rewind`, body),
+
+  listKits: (params?: { task_id?: string; limit?: number }) => {
+    const sp = new URLSearchParams();
+    if (params?.task_id) sp.set("task_id", params.task_id);
+    if (params?.limit) sp.set("limit", String(params.limit));
+    const q = sp.toString();
+    return get<BoardKit[]>(`/kits${q ? `?${q}` : ""}`).then(arr);
+  },
+
+  listTips: (params?: { category?: string; tags?: string; limit?: number }) => {
+    const sp = new URLSearchParams();
+    if (params?.category) sp.set("category", params.category);
+    if (params?.tags) sp.set("tags", params.tags);
+    if (params?.limit) sp.set("limit", String(params.limit));
+    const q = sp.toString();
+    return get<TipCard[]>(`/tips${q ? `?${q}` : ""}`).then(arr);
+  },
+  createTip: (body: { category: string; tags: string[]; title: string; pitfall: string; pattern_code?: string }) =>
+    post<TipCard>(`/tips`, body),
+  deleteTip: (tipId: number) => del<{ ok: boolean }>(`/tips/${tipId}`),
+  taskTipsCrystallize: (taskId: string) =>
+    post<{ cards: TipCard[] }>(`/tasks/${taskId}/tips/crystallize`).then((r) => arr(r.cards)),
+
+  taskADOverview: (taskId: string) =>
+    get<ADOverview>(`/tasks/${taskId}/ad`).then((r) => ({
+      weapons: arr(r.weapons),
+      events: arr(r.events),
+      recommendations: arr(r.recommendations),
+    })),
+  taskADWeaponCreate: (
+    taskId: string,
+    body: {
+      target_service: string;
+      script_path: string;
+      check_cmd?: string;
+      targets: string[];
+      flag_regex?: string;
+      submit_url?: string;
+      submit_token?: string;
+      interval_sec?: number;
+    },
+  ) => post<ADWeapon>(`/tasks/${taskId}/ad/weapons`, body),
+  taskADWeaponUpdate: (
+    taskId: string,
+    weaponId: number,
+    body: { status?: "active" | "blocked" | "paused"; targets?: string[]; interval_sec?: number },
+  ) => patch<ADWeapon>(`/tasks/${taskId}/ad/weapons/${weaponId}`, body),
+  taskADWeaponDelete: (taskId: string, weaponId: number) =>
+    del<{ ok: boolean }>(`/tasks/${taskId}/ad/weapons/${weaponId}`),
+  taskADRepeaterRun: (taskId: string, body?: { weapon_id?: number; force?: boolean }) =>
+    post<RepeaterRunResult>(`/tasks/${taskId}/ad/repeater/run`, body ?? {}),
+  taskADCatcherScan: (
+    taskId: string,
+    body?: { samples?: Array<{ target: string; request: string; source?: string }>; record_board?: boolean },
+  ) => post<CatcherScanResult>(`/tasks/${taskId}/ad/catcher/scan`, body ?? {}),
+  taskADPatcherVerify: (
+    taskId: string,
+    body: { service_name: string; patch_cmd?: string; check_cmd: string; exploit_cmd: string },
+  ) => post<PatchVerifyResult>(`/tasks/${taskId}/ad/patcher/verify`, body),
 };

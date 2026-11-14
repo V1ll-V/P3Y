@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/artex/db"
+	"p3y/db"
 )
 
 func seedVerificationBlob(t *testing.T, s *Store, body []byte) string {

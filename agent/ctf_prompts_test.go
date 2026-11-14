@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/artex/artifacts"
+	"p3y/artifacts"
 )
 
 func TestCTFCategoryPrompts(t *testing.T) {
@@ -54,5 +54,13 @@ func TestCTFAutoPromptInference(t *testing.T) {
 	pRE := ctfCategoryPrompt("auto", reFiles)
 	if !strings.Contains(pRE, "Reverse 倾向") {
 		t.Fatalf("expected Reverse inference, got: %s", pRE)
+	}
+
+	// Unified Ghidra guidance across reverse prompt & ctf_flow.
+	revPrompt := ctfCategoryPrompt("reverse", nil)
+	for _, kw := range []string{"ctf_decompile", "analyzeHeadless", "ExportFunctions.java"} {
+		if !strings.Contains(revPrompt, kw) {
+			t.Fatalf("reverse prompt missing unified Ghidra guidance %q", kw)
+		}
 	}
 }

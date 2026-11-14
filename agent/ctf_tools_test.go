@@ -3,7 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
-	"github.com/Autumn-27/artex/db"
+	"p3y/db"
 	actool "github.com/Autumn-27/norma/tool"
 	"strings"
 	"testing"
@@ -11,11 +11,11 @@ import (
 
 func TestCTFFileToolsRejectApplicationPaths(t *testing.T) {
 	for _, tool := range ctfTools(nil, 1, 1, "") {
-		if tool.Name() != "Read" && tool.Name() != "Write" && tool.Name() != "LS" {
+		if tool.Name() != "Read" && tool.Name() != "Write" && tool.Name() != "Edit" && tool.Name() != "Grep" && tool.Name() != "Glob" && tool.Name() != "LS" {
 			continue
 		}
 		for _, p := range []string{"/app/config.json", "/var/run/docker.sock", "/work/../../app/jwt.key"} {
-			in, _ := json.Marshal(map[string]any{"path": p, "file_path": p, "content": "x"})
+			in, _ := json.Marshal(map[string]any{"path": p, "file_path": p, "content": "x", "old_string": "a", "new_string": "b", "pattern": "flag"})
 			result, err := tool.Call(t.Context(), in, nil)
 			if err != nil {
 				t.Fatal(err)
@@ -24,6 +24,45 @@ func TestCTFFileToolsRejectApplicationPaths(t *testing.T) {
 			if !strings.Contains(string(raw), "仅允许") {
 				t.Fatalf("%s allowed %s: %s", tool.Name(), p, raw)
 			}
+		}
+	}
+}
+
+func TestCTFEditRejectsInputsAndValidatesArgs(t *testing.T) {
+	var editTool, grepTool, globTool actool.CoreTool
+	for _, tl := range ctfTools(nil, 1, 1, "") {
+		switch tl.Name() {
+		case "Edit":
+			editTool = tl
+		case "Grep":
+			grepTool = tl
+		case "Glob":
+			globTool = tl
+		}
+	}
+	if editTool == nil || grepTool == nil || globTool == nil {
+		t.Fatalf("missing new file tools: edit=%v grep=%v glob=%v", editTool != nil, grepTool != nil, globTool != nil)
+	}
+	for _, tc := range []struct {
+		name string
+		tl   actool.CoreTool
+		args map[string]any
+		want string
+	}{
+		{"edit_inputs", editTool, map[string]any{"file_path": "/work/.inputs/chall", "old_string": "a", "new_string": "b"}, "只读"},
+		{"edit_empty_old", editTool, map[string]any{"file_path": "/work/exp.py", "old_string": "", "new_string": "b"}, "不能为空"},
+		{"edit_same", editTool, map[string]any{"file_path": "/work/exp.py", "old_string": "same", "new_string": "same"}, "相同"},
+		{"grep_empty_pat", grepTool, map[string]any{"pattern": "   "}, "不能为空"},
+		{"glob_empty_pat", globTool, map[string]any{"pattern": ""}, "不能为空"},
+	} {
+		in, _ := json.Marshal(tc.args)
+		res, err := tc.tl.Call(t.Context(), in, nil)
+		if err != nil {
+			t.Fatalf("%s err: %v", tc.name, err)
+		}
+		raw, _ := json.Marshal(res)
+		if !strings.Contains(string(raw), tc.want) {
+			t.Fatalf("%s expected %q, got %s", tc.name, tc.want, raw)
 		}
 	}
 }
@@ -178,5 +217,89 @@ func TestCTFGraphOverviewPausedAndPwnExploitMutex(t *testing.T) {
 	id2, err := ts.addOneIntent(intentItem{Summary: "resume exploit", Phase: "exploit"})
 	if err != nil || id2 <= 0 {
 		t.Fatalf("expected exploit intent allowed after exhaustion, got id=%d err=%v", id2, err)
+	}
+}
+
+func TestCTFDomainToolpacksAndWebSkillUnlock(t *testing.T) {
+	dsn, _, err := db.DSN()
+	if err != nil {
+		t.Skip("test database required")
+	}
+	pg, err := db.Open(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pg.Close()
+
+	webTask, err := pg.CreateTaskWithOptions("web-pack", "flag", db.TaskCreateOptions{Mode: "ctf", ChallengeType: "web"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pg.DeleteTask(webTask.ID)
+
+	oldAugment, oldResolve := ToolAugment, ToolResolve
+	defer func() { ToolAugment, ToolResolve = oldAugment, oldResolve }()
+
+	ToolAugment = func(context.Context, string) ([]actool.CoreTool, DeferredInfo, func()) {
+		extra := []actool.CoreTool{
+			readTool("Skill", "skill loader", obj(nil), nil),
+			readTool("mcp__playwright__navigate", "pw", obj(nil), nil),
+			readTool("mcp__host_shell__exec", "host shell mcp", obj(nil), nil),
+			readTool("Bash", "host bash", obj(nil), nil),
+		}
+		def := DeferredInfo{
+			Deferred:    []string{"mcp__playwright__navigate", "mcp__host_shell__exec", "Bash"},
+			GlobalNames: []string{"mcp__playwright__navigate", "mcp__host_shell__exec", "Bash"},
+			Unlock:      actool.NewUnlockSet("mcp__playwright__navigate"),
+		}
+		return extra, def, nil
+	}
+	ToolResolve = nil
+
+	root := t.TempDir()
+	ctx, base := ctfBase(t.Context(), root, pg.Exploration(webTask.ExplorationID), webTask.ID, 1, nil)
+	tools, def, cleanup := AugmentTools(ctx, "worker", base)
+	defer cleanup()
+
+	mounted := map[string]actool.CoreTool{}
+	for _, tl := range tools {
+		mounted[tl.Name()] = tl
+	}
+	if mounted["Skill"] == nil || mounted["mcp__playwright__navigate"] == nil || mounted["http_send"] == nil || mounted["Edit"] == nil {
+		t.Fatalf("expected Skill, playwright MCP, http_send, Edit mounted for web task; got keys=%v", len(mounted))
+	}
+	if mounted["mcp__host_shell__exec"] != nil {
+		t.Fatal("host shell MCP must remain blocked in web CTF")
+	}
+	deferredSet := map[string]bool{}
+	for _, n := range def.Deferred {
+		deferredSet[n] = true
+	}
+	for _, wantDef := range []string{"ctf_decompile", "ctf_pwn_triage", "ctf_gdb", "ctf_pcap_analyze"} {
+		if !deferredSet[wantDef] {
+			t.Fatalf("expected non-web tool %s to be deferred on web task", wantDef)
+		}
+	}
+	if deferredSet["ctf_http"] || deferredSet["http_send"] || deferredSet["Bash"] || deferredSet["Edit"] {
+		t.Fatalf("web/base tools must not be deferred: %v", def.Deferred)
+	}
+	for _, n := range def.GlobalNames {
+		if n == "mcp__host_shell__exec" || n == "Bash" {
+			t.Fatalf("unsafe deferred name leaked into GlobalNames: %s", n)
+		}
+	}
+	if def.Unlock.Has("ctf_decompile") {
+		t.Fatal("binary tool should start locked on web task")
+	}
+	unlockTool := mounted["ctf_unlock_toolpack"]
+	if unlockTool == nil {
+		t.Fatal("expected ctf_unlock_toolpack in Base Pack")
+	}
+	in, _ := json.Marshal(map[string]string{"pack": "binary"})
+	if _, err := unlockTool.Call(ctx, in, nil); err != nil {
+		t.Fatalf("ctf_unlock_toolpack call failed: %v", err)
+	}
+	if !def.Unlock.Has("ctf_decompile") || !def.Unlock.Has("ctf_pwn_triage") {
+		t.Fatal("expected binary pack tools to be unlocked in shared UnlockSet")
 	}
 }

@@ -90,7 +90,7 @@ func TestEngineContainerLimitsAndOwnership(t *testing.T) {
 	}))
 	defer fake.Close()
 	e := &Engine{Client: fake.Client(), Base: fake.URL, Image: "ctf-tools"}
-	if _, err := e.Ensure(context.Background(), "artex-ctf-test", "1", "hash"); err != nil {
+	if _, err := e.Ensure(context.Background(), "p3y-box-test", "1", "hash"); err != nil {
 		t.Fatal(err)
 	}
 	host := create["HostConfig"].(map[string]any)

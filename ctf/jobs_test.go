@@ -9,18 +9,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/artex/artifacts"
-	"github.com/Autumn-27/artex/ctfrunner"
-	"github.com/Autumn-27/artex/db"
+	"p3y/artifacts"
+	"p3y/ctfrunner"
+	"p3y/db"
 )
 
 func TestServiceBackgroundJobAndFlagCandidate(t *testing.T) {
-	if os.Getenv("ARTEX_CTF_DOCKER_TEST") != "1" {
-		t.Skip("skipping docker integration test; set ARTEX_CTF_DOCKER_TEST=1")
+	if os.Getenv("P3Y_BOX_DOCKER_TEST") != "1" {
+		t.Skip("skipping docker integration test; set P3Y_BOX_DOCKER_TEST=1")
 	}
-	dsn := os.Getenv("ARTEX_PG_DSN")
+	dsn := os.Getenv("P3Y_PG_DSN")
 	if dsn == "" {
-		t.Skip("test database required; set ARTEX_PG_DSN")
+		t.Skip("test database required; set P3Y_PG_DSN")
 	}
 	pg, err := db.Open(dsn)
 	if err != nil {
@@ -34,7 +34,7 @@ func TestServiceBackgroundJobAndFlagCandidate(t *testing.T) {
 	}
 	defer pg.DeleteTask(task.ID)
 
-	engine := ctfrunner.DockerEngine("/var/run/docker.sock", "autumn27/artex-ctf-tools:20261109")
+	engine := ctfrunner.DockerEngine("/var/run/docker.sock", "p3y/p3y-box-tools:20261109")
 	controller := &ctfrunner.Server{Engine: engine, Token: strings.Repeat("test-", 8), StateDir: t.TempDir()}
 	httpServer := httptest.NewServer(controller.Handler())
 	defer httpServer.Close()
@@ -47,7 +47,7 @@ func TestServiceBackgroundJobAndFlagCandidate(t *testing.T) {
 	s := &Service{Root: root, DB: pg, Runner: runner}
 	m, _ := store.Inputs(task.ID, 201)
 	spec := ctfrunner.SessionSpec{TaskID: task.ID, IntentID: 201, InputHash: Hash(m)}
-	defer engine.Remove(context.Background(), "artex-ctf-"+spec.Key())
+	defer engine.Remove(context.Background(), "p3y-box-"+spec.Key())
 
 	// 启动后台任务：输出带有 Flag 的内容
 	job, err := s.StartJob(t.Context(), task.ID, 201, "echo 'Brute forcing...'; sleep 1; echo 'Found DASCTF{bg_async_win_123} in hash'", "brute-1")

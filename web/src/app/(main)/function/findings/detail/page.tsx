@@ -9,11 +9,8 @@ import { ArrowLeftIcon, ArrowUpRightIcon, ShieldAlertIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { CopyButton } from "@/components/copy-button";
-import { FindingRetestPanel } from "@/components/finding-retest-panel";
-import { FindingReviewPanel } from "@/components/finding-review-panel";
 import { FindingTrafficPanel } from "@/components/finding-traffic-panel";
 import { Markdown } from "@/components/markdown";
-import { FindingVerdictBadge, FindingVerdictScope } from "@/components/finding-verdict";
 import { StatusBadge } from "@/components/status-badge";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -23,7 +20,7 @@ import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger } from "@
 import { Separator } from "@/components/ui/separator";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { api, http } from "@/lib/api";
+import { api } from "@/lib/api";
 import { statusMeta } from "@/lib/status";
 import type { Finding, FindingStatus, Severity } from "@/lib/types";
 
@@ -60,7 +57,6 @@ function FindingDetailInner() {
   const searchParams = useSearchParams();
   const id = searchParams.get("id") ?? "";
   const contextTaskId = searchParams.get("context_task") ?? "";
-  const [verifying, setVerifying] = React.useState(false);
   const [finding, setFinding] = React.useState<Finding | null>(null);
   const [loaded, setLoaded] = React.useState(false);
   const [tab, setTab] = React.useState("overview");
@@ -148,14 +144,8 @@ function FindingDetailInner() {
           </h1>
           <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground">#{finding.id}</code>
           <Separator orientation="vertical" className="mx-1 h-4" />
-          {finding.effective && !finding.display_severity ? (
-            <Badge variant="outline">等级未独立确认</Badge>
-          ) : (
-            <StatusBadge domain="severity" value={finding.display_severity || finding.severity} dot />
-          )}
-          <FindingVerdictBadge finding={finding} />
+          <StatusBadge domain="severity" value={finding.display_severity || finding.severity} dot />
           <StatusBadge domain="finding" value={finding.status} dot />
-          {finding.review_decision ? <StatusBadge domain="review" value={finding.review_decision} dot /> : null}
           {finding.inherited && finding.source_task_id && (
             <Badge variant="outline">来源任务 #{finding.source_task_id} · 只读</Badge>
           )}
@@ -178,46 +168,9 @@ function FindingDetailInner() {
                   <CardTitle className="text-sm">摘要</CardTitle>
                 </CardHeader>
                 <CardContent>
-                  <FindingVerdictScope finding={finding} />
-                  {!finding.inherited ? (
-                    <Button
-                      className="mt-3"
-                      size="sm"
-                      variant="outline"
-                      disabled={verifying}
-                      onClick={async () => {
-                        setVerifying(true);
-                        try {
-                          await http(`/exploration/findings/${id}/verification`, {
-                            method: "POST",
-                            body: JSON.stringify({
-                              review_request_id:
-                                globalThis.crypto?.randomUUID?.() ??
-                                `review-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-                            }),
-                          });
-                          toast.success("已提交本地证据验收；保留现有人工决定");
-                          await load();
-                        } catch (e) {
-                          toast.error((e as Error).message);
-                        } finally {
-                          setVerifying(false);
-                        }
-                      }}
-                    >
-                      重新验收本地证据
-                    </Button>
-                  ) : null}
+                  <p className="text-sm whitespace-pre-wrap">{finding.display_claim ?? finding.summary}</p>
                 </CardContent>
               </Card>
-              <FindingReviewPanel
-                key={`review-${id}`}
-                findingId={id}
-                findingName={title}
-                inherited={finding.inherited}
-                onChanged={load}
-              />
-              <FindingRetestPanel key={id} findingId={id} readOnly={finding.inherited} onCompleted={load} />
               <Card>
                 <CardHeader>
                   <CardTitle className="text-sm">证据 / PoC</CardTitle>
@@ -246,17 +199,6 @@ function FindingDetailInner() {
                   {(finding.report || finding.report_draft) && <CopyButton text={finding.report || finding.report_draft || ""} successMessage="已复制报告" />}
                 </CardHeader>
                 <CardContent>
-                  {finding.review_decision ? (
-                    <Alert className="mb-3">
-                      <AlertDescription className="flex flex-wrap items-center gap-2">
-                        人工复核结论：
-                        <StatusBadge domain="review" value={finding.review_decision} dot />
-                        {finding.review_note ? (
-                          <span className="min-w-0 break-words text-muted-foreground">{finding.review_note}</span>
-                        ) : null}
-                      </AlertDescription>
-                    </Alert>
-                  ) : null}
                   {finding.report_stale ? (
                     <Alert>
                       <AlertDescription>

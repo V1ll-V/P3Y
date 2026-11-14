@@ -33,6 +33,7 @@ import { type Tone, toneClasses, toneDot } from "@/lib/status";
 import { taskAssetTypeLabel } from "@/lib/task-assets";
 import type { Edge, ExploreKind, FindingAsset, NewAssetType, TaskNode } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { ADConsolePanel } from "./ad-console-panel";
 
 const PAGE_SIZES = [20, 50, 100];
 const POLL_MS = 8000;
@@ -432,6 +433,7 @@ function BroadcastRow({
 }
 
 export function BroadcastTab({ taskId }: { taskId: string }) {
+  const [tabMode, setTabMode] = React.useState<"ad" | "timeline">("ad");
   const [kinds, setKinds] = React.useState<ExploreKind[]>([]);
   const [queryInput, setQueryInput] = React.useState("");
   const [query, setQuery] = React.useState("");
@@ -565,7 +567,31 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
   }
 
   return (
-    <Card className="overflow-hidden py-0">
+    <div className="flex flex-col gap-3">
+      <div className="flex items-center gap-1 self-start rounded-lg border bg-muted/40 p-1">
+        <button
+          type="button"
+          onClick={() => setTabMode("ad")}
+          className={`rounded-md px-3 py-1 text-sm font-medium transition-colors ${
+            tabMode === "ad" ? "bg-background shadow-xs" : "text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          AD 攻防控制台（Repeater / Catcher / Patcher）
+        </button>
+        <button
+          type="button"
+          onClick={() => setTabMode("timeline")}
+          className={`rounded-md px-3 py-1 text-sm font-medium transition-colors ${
+            tabMode === "timeline" ? "bg-background shadow-xs" : "text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          探索播报时间线 ({total})
+        </button>
+      </div>
+      {tabMode === "ad" ? (
+        <ADConsolePanel taskId={taskId} />
+      ) : (
+        <Card className="overflow-hidden py-0">
       {/* 工具条 */}
       <div className="flex flex-wrap items-center gap-2 border-b px-4 py-2.5">
         <div className="relative w-full sm:w-64">
@@ -729,6 +755,8 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
           </Button>
         </div>
       </CardFooter>
-    </Card>
+        </Card>
+      )}
+    </div>
   );
 }

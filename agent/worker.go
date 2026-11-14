@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/intercept"
+	"p3y/db"
+	"p3y/intercept"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
@@ -386,10 +386,8 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	tsx := NewToolSet(ts, name)
 	tsx.SetFindingRecorder(w.findingRecorder)
 	tsx.SetTaskID(taskID)
-	coverageEnabled := as == nil || as.CoverageEnabled(taskID)
-	tsx.SetCoverageEnabled(coverageEnabled)
 	if as != nil {
-		tsx.SetAssetStore(as, as.Companies())
+		tsx.SetAssetStore(as)
 	}
 	tsx.SetOwnerNode(intent.ID)         // assets this worker discovers anchor to its intent → visible to the task
 	tsx.SetEnrich(enr)                  // async DNS/HTTP auto-completion for assets this worker writes
@@ -401,26 +399,38 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// worker 刻意不给 MultiEdit/Glob/Grep：文件精改用 Edit、检索走 Bash(grep/find)，
 	// 收敛工具面、减少低价值调用。其余 SDK 默认工具(Read/Write/Edit/LS/Bash/Sleep)照常。
 	base = append(base, defaultToolsExcept("MultiEdit", "Glob", "Grep")...)
+	runDir := ensureRunDir(w.workDir, taskID, intent.ID)
+	intentID := intent.ID
+	emitWrap := func(r db.Activity) {
+		if emit != nil {
+			r.NodeID, r.Worker = &intentID, name
+			emit(r)
+		}
+	}
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts), IntentID: intent.ID})
+	ctx = WithCTFProxy(ctx, w.proxyAddr, w.proxyCACert)
+	if !isCTFHelperContext(ctx) && !isCTFForkBranchContext(ctx) {
+		ctx = WithCTFHelperRunner(ctx, func(callCtx context.Context, req CTFHelperRequest) (CTFHelperResult, error) {
+			return w.runCTFHelper(callCtx, as, ts, taskID, intentID, runDir, emit, req)
+		})
+		ctx = WithCTFPlateauForkRunner(ctx, func(callCtx context.Context, req CTFPlateauForkRequest) (CTFPlateauForkResult, error) {
+			return w.runCTFPlateauFork(callCtx, as, ts, taskID, intentID, runDir, emit, req)
+		})
+	}
 	ctx, base = ctfBase(ctx, w.workDir, ts, taskID, intent.ID, base)
 	tools, def, cleanup := AugmentTools(ctx, "worker", base)
 	defer cleanup()
 
-	// 意图是 worker 的【唯一职责、贯穿整个 run 的不变量】→ 连同启动指令、意图锚定的目标资产
-	// 原始数据一起放进 system prompt：system 每次 run 都重新拼一遍、绝不会被 compaction 压掉，
-	// 长 run 里意图永远在场，续跑时也不依赖 transcript 历史是否留住那条首消息。代价是 system
-	// 混入 per-intent 易变数据、失去跨意图缓存复用；这是刻意的取舍（意图丢失比省 token 严重得多）。
-	// 与 planner「态势块放 user turn」分叉是有意的：planner 本身是产意图的那个、没有单一 mandate，
-	// worker 有。仅【全局态势 overview】留在启动 user 消息里——它可降级、容忍 stale，压掉无碍。
-	// 本次意图的专属工作目录 <workDir>/tasks/<taskID>/i<intentID>，引擎侧先建好。
-	runDir := ensureRunDir(w.workDir, taskID, intent.ID)
+	// KV Cache 友好设计：SystemPrompt 严格保持纯静态（跨意图/跨轮次字节级一致），
+	// 所有 per-task / per-intent 动态上下文（附件清单、约束、意图原文、目标资产、阶段指令与全局态势）
+	// 均装入首轮 user 消息 runBrief；续跑会话（len(s.Messages())>0）中它们已在历史首消息内。
 	// The run-wide intent is not the current tool action. Do not forward it or
 	// inherit a parent run's background into the action reviewer.
 	ctx = intercept.WithReviewContext(ctx, runDir, intercept.ReviewBackground{})
 	overview := renderWorkerGraphOverview(tsx.graphOverviewData())
-	sysBody := workerSystem(w.proxyAddr, w.proxyCACert, w.workDir, runDir)
 	ctfMode := isCTFContext(ctx)
 	phase := ""
+	sysBody := workerSystem(w.proxyAddr, w.proxyCACert, w.workDir, w.workDir)
 	if ctfMode {
 		sysBody = ctfWorkerSystem
 		phase = intentPhase(intent)
@@ -429,39 +439,34 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	if inputErr != nil {
 		return "", WriteCounts{}, inputErr
 	}
-	sysBody += inputs
+	var brief strings.Builder
+	brief.WriteString(inputs)
 	if w.wantConstraints() {
-		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,worker 执行时严格遵守
+		brief.WriteString(constraintBlock(ts)) // 操作约束(若有)注入首轮 user 消息，保持 SystemPrompt 静态
 	}
-	// 意图块 → 意图锚定资产块 → 启动指令，依次追加到 system 尾部（与 constraintBlock 同一套追加法）。
-	sysBody += renderIntentTask(intent)
+	if !ctfMode && runDir != "" && runDir != w.workDir {
+		fmt.Fprintf(&brief, "\n\n【本意图专属工作目录】：%s（已自动创建，相对路径即写在此处）", runDir)
+	}
+	brief.WriteString(renderIntentTask(intent))
 	if as != nil {
 		if ids := intentAssetIDs(intent); len(ids) > 0 {
 			if assets, err := as.GetByIDs(ids); err == nil && len(assets) > 0 {
 				if b, err := json.Marshal(assets); err == nil {
-					sysBody += "\n\n本意图 asset_ids 对应的目标资产：\n" + string(b)
-				}
-				// 意图明确针对的这些资产 → 自动纳入任务测试范围（与 insertAssets 同一套
-				// 保守粒度）。upsertTaskScope 的 ON CONFLICT DO NOTHING + uq_task_scope
-				// 唯一索引保证不会重复添加；重跑/重试同样是幂等 no-op。
-				// 资产覆盖度功能关闭时不再累积测试范围(分母)。
-				if coverageEnabled {
-					for _, a := range assets {
-						_ = as.AddAutoScope(taskID, a.Type, a.Domain, a.URL, a.IP)
-					}
+					brief.WriteString("\n\n本意图 asset_ids 对应的目标资产：\n" + string(b))
 				}
 			}
 		}
 	}
 	if ctfMode {
 		if phase == "recon" {
-			sysBody += "\n\n（请全程使用简体中文进行内部思考和步骤说明）【本意图阶段定位：仅前置侦察（RECON-ONLY）】你只负责完成本意图中明确要求的环境搭建、保护识别或远程握手/菜单/PoW 探测并调用 record_fact 写回完整路径与协议信息；严禁在本意图内顺手做完整逆向求解、下载无关大型依赖或自己编写 exploit 冲向 Flag，取得目标线索并写完 fact 后请立即结束本轮交还给 Planner。"
+			brief.WriteString("\n\n（请全程使用简体中文进行内部思考和步骤说明）【本意图阶段定位：仅前置侦察（RECON-ONLY）】你只负责完成本意图中明确要求的环境搭建、保护识别或远程握手/菜单/PoW 探测并调用 record_fact 写回完整路径与协议信息；严禁在本意图内顺手做完整逆向求解、下载无关大型依赖或自己编写 exploit 冲向 Flag，取得目标线索并写完 fact 后请立即结束本轮交还给 Planner。")
 		} else {
-			sysBody += "\n\n（请全程使用简体中文进行内部思考和步骤说明）执行当前 CTF 意图：先检查已有 fact 中的工作目录/ld-libc 环境与远程协议结论并直接复用（勿重复解包或重复下载 libc）；在同一次上下文中动静结合推进，在关键步骤与取得候选 Flag 时务必通过 record_fact 写回技术事实，得到候选 Flag 后立即交接并结束。"
+			brief.WriteString("\n\n（请全程使用简体中文进行内部思考和步骤说明）执行当前 CTF 意图：先检查已有 fact 中的工作目录/ld-libc 环境与远程协议结论并直接复用（勿重复解包或重复下载 libc）；在同一次上下文中动静结合推进，在关键步骤与取得候选 Flag 时务必通过 record_fact 写回技术事实，得到候选 Flag 后立即交接并结束。")
 		}
 	} else {
-		sysBody += "\n\n开始执行上面这条意图：只做它、只产生事实、assets、finding、做完即停。"
+		brief.WriteString("\n\n开始执行上面这条意图：只做它、只产生事实、assets、finding、做完即停。")
 	}
+	runBrief := brief.String()
 	system, boundary := deferredSystem(sysBody, def)
 	// 任务级 deadline(经 ctx 注入)夹逼本 run 的墙钟预算 + 决定收尾词(见 taskclock.go)。
 	tc := taskClockFrom(ctx)
@@ -520,27 +525,27 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	}
 	var ctfGate *ctfSubmissionProvider
 	if ctfMode {
+		baseHooks := hooks
+		if !isCTFHelperContext(ctx) && !isCTFForkBranchContext(ctx) {
+			var pg *db.DB
+			if ts != nil {
+				pg = ts.Database()
+			}
+			baseHooks = newCTFCriticHooks(hooks, w.prov, pg, taskID, intent.ID, emitWrap)
+		}
 		ctfGate = &ctfSubmissionProvider{Provider: opts.Provider, pg: ts.Database(), taskID: taskID}
 		opts.Provider = ctfGate
-		opts.Hooks = ctfSubmissionHooks{inner: hooks, gate: ctfGate}
+		opts.Hooks = ctfSubmissionHooks{inner: baseHooks, gate: ctfGate}
 	}
 	if w.tx != nil { // persist raw LLM conversation; one file per worked intent
 		opts.Transcript = w.tx
 		opts.SessionID = WorkerSessionID(ts.ID(), intent.ID)
 	}
-	intentID := intent.ID
-	emitWrap := func(r db.Activity) {
-		if emit != nil {
-			r.NodeID, r.Worker = &intentID, name
-			emit(r)
-		}
-	}
-	// 意图 / 启动指令 / 意图锚定资产已随 system prompt 下发（见上方 sysBody 组装）。
-	// 这条启动 user 消息只承载【全局态势 overview】——可降级的了解大局信息，压掉无碍。
-	// overview 罕见地 marshal 失败为空时，回退一句启动词，避免首轮出现空 user 消息。
-	input := overview
-	if strings.TrimSpace(input) == "" {
-		input = "开始执行 system 里领到的意图：只做它、只产生事实、assets、finding、做完即停。"
+	// 首轮启动 user 消息承载本轮动态上下文（输入清单/约束/意图详情/资产/阶段指令/全局态势），
+	// 使 SystemPrompt 严格静态、最大化 KV Cache 命中率。
+	input := strings.TrimSpace(runBrief + overview)
+	if input == "" {
+		input = "开始执行本轮意图：只做它、只产生事实、assets、finding、做完即停。"
 	}
 
 	// 实验功能:开启后由 noa 接管上下文压缩(归档集中在 <workDir>/noa/<SessionID> 下,持久)。
@@ -563,7 +568,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 			input = "继续执行。"
 			if ctfMode && ts != nil {
 				if cands, cerr := ts.Database().CTFCandidates(ctx, taskID); cerr == nil && len(cands) > 0 && cands[0].State == "rejected" {
-					input = fmt.Sprintf("上一轮候选 Flag `%s` 已被用户否定（备注：%s），请勿重复提交该值，请据此调整策略并继续执行。", cands[0].Value, cands[0].Notes)
+					input = formatCTFRejectionFeedback(cands[0])
 				}
 			}
 		} else if len(s.Messages()) > 0 {

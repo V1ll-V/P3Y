@@ -7,8 +7,8 @@ import (
 	"log"
 	"time"
 
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db"
+	"p3y/agent"
+	"p3y/db"
 )
 
 const (
@@ -236,7 +236,7 @@ func (sc *Scheduler) runVerificationQueue() {
 }
 
 func (sc *Scheduler) claimReadyVerification(ctx context.Context) (*db.VerificationJob, agent.Verifier, error) {
-	includeFindings := sc.s.engine == nil || sc.s.engine.lifecycleReady == nil || sc.s.engine.lifecycleReady()
+	includeFindings := false
 	var after int64
 	for {
 		candidates, err := sc.pg.VerificationCandidates(ctx, after, includeFindings)

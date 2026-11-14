@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
+	"p3y/db"
 	"github.com/google/uuid"
 )
 

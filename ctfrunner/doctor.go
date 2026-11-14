@@ -22,7 +22,7 @@ func (s *Server) tools(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
-	const name = "artex-ctf-doctor"
+	const name = "p3y-box-doctor"
 	id, err := s.Engine.Ensure(ctx, name, "doctor", "environment")
 	if err != nil {
 		fail(w, err)

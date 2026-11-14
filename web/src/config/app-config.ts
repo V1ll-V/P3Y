@@ -3,12 +3,12 @@ import packageJson from "../../package.json";
 const currentYear = new Date().getFullYear();
 
 export const APP_CONFIG = {
-  name: "ARTEX PM",
-  displayVersion: "v0.8.1",
+  name: "p3y",
+  displayVersion: "v0.9.0",
   version: packageJson.version,
-  copyright: `© ${currentYear}, ARTEX PM.`,
+  copyright: `© ${currentYear}, p3y.`,
   meta: {
-    title: "ARTEX PM v0.8.1 — 自主渗透测试控制台",
-    description: "LLM 驱动的自主渗透测试系统控制台",
+    title: "P3Y智能攻防系统控制台",
+    description: "LLM 驱动的 CTF 解题与自主网络攻防系统控制台",
   },
 };

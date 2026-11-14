@@ -183,6 +183,7 @@ export function CTFReportTab({ taskId, onTaskUpdated }: { taskId: string; onTask
   const [progress, setProgress] = React.useState<CTFProgress>();
   const [busy, setBusy] = React.useState(false);
   const [optimizing, setOptimizing] = React.useState(false);
+  const [crystallizingTips, setCrystallizingTips] = React.useState(false);
   const [changingMode, setChangingMode] = React.useState(false);
   const [proofSummary, setProofSummary] = React.useState("");
   const [proofNotes, setProofNotes] = React.useState("");
@@ -330,6 +331,17 @@ export function CTFReportTab({ taskId, onTaskUpdated }: { taskId: string; onTask
       toast.error(e instanceof Error ? e.message : "恢复 WP 失败");
     } finally {
       setOptimizing(false);
+    }
+  }
+  async function handleCrystallizeTips() {
+    setCrystallizingTips(true);
+    try {
+      const cards = await api.taskTipsCrystallize(taskId);
+      toast.success(`已提炼并入库 ${cards.length} 张 Tips 避坑卡（可在侧边栏「武库与套件」查看）`);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "提炼 Tips 失败");
+    } finally {
+      setCrystallizingTips(false);
     }
   }
   const verifyMode = progress?.verify_mode ?? "flag";
@@ -506,6 +518,10 @@ export function CTFReportTab({ taskId, onTaskUpdated }: { taskId: string; onTask
                     恢复标准版
                   </Button>
                 )}
+                <Button size="sm" variant="outline" disabled={busy || optimizing || crystallizingTips} onClick={() => void handleCrystallizeTips()}>
+                  <SparklesIcon className={crystallizingTips ? "animate-spin" : ""} />
+                  {crystallizingTips ? "提炼中…" : "提炼 Tips 避坑卡"}
+                </Button>
                 <Button size="sm" variant="outline" disabled={busy || optimizing} onClick={() => void refresh()}>
                   <RefreshCwIcon className={busy ? "animate-spin" : ""} />
                   刷新 WP

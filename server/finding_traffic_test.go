@@ -16,9 +16,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/traffic"
+	"p3y/agent"
+	"p3y/db"
+	"p3y/traffic"
 )
 
 func trafficEvidenceServer(t *testing.T) (*Server, *db.RecordedFinding, func(string, string, string) *httptest.ResponseRecorder) {
@@ -41,7 +41,7 @@ func trafficEvidenceServer(t *testing.T) (*Server, *db.RecordedFinding, func(str
 	query := uri.Query()
 	query.Set("search_path", schema)
 	uri.RawQuery = query.Encode()
-	t.Setenv("ARTEX_PG_DSN", uri.String())
+	t.Setenv("P3Y_PG_DSN", uri.String())
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
 		t.Fatal(err)
@@ -144,16 +144,8 @@ func TestFindingTrafficToolUpgradePreservesCustomization(t *testing.T) {
 		}
 	}
 	reader, _ := pg.GetTool("get_finding_traffic")
-	if reader.Enabled || !contains(reader.Agents, "reporter") {
-		t.Fatal("reader should be bound without enabling it")
-	}
-	if err := pg.RemoveAgentFromTool("reporter", "get_finding_traffic"); err != nil {
-		t.Fatal(err)
-	}
-	s.seedFindingTrafficTools()
-	reader, _ = pg.GetTool("get_finding_traffic")
-	if contains(reader.Agents, "reporter") {
-		t.Fatal("restart overwrote user's unbinding")
+	if reader.Enabled || len(reader.Agents) != 1 || reader.Agents[0] != "worker" {
+		t.Fatalf("custom reader configuration overwritten: %+v", reader)
 	}
 	if got, _ := pg.CurrentPrompt(worker.ID); got != "USER CUSTOM PROMPT" {
 		t.Fatal("custom prompt replaced")

@@ -7,7 +7,6 @@ import Link from "next/link";
 import { ArrowDownIcon, ArrowUpIcon, ArrowUpRightIcon, ChevronRightIcon } from "lucide-react";
 import { toast } from "sonner";
 
-import { FindingVerdictBadge, FindingVerdictScope } from "@/components/finding-verdict";
 import { StatusBadge } from "@/components/status-badge";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
@@ -21,7 +20,7 @@ import { cn } from "@/lib/utils";
 type FindingSortField = "time";
 
 const FINDING_SORT_FIELDS: readonly FindingSortField[] = ["time"];
-const FINDING_SORT_PREFERENCE_KEY = "artex_task_findings_sort";
+const FINDING_SORT_PREFERENCE_KEY = "p3y_task_findings_sort";
 
 function findingLabel(finding: Finding): string {
   if (finding.name?.trim()) return finding.name;
@@ -62,12 +61,7 @@ function Row({
           <ChevronRightIcon
             className={cn("size-4 shrink-0 text-muted-foreground transition-transform", open && "rotate-90")}
           />
-          <FindingVerdictBadge finding={f} />
-          {f.effective && !f.display_severity ? (
-            <Badge variant="outline">等级未独立确认</Badge>
-          ) : (
-            <StatusBadge domain="severity" value={f.display_severity || f.severity} dot />
-          )}
+          <StatusBadge domain="severity" value={f.display_severity || f.severity} dot />
           <div className="flex min-w-0 flex-1 flex-col gap-1">
             <div className="flex min-w-0 items-center gap-2">
               <span className="truncate font-medium">{findingLabel(f)}</span>

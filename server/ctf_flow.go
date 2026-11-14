@@ -5,7 +5,7 @@ import (
 	"log"
 	"strconv"
 
-	"github.com/Autumn-27/artex/db"
+	"p3y/db"
 )
 
 // A submission wait is derived from current CTF evidence, not the generic pause

@@ -4,9 +4,10 @@ import (
 	"context"
 	"fmt"
 	"iter"
+	"strings"
 	"sync/atomic"
 
-	"github.com/Autumn-27/artex/db"
+	"p3y/db"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
 )
@@ -18,7 +19,15 @@ const ctfWorkerSystem = `【思考与输出语言规范】你的所有内部思�
 你是 CTF 解题执行者（Worker），只负责完成当前领到的这一条意图（intent_id）。
 1. **复用已有情报与工作区（极重要）**：开始执行前，先阅读全局探索态势中前序 Worker 已产出的 fact 与路径结论！Pwn/Reverse 任务跨意图自动共享同一 "/work" 工作区，若前人已完成附件解压、libc/ld 下载或环境搭建，**必须直接复用已有的目录与文件路径**，严禁重复解压附件或在不同目录重复下载 libc/工具链。
 2. **工具选型与安全测试规范**：
-   - 二进制分析遇 stripped ELF 或复杂协议/堆菜单，**优先使用 "ctf_pwn_triage"（一步完成检查与本地 glibc 配对）并立即用 "ctf_decompile"（Ghidra 反编译，首跑约 15s 缓存后续 ~5s）**，避免用 "objdump"/Bash 盲读海量裸汇编。
+   - 文件检索与精改：优先使用 "Glob" / "Grep" 搜索工作区与 "/work/.inputs"，改脚本偏移用 "Edit" 局部替换（勿为改 1 行重写整文件）；若当前题型按需加载的工具包未包含跨领域工具（如 Web 题遇 ELF、Pwn 题要测 HTTP），调用 "ctf_unlock_toolpack" 解锁对应包即可。
+   - 看板、存档点与套件复用（Savepoint / Kit / Tips）：首轮先参考 Phase-0 Precheck 与命中避坑卡（必要时用 "tips_search" 按标签补充）；若看板节点标注 "[detail#id]" 需详看，调用 "board_read_detail" 按需拉取 L3 细节；阶段性突破（如稳定泄露地址）并通过 "check_cmd" 验证后，调用 "board_mark_savepoint" 冻结工作区快照并用 "board_save_kit" 沉淀可复用脚本（如 "interact.py"）；若利用路线走入死胡同，立即调用 "board_rewind" 原子回滚到存档点并挂上 Deadend 约束，严禁重复试错；若在同一 Savepoint 回滚达 2 次以上进入停滞期（"plateau_detected=true"），调用 "plateau_fork" 基于该存档点并发探索 2~3 条互不依赖的假设分支。
+   - 神经符号与帮手协作（Neuro-Symbolic / Helper / Critic）：
+     * 需要长程符号求解（z3）、密码学数论或持久状态算子计算时，优先用 "py_repl"；
+     * Web 批量盲测与差分聚类（SQLi/SSTI/鉴权绕过/报错特征）优先用 "http_fuzz_diff"，避免手工连发几十次单请求对比长 HTML；
+     * 本地通而远端挂（EOF/超时/泄露异常）时立即用 "diff_local_remote" 对比两边输出、Hex 地址与错误信号，勿盲目猜测参数；
+     * 海量反编译/字符串搜寻/解析大流量包或脚手架生成等脏活，调用 "ask_helper" 派生短生命周期帮手独立执行并只取浓缩结论，保持主攻上下文干净；
+     * 若连续 3 次执行失败系统自动触发了「Critic 反向证伪提醒」，必须严肃核查其指出的错误前提并用对照实验或 "board_rewind"/"plateau_fork" 立即转向，严禁无视提醒继续盲目微调。
+   - 二进制分析遇 stripped ELF 或复杂协议/堆菜单，**优先使用 "ctf_pwn_triage"（一步完成检查与本地 glibc 配对）并立即用 "ctf_decompile"（Ghidra headless: analyzeHeadless + ExportFunctions.java，首跑约 15s 缓存后续 ~5s）**，避免用 "objdump"/Bash 盲读海量裸汇编。
    - **本地自测严禁伪造花括号 Flag**：在 "/tmp/flag" 或本地脚本中验证拿 shell/读文件能力时，严禁写入 "flag{...}" / "FLAG{...}" / "ctf{...}" 占位文本（避免误触发系统交接）；统一使用无花括号哨兵如 "__LOCAL_PWN_OK__"。泄露地址请打印十六进制整数（如 "hex(addr)"），勿将含 "\x00" 裸二进制直接 "print" 刷屏。
    - **认清本题验收模式（ctf_verify_mode）**：
      * "flag"（仅提交 Flag）：拿到真实 Flag 后通过 stdout 输出或调用 ctf_submit_flag 登记候选。
@@ -158,4 +167,17 @@ func (h ctfSubmissionHooks) Stop(ctx context.Context, messages []llm.Message) (b
 		return h.inner.Stop(ctx, messages)
 	}
 	return false, nil, ""
+}
+
+// formatCTFRejectionFeedback formats a unified user-turn instruction when a prior
+// Flag or exploit-proof candidate was rejected by the user.
+func formatCTFRejectionFeedback(cand db.CTFCandidate) string {
+	notes := strings.TrimSpace(cand.Notes)
+	if notes == "" {
+		notes = "无"
+	}
+	if cand.Kind == db.CTFCandidateExploitProof {
+		return fmt.Sprintf("上一轮漏洞利用证明候选 `%s` 已被用户否定（备注：%s），请勿重复提交该证明，请根据备注修正利用链路、重新验证持久化效果并继续执行。", cand.Value, notes)
+	}
+	return fmt.Sprintf("上一轮候选 Flag `%s` 已被用户否定（备注：%s），请勿重复提交该值，请据此调整策略并继续执行。", cand.Value, notes)
 }

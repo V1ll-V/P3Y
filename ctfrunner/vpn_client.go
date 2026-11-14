@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-// Configured reports whether an external ctf-runner endpoint and token are present.
+// Configured reports whether an external p3y-box endpoint and token are present.
 func (c *Client) Configured() bool {
 	return c != nil && strings.TrimSpace(c.URL) != "" && strings.TrimSpace(c.Token) != ""
 }
@@ -46,7 +46,7 @@ func (c *Client) DeleteTaskResources(ctx context.Context, taskID int64) error {
 
 func (c *Client) doVPNRequest(ctx context.Context, method, path string, body, out any) error {
 	if !c.Configured() {
-		return errors.New("CTF 执行器未配置：请部署 ctf-runner 并设置 ARTEX_CTF_RUNNER_URL / TOKEN")
+		return errors.New("p3y-box 沙箱执行器未配置：请部署 p3y-box 并设置 P3Y_BOX_URL / P3Y_BOX_TOKEN")
 	}
 	var reader io.Reader
 	if body != nil {
@@ -85,7 +85,7 @@ func (c *Client) doVPNRequest(ctx context.Context, method, path string, body, ou
 		if msg == "" {
 			msg = resp.Status
 		}
-		return fmt.Errorf("ctf-runner %s %s: %s", method, path, msg)
+		return fmt.Errorf("p3y-box %s %s: %s", method, path, msg)
 	}
 	if out != nil && len(bytes.TrimSpace(rawResp)) > 0 {
 		return json.Unmarshal(rawResp, out)

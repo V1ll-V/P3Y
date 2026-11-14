@@ -9,15 +9,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
+	"p3y/db"
 )
 
 // The queue scans globally, so this test needs its own schema rather than
 // modifying/superseding jobs belonging to other tests on the shared database.
 func privateVerificationDB(t *testing.T) *db.DB {
 	t.Helper()
-	if os.Getenv("ARTEX_PG_DSN") == "" {
-		t.Skip("ARTEX_PG_DSN required for isolated queue test")
+	if os.Getenv("P3Y_PG_DSN") == "" {
+		t.Skip("P3Y_PG_DSN required for isolated queue test")
 	}
 	root := openTestPG(t)
 	t.Cleanup(func() { root.Close() })
@@ -81,7 +81,7 @@ func TestGoalVerificationContinuesWithOptionalFindingAutomationDisabled(t *testi
 	m := &Manager{pg: d, dir: t.TempDir()}
 	s := &Server{m: m, ctx: t.Context()}
 	s.engine = NewEngine(m)
-	s.engine.lifecycleReady = func() bool { return false }
+	_ = s.engine
 	s.SetVerifier(&fakeVerifier{result: db.VerdictResult{GoalVerdict: "met", Rationale: "local inventory supplied", PolicyVersion: db.VerdictPolicyVersion}})
 	sc := newScheduler(s)
 	sc.fireVerdictWorkflow()
@@ -138,8 +138,12 @@ func TestVerificationQueueCapsAcrossTicksAndCancelsOnShutdown(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err = d.Exploration(tk.ExplorationID).RecordFinding(t.Context(), db.RecordFindingInput{TaskID: tk.ID,
-			Summary: "candidate", Evidence: "local evidence", Name: "fixture", VulnClass: "test", Severity: "low", Worker: "test"}); err != nil {
+		es := d.Exploration(tk.ExplorationID)
+		goal, err := es.AddGoal(map[string]any{"text": "local candidate"}, "test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = es.EnqueueGoalEvaluation(goal, 0); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -17,11 +17,11 @@ func testPaths(t *testing.T) Paths {
 	dir := t.TempDir()
 	return Paths{
 		Dir:     dir,
-		Current: filepath.Join(dir, "artex"),
-		New:     filepath.Join(dir, "artex.new"),
-		Sum:     filepath.Join(dir, "artex.new.sha256"),
-		Old:     filepath.Join(dir, "artex.old"),
-		Marker:  filepath.Join(dir, "artex.upgrade.json"),
+		Current: filepath.Join(dir, "p3y"),
+		New:     filepath.Join(dir, "p3y.new"),
+		Sum:     filepath.Join(dir, "p3y.new.sha256"),
+		Old:     filepath.Join(dir, "p3y.old"),
+		Marker:  filepath.Join(dir, "p3y.upgrade.json"),
 	}
 }
 
@@ -314,7 +314,7 @@ func TestParseSums(t *testing.T) {
 
 func TestExtractBinaryFindsNestedEntry(t *testing.T) {
 	if runtime.GOOS == "windows" {
-		t.Skip("包内基名在 Windows 上是 artex.exe，此用例按 Unix 命名构造")
+		t.Skip("包内基名在 Windows 上是 p3y.exe，此用例按 Unix 命名构造")
 	}
 	dir := t.TempDir()
 	zipPath := filepath.Join(dir, "release.zip")
@@ -324,12 +324,12 @@ func TestExtractBinaryFindsNestedEntry(t *testing.T) {
 		t.Fatal(err)
 	}
 	zw := zip.NewWriter(f)
-	// 真实发布包的结构：artex-<版本>-<os>-<arch>/artex，外加若干干扰文件。
+	// 真实发布包的结构：p3y-<版本>-<os>-<arch>/p3y，外加若干干扰文件。
 	for name, body := range map[string]string{
-		"artex-0.3.8-linux-amd64/README.md":           "readme",
-		"artex-0.3.8-linux-amd64/skills/a.md":         "skill",
-		"artex-0.3.8-linux-amd64/artex":               "#!/bin/sh\nexit 0\n",
-		"artex-0.3.8-linux-amd64/config.example.json": "{}",
+		"p3y-0.3.8-linux-amd64/README.md":           "readme",
+		"p3y-0.3.8-linux-amd64/skills/a.md":         "skill",
+		"p3y-0.3.8-linux-amd64/p3y":                 "#!/bin/sh\nexit 0\n",
+		"p3y-0.3.8-linux-amd64/config.example.json": "{}",
 	} {
 		w, err := zw.Create(name)
 		if err != nil {
@@ -405,12 +405,12 @@ func TestCheckURLRejectsNonGitHub(t *testing.T) {
 }
 
 func TestAssetNameMatchesBuildScript(t *testing.T) {
-	// build.sh 的 package_binary 用的是 artex-<版本>-<os>-<arch>.zip，且版本号
+	// build.sh 的 package_binary 用的是 p3y-<版本>-<os>-<arch>.zip，且版本号
 	// 去掉了 v 前缀。这里对错一个字符，所有平台的一键更新都会找不到资产。
-	if got := AssetName("v0.3.8", "linux", "amd64"); got != "artex-0.3.8-linux-amd64.zip" {
+	if got := AssetName("v0.3.8", "linux", "amd64"); got != "p3y-0.3.8-linux-amd64.zip" {
 		t.Errorf("AssetName = %q", got)
 	}
-	if got := AssetName("0.3.8", "windows", "amd64"); got != "artex-0.3.8-windows-amd64.zip" {
+	if got := AssetName("0.3.8", "windows", "amd64"); got != "p3y-0.3.8-windows-amd64.zip" {
 		t.Errorf("AssetName = %q", got)
 	}
 }

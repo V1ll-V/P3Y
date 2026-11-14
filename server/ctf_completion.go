@@ -5,7 +5,7 @@ import (
 	"errors"
 	"strconv"
 
-	"github.com/Autumn-27/artex/db"
+	"p3y/db"
 )
 
 func (m *Manager) DecideCTFAnswer(ctx context.Context, t *Task, candidateID, revision int64, state, notes string, finish bool) (db.CTFCandidate, error) {

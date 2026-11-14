@@ -1,12 +1,39 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 
-	"github.com/Autumn-27/artex/db"
+	"p3y/db"
 )
+
+// taskScopeInputs accepts both [{kind,value}] and historical ["example.com"] inputs.
+type taskScopeInputs []db.ScopeInput
+
+func (items *taskScopeInputs) UnmarshalJSON(data []byte) error {
+	var rawItems []json.RawMessage
+	if err := json.Unmarshal(data, &rawItems); err != nil {
+		return err
+	}
+	out := make([]db.ScopeInput, 0, len(rawItems))
+	for i, raw := range rawItems {
+		var legacy string
+		if err := json.Unmarshal(raw, &legacy); err == nil {
+			out = append(out, db.ScopeInput{Value: legacy})
+			continue
+		}
+		var structured db.ScopeInput
+		if err := json.Unmarshal(raw, &structured); err != nil {
+			return fmt.Errorf("scope[%d] must be a string or {kind,value}", i)
+		}
+		out = append(out, structured)
+	}
+	*items = out
+	return nil
+}
 
 const maxTaskAssetRequestBytes = 512 << 10
 
@@ -31,7 +58,7 @@ func (s *Server) attachTaskAssets(w http.ResponseWriter, r *http.Request) {
 	var request struct {
 		AssetIDs      []int64            `json:"asset_ids"`
 		SourceSummary string             `json:"source_summary"`
-		Scope         companyScopeInputs `json:"scope"`
+		Scope         taskScopeInputs `json:"scope"`
 	}
 	if err := decode(r, &request); err != nil {
 		var tooLarge *http.MaxBytesError

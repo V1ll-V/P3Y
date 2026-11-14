@@ -6,9 +6,9 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/guard"
-	"github.com/Autumn-27/artex/intercept"
+	"p3y/db"
+	"p3y/guard"
+	"p3y/intercept"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/permission"
@@ -119,10 +119,6 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 	// visible skills/MCP and lets the DB tools table filter/override. DefaultTools
 	// have no tools-table rows, so they always pass through.
 	base := actool.DefaultTools()
-	reviewMode := ReviewModeFromContext(ctx)
-	if reviewMode == ReviewModeEvidenceOnly {
-		base = evidenceOnlyTools(base)
-	}
 	ctx = WithRunInfo(ctx, RunInfo{SessionID: sessionID})
 	tools, def, cleanup := AugmentTools(ctx, agentKey, base)
 	defer cleanup()
@@ -136,7 +132,7 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 		DeferredTools:   def.Deferred,
 		UnlockSet:       def.Unlock,
 		PermissionMode:  permission.ModeBypass,
-		EnableWebFetch:  reviewMode != ReviewModeEvidenceOnly, // 只读复核不发起新请求
+		EnableWebFetch:  true,
 		WebFetchProxy:   c.proxyAddr,
 		WebFetchCACert:  c.proxyCACert,
 		// 联网搜索(可选)。ddgs 无需 key；brave-free 需 BraveKey；tavily 需 TavilyKey。
@@ -193,16 +189,3 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 	return text, err
 }
 
-// evidenceOnlyTools narrows a chat agent's base tools to read-only inspection
-// for an evidence-only triage review: no shell (Bash), no file writes
-// (Write/Edit), and WebFetch is disabled separately via Options.
-func evidenceOnlyTools(tools []actool.CoreTool) []actool.CoreTool {
-	allowed := map[string]bool{"Read": true, "LS": true, "Glob": true, "Grep": true}
-	out := make([]actool.CoreTool, 0, len(tools))
-	for _, t := range tools {
-		if allowed[t.Name()] {
-			out = append(out, t)
-		}
-	}
-	return out
-}

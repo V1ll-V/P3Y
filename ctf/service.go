@@ -20,20 +20,59 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Autumn-27/artex/artifacts"
-	"github.com/Autumn-27/artex/ctfrunner"
-	"github.com/Autumn-27/artex/db"
+	"p3y/artifacts"
+	"p3y/ctfrunner"
+	"p3y/db"
 	"github.com/google/uuid"
 )
 
 type Service struct {
-	Root   string
-	DB     *db.DB
-	Runner *ctfrunner.Client
+	Root        string
+	DB          *db.DB
+	Runner      *ctfrunner.Client
+	BindMount   bool
+	HostRoot    string
+	ProxyAddr   string
+	ProxyCACert string
 }
 
 func New(root string, pg *db.DB) *Service {
-	return &Service{Root: root, DB: pg, Runner: &ctfrunner.Client{URL: os.Getenv("ARTEX_CTF_RUNNER_URL"), Token: os.Getenv("ARTEX_CTF_RUNNER_TOKEN")}}
+	return &Service{
+		Root:      root,
+		DB:        pg,
+		Runner:    &ctfrunner.Client{URL: os.Getenv("P3Y_BOX_URL"), Token: os.Getenv("P3Y_BOX_TOKEN")},
+		BindMount: os.Getenv("P3Y_BOX_BIND_MOUNT") == "1",
+		HostRoot:  strings.TrimSpace(os.Getenv("P3Y_BOX_HOST_ROOT")),
+	}
+}
+
+// WithProxy configures the host MITM traffic proxy passed into sandbox containers.
+func (s *Service) WithProxy(addr, caCert string) *Service {
+	if s == nil {
+		return nil
+	}
+	s.ProxyAddr = strings.TrimSpace(addr)
+	s.ProxyCACert = strings.TrimSpace(caCert)
+	return s
+}
+
+func (s *Service) bindMountEnabled() bool {
+	return s != nil && (s.BindMount || os.Getenv("P3Y_BOX_BIND_MOUNT") == "1")
+}
+
+func (s *Service) hostBindPath(localPath string) string {
+	hostRoot := strings.TrimSpace(s.HostRoot)
+	if hostRoot == "" {
+		hostRoot = strings.TrimSpace(os.Getenv("P3Y_BOX_HOST_ROOT"))
+	}
+	if hostRoot == "" || s.Root == "" {
+		return localPath
+	}
+	rel, err := filepath.Rel(s.Root, localPath)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return localPath
+	}
+	return filepath.Join(hostRoot, rel)
 }
 func Hash(m artifacts.Manifest) string { b, _ := json.Marshal(m); return SHA(b) }
 func SHA(b []byte) string              { sum := sha256.Sum256(b); return hex.EncodeToString(sum[:]) }
@@ -42,7 +81,11 @@ func (s *Service) Sync(ctx context.Context, id int64) error {
 	if err != nil {
 		return err
 	}
-	return s.DB.SyncCTFInput(ctx, id, Hash(m))
+	if err := s.DB.SyncCTFInput(ctx, id, Hash(m)); err != nil {
+		return err
+	}
+	_, _ = s.RunPrecheck(ctx, id, false)
+	return nil
 }
 func (s *Service) WorkDir(task, intent int64) string {
 	return filepath.Join(s.Root, "tasks", strconv.FormatInt(task, 10), fmt.Sprintf("i%d", intent), "ctf-work")
@@ -80,6 +123,16 @@ func executionLock(key string) func() {
 	return m.Unlock
 }
 
+func (s *Service) sessionKey(ctx context.Context, task, intent int64) (string, string, error) {
+	sessionIntent, work, _, _ := s.resolveScope(ctx, task, intent)
+	m, err := (artifacts.Store{Root: s.Root}).Inputs(task, sessionIntent)
+	if err != nil {
+		return "", "", err
+	}
+	spec := ctfrunner.SessionSpec{TaskID: task, IntentID: sessionIntent, InputHash: Hash(m)}
+	return spec.Key(), work, nil
+}
+
 func (s *Service) prepareSession(ctx context.Context, task, intent int64) (string, ctfrunner.Session, artifacts.Manifest, string, error) {
 	sessionIntent, work, _, shared := s.resolveScope(ctx, task, intent)
 	store := artifacts.Store{Root: s.Root}
@@ -87,7 +140,13 @@ func (s *Service) prepareSession(ctx context.Context, task, intent int64) (strin
 	if err != nil {
 		return "", ctfrunner.Session{}, m, "", err
 	}
-	spec, err := s.sessionSpec(ctx, task, sessionIntent, m)
+	if !shared {
+		seedNonSharedWorkDir(s.Root, task, work)
+	}
+	if err = os.MkdirAll(work, 0700); err != nil {
+		return "", ctfrunner.Session{}, m, "", err
+	}
+	spec, err := s.sessionSpec(ctx, task, sessionIntent, m, work)
 	if err != nil {
 		return "", ctfrunner.Session{}, m, "", err
 	}
@@ -108,14 +167,10 @@ func (s *Service) prepareSession(ctx context.Context, task, intent int64) (strin
 			return "", session, m, "", err
 		}
 	}
-	if !shared {
-		seedNonSharedWorkDir(s.Root, task, work)
-	}
-	if err = os.MkdirAll(work, 0700); err != nil {
-		return "", session, m, "", err
-	}
-	if err = s.uploadWork(ctx, key, work); err != nil {
-		return "", session, m, "", err
+	if !s.bindMountEnabled() {
+		if err = s.uploadWork(ctx, key, work); err != nil {
+			return "", session, m, "", err
+		}
 	}
 	return key, session, m, work, nil
 }
@@ -128,16 +183,28 @@ func pendingCTFWaitError(pending *db.CTFCandidate) error {
 }
 
 func (s *Service) Execute(ctx context.Context, task, intent int64, command string, timeout int) (*db.CTFExecution, error) {
+	return s.execute(ctx, task, intent, command, timeout, true, true)
+}
+
+// ExecuteRaw runs a sandbox command for deterministic automation (e.g. AD Repeater / Red-Blue Patcher)
+// without stopping on pending Jeopardy candidates or creating spurious Jeopardy candidate rows.
+func (s *Service) ExecuteRaw(ctx context.Context, task, intent int64, command string, timeout int) (*db.CTFExecution, error) {
+	return s.execute(ctx, task, intent, command, timeout, false, false)
+}
+
+func (s *Service) execute(ctx context.Context, task, intent int64, command string, timeout int, enforcePendingCheck, autoCandidates bool) (*db.CTFExecution, error) {
 	sessionIntent, _, lockKey, _ := s.resolveScope(ctx, task, intent)
 	unlock := executionLock(lockKey)
 	defer unlock()
 	if err := s.Sync(ctx, task); err != nil {
 		return nil, err
 	}
-	if pending, err := s.DB.PendingCTFSubmission(ctx, task); err != nil {
-		return nil, err
-	} else if pending != nil {
-		return nil, pendingCTFWaitError(pending)
+	if enforcePendingCheck {
+		if pending, err := s.DB.PendingCTFSubmission(ctx, task); err != nil {
+			return nil, err
+		} else if pending != nil {
+			return nil, pendingCTFWaitError(pending)
+		}
 	}
 	key, session, m, work, err := s.prepareSession(ctx, task, intent)
 	if err != nil {
@@ -177,7 +244,7 @@ func (s *Service) Execute(ctx context.Context, task, intent int64, command strin
 	// Persist a cancelled execution too. The runner kills its container on timeout.
 	saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
-	if runErr == nil && result.Error == "" {
+	if runErr == nil && result.Error == "" && !s.bindMountEnabled() {
 		if body, er := s.Runner.Download(saveCtx, key); er == nil {
 			er = s.extractWork(body, work)
 			body.Close()
@@ -212,13 +279,15 @@ func (s *Service) Execute(ctx context.Context, task, intent int64, command strin
 	if err = s.DB.SaveCTFExecution(saveCtx, e); err != nil {
 		return nil, err
 	}
-	if verifyMode, _ := s.DB.TaskCTFVerifyMode(saveCtx, task); verifyMode != db.CTFVerifyExploitProof {
-		for _, flag := range ExtractFlags(string(result.Stdout)+"\n"+string(result.Stderr), 32) {
-			if IsSelfConstructedMockFlag(command, flag) {
-				continue
-			}
-			if _, err = s.DB.AddCTFOutputCandidate(saveCtx, task, e.ID, flag); err != nil {
-				return nil, err
+	if autoCandidates {
+		if verifyMode, _ := s.DB.TaskCTFVerifyMode(saveCtx, task); verifyMode != db.CTFVerifyExploitProof {
+			for _, flag := range ExtractFlags(string(result.Stdout)+"\n"+string(result.Stderr), 32) {
+				if IsSelfConstructedMockFlag(command, flag) {
+					continue
+				}
+				if _, err = s.DB.AddCTFOutputCandidate(saveCtx, task, e.ID, flag); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
@@ -277,7 +346,7 @@ func (s *Service) StartJob(ctx context.Context, task, intent int64, command, job
 }
 
 func (s *Service) ListJobs(ctx context.Context, task, intent int64) ([]ctfrunner.JobInfo, error) {
-	key, _, _, _, err := s.prepareSession(ctx, task, intent)
+	key, _, err := s.sessionKey(ctx, task, intent)
 	if err != nil {
 		return nil, err
 	}
@@ -285,7 +354,7 @@ func (s *Service) ListJobs(ctx context.Context, task, intent int64) ([]ctfrunner
 }
 
 func (s *Service) JobStatus(ctx context.Context, task, intent int64, jobID string, tailLines int) (*ctfrunner.JobStatus, error) {
-	key, _, _, _, err := s.prepareSession(ctx, task, intent)
+	key, _, err := s.sessionKey(ctx, task, intent)
 	if err != nil {
 		return nil, err
 	}
@@ -307,7 +376,7 @@ func (s *Service) JobStatus(ctx context.Context, task, intent int64, jobID strin
 }
 
 func (s *Service) StopJob(ctx context.Context, task, intent int64, jobID string) error {
-	key, _, _, _, err := s.prepareSession(ctx, task, intent)
+	key, _, err := s.sessionKey(ctx, task, intent)
 	if err != nil {
 		return err
 	}
@@ -343,7 +412,7 @@ func (s *Service) StartInteractive(ctx context.Context, task, intent int64, comm
 }
 
 func (s *Service) ListInteractive(ctx context.Context, task, intent int64) ([]ctfrunner.InteractiveSessionInfo, error) {
-	key, _, _, _, err := s.prepareSession(ctx, task, intent)
+	key, _, err := s.sessionKey(ctx, task, intent)
 	if err != nil {
 		return nil, err
 	}
@@ -351,7 +420,7 @@ func (s *Service) ListInteractive(ctx context.Context, task, intent int64) ([]ct
 }
 
 func (s *Service) WriteInteractive(ctx context.Context, task, intent int64, sid, data, encoding string, autoNewline bool) (*ctfrunner.InteractiveWriteResult, error) {
-	key, _, _, _, err := s.prepareSession(ctx, task, intent)
+	key, _, err := s.sessionKey(ctx, task, intent)
 	if err != nil {
 		return nil, err
 	}
@@ -359,7 +428,7 @@ func (s *Service) WriteInteractive(ctx context.Context, task, intent int64, sid,
 }
 
 func (s *Service) ReadInteractive(ctx context.Context, task, intent int64, sid string, offset int64, waitMs int) (*ctfrunner.InteractiveReadResult, error) {
-	key, _, _, _, err := s.prepareSession(ctx, task, intent)
+	key, _, err := s.sessionKey(ctx, task, intent)
 	if err != nil {
 		return nil, err
 	}
@@ -382,11 +451,50 @@ func (s *Service) ReadInteractive(ctx context.Context, task, intent int64, sid s
 }
 
 func (s *Service) CloseInteractive(ctx context.Context, task, intent int64, sid string) error {
-	key, _, _, _, err := s.prepareSession(ctx, task, intent)
+	key, _, err := s.sessionKey(ctx, task, intent)
 	if err != nil {
 		return err
 	}
 	return s.Runner.CloseInteractive(ctx, key, sid)
+}
+
+// CreateSavepoint freezes the container /work state via hardlink snapshot.
+func (s *Service) CreateSavepoint(ctx context.Context, task, intent int64, id string) (ctfrunner.SavepointResult, error) {
+	_, _, lockKey, _ := s.resolveScope(ctx, task, intent)
+	unlock := executionLock(lockKey)
+	defer unlock()
+	key, _, _, _, err := s.prepareSession(ctx, task, intent)
+	if err != nil {
+		return ctfrunner.SavepointResult{}, err
+	}
+	return s.Runner.CreateSavepoint(ctx, key, id)
+}
+
+// Rewind restores a previously created /work savepoint and syncs back to host mirror when needed.
+func (s *Service) Rewind(ctx context.Context, task, intent int64, id string) (ctfrunner.RewindResult, error) {
+	_, _, lockKey, _ := s.resolveScope(ctx, task, intent)
+	unlock := executionLock(lockKey)
+	defer unlock()
+	key, work, err := s.sessionKey(ctx, task, intent)
+	if err != nil {
+		return ctfrunner.RewindResult{}, err
+	}
+	res, err := s.Runner.Rewind(ctx, key, id)
+	if err != nil {
+		return res, err
+	}
+	if !s.bindMountEnabled() {
+		if body, dlErr := s.Runner.Download(ctx, key); dlErr == nil {
+			syncErr := s.extractWork(body, work)
+			body.Close()
+			if syncErr != nil {
+				return res, fmt.Errorf("读档后工作文件同步失败：%w", syncErr)
+			}
+		} else {
+			return res, fmt.Errorf("读档后工作文件同步失败：%w", dlErr)
+		}
+	}
+	return res, nil
 }
 
 func excerpt(b []byte, n int) string {
@@ -547,7 +655,7 @@ const (
 )
 
 func maxWorkBytes() int64 {
-	if raw := strings.TrimSpace(os.Getenv("ARTEX_CTF_WORKDIR_MAX_MB")); raw != "" {
+	if raw := strings.TrimSpace(os.Getenv("P3Y_BOX_WORKDIR_MAX_MB")); raw != "" {
 		if mb, err := strconv.Atoi(raw); err == nil && mb >= 64 {
 			if mb > 2048 {
 				mb = 2048

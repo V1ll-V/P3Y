@@ -38,40 +38,40 @@ update_docker(){
   # 可选：升级到指定版本 tag（不填则沿用 .env，缺省 local）
   local tag; tag="$(ask '目标镜像 tag（回车沿用 .env / local）' '')"
   if [ -n "$tag" ]; then
-    if grep -q '^ARTEX_TAG=' .env; then
-      sed -i.bak "s|^ARTEX_TAG=.*|ARTEX_TAG=${tag}|" .env && rm -f .env.bak
+    if grep -q '^P3Y_TAG=' .env; then
+      sed -i.bak "s|^P3Y_TAG=.*|P3Y_TAG=${tag}|" .env && rm -f .env.bak
     else
-      printf '\nARTEX_TAG=%s\n' "$tag" >> .env
+      printf '\nP3Y_TAG=%s\n' "$tag" >> .env
     fi
-    ok "已将 ARTEX_TAG 设为 ${tag}"
-  elif ! grep -q '^ARTEX_TAG=' .env; then
-    printf '\nARTEX_TAG=local\n' >> .env
-    ok "已补充 ARTEX_TAG=local"
+    ok "已将 P3Y_TAG 设为 ${tag}"
+  elif ! grep -q '^P3Y_TAG=' .env; then
+    printf '\nP3Y_TAG=local\n' >> .env
+    ok "已补充 P3Y_TAG=local"
   fi
 
   local effective
-  effective="$(sed -n 's/^ARTEX_TAG=//p' .env | tail -n1 | tr -d '\r')"
+  effective="$(sed -n 's/^P3Y_TAG=//p' .env | tail -n1 | tr -d '\r')"
   effective="${effective:-local}"
   local arch; arch="${TARGETARCH:-$(host_arch)}"
 
   if [ "$effective" = "local" ]; then
-    [ -f "dist/${arch}/artex" ] || die "未找到 dist/${arch}/artex；请先按 README「快速开始（本分支）」构建二进制"
-    info "本地重建镜像 autumn27/artex:local …"
-    docker build --build-arg TARGETARCH="${arch}" -t "autumn27/artex:local" .
+    [ -f "dist/${arch}/p3y" ] || die "未找到 dist/${arch}/p3y；请先按 README「快速开始（本分支）」构建二进制"
+    info "本地重建镜像 p3y/p3y:local …"
+    docker build --build-arg TARGETARCH="${arch}" -t "p3y/p3y:local" .
   else
-    warn "将拉取上游镜像 autumn27/artex:${effective}，它不包含本分支改动。"
+    warn "将拉取上游镜像 p3y/p3y:${effective}，它不包含本分支改动。"
     [ "$(ask '确认拉取上游镜像? (y/n)' n)" = y ] || die "已取消"
-    info "拉取镜像 autumn27/artex:${effective} …"
-    docker compose pull artex
+    info "拉取镜像 p3y/p3y:${effective} …"
+    docker compose pull p3y
   fi
 
-  # 只动 artex：postgres 是固定的 16-alpine，不需要跟着升级（拉它纯属浪费带宽，
-  # 且大版本变动还会有兼容风险）。artex 声明了 depends_on postgres，所以带服务名
+  # 只动 p3y：postgres 是固定的 16-alpine，不需要跟着升级（拉它纯属浪费带宽，
+  # 且大版本变动还会有兼容风险）。p3y 声明了 depends_on postgres，所以带服务名
   # up 时若 pg 没起会自动拉起，已在跑的则原样保留、不重建。
-  info "重建并启动（artex 重启时自动迁移 schema）…"
-  docker compose up -d artex
+  info "重建并启动（p3y 重启时自动迁移 schema）…"
+  docker compose up -d p3y
   ok "更新完成 → http://localhost:8787"
-  info "查看日志：docker compose logs -f artex"
+  info "查看日志：docker compose logs -f p3y"
   info "清理旧镜像（可选）：docker image prune -f"
 }
 
@@ -86,17 +86,17 @@ update_local(){
     ( cd web && npm ci && npm run build:static )
     rm -rf server/webui/dist && cp -r web/out server/webui/dist
     info "重新编译内嵌单二进制…"
-    CGO_ENABLED=0 go build -tags embedui -trimpath -o artex ./cmd/artex
+    CGO_ENABLED=0 go build -tags embedui -trimpath -o p3y ./cmd/p3y
   else
     warn "未检测到 npm：编译**不内嵌前端**的后端（前端需另跑 npm run dev）"
-    CGO_ENABLED=0 go build -o artex ./cmd/artex
+    CGO_ENABLED=0 go build -o p3y ./cmd/p3y
   fi
-  ok "编译完成 → ./artex"
-  warn "请重启正在运行的 artex 进程以生效（重启时会自动迁移 schema）"
+  ok "编译完成 → ./p3y"
+  warn "请重启正在运行的 p3y 进程以生效（重启时会自动迁移 schema）"
 }
 
 echo "=============================="
-echo "  ARTEX 更新"
+echo "  p3y 更新"
 echo "  1) Docker 更新（本地重建镜像）"
 echo "  2) 本地更新（go 重新编译）"
 echo "=============================="

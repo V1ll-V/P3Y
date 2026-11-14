@@ -17,7 +17,7 @@ type Client struct {
 
 func (c *Client) request(ctx context.Context, method, path string, body io.Reader, typ string) (*http.Response, error) {
 	if c == nil || c.URL == "" || len(c.Token) < 24 {
-		return nil, fmt.Errorf("CTF 执行器未配置：请部署 ctf-runner 并设置 ARTEX_CTF_RUNNER_URL / TOKEN")
+		return nil, fmt.Errorf("p3y-box 沙箱执行器未配置：请部署 p3y-box 并设置 P3Y_BOX_URL / P3Y_BOX_TOKEN")
 	}
 	r, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(c.URL, "/")+path, body)
 	if err != nil {
@@ -167,4 +167,28 @@ func (c *Client) CloseInteractive(ctx context.Context, key, sid string) error {
 		res.Body.Close()
 	}
 	return err
+}
+
+// SavepointResult describes a hardlink snapshot taken inside a session container.
+type SavepointResult struct {
+	ID   string `json:"id"`
+	Path string `json:"path"`
+}
+
+// RewindResult describes a container workspace rewind to a prior savepoint.
+type RewindResult struct {
+	ID      string `json:"id"`
+	Rewound bool   `json:"rewound"`
+}
+
+func (c *Client) CreateSavepoint(ctx context.Context, key, id string) (SavepointResult, error) {
+	var out SavepointResult
+	err := c.json(ctx, "POST", "/sessions/"+key+"/savepoints", map[string]string{"id": id}, &out)
+	return out, err
+}
+
+func (c *Client) Rewind(ctx context.Context, key, id string) (RewindResult, error) {
+	var out RewindResult
+	err := c.json(ctx, "POST", "/sessions/"+key+"/rewind", map[string]string{"id": id}, &out)
+	return out, err
 }

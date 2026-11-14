@@ -40,9 +40,9 @@ func isIdentChar(b byte) bool {
 	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
 }
 
-// flagRegexp 读取 ARTEX_CTF_FLAG_PREFIXES（逗号分隔）一次并缓存。
+// flagRegexp 读取 P3Y_CTF_FLAG_PREFIXES（逗号分隔）一次并缓存。
 func flagRegexp() *regexp.Regexp {
-	flagOnce.Do(func() { flagMatcher = buildFlagPattern(os.Getenv("ARTEX_CTF_FLAG_PREFIXES")) })
+	flagOnce.Do(func() { flagMatcher = buildFlagPattern(os.Getenv("P3Y_CTF_FLAG_PREFIXES")) })
 	return flagMatcher
 }
 

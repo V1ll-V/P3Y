@@ -85,12 +85,12 @@ func TestShellQuote(t *testing.T) {
 // stdin JSON and the mirrored env var, then print — verifying the whole script
 // param-passing path. Skips if no python3.
 func TestExecPython(t *testing.T) {
-	interp := os.Getenv("ARTEX_TEST_PYTHON")
+	interp := os.Getenv("P3Y_TEST_PYTHON")
 	if interp == "" {
 		var err error
 		interp, err = exec.LookPath("python3")
 		if err != nil {
-			t.Skip("python3 unavailable; set ARTEX_TEST_PYTHON to a real interpreter")
+			t.Skip("python3 unavailable; set P3Y_TEST_PYTHON to a real interpreter")
 		}
 	}
 	code := `import json,sys,os

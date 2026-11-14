@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Autumn-27/artex/db"
+	"p3y/db"
 	acperm "github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -52,17 +52,10 @@ func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64) []map[
 // One ToolSet is created per planner/worker run; per-run signals live here.
 type ToolSet struct {
 	findingRecorder FindingRecorder
-	as              *db.AssetStore   // asset store (optional; nil = asset tools not available)
-	cs              *db.CompanyStore // company store (optional)
+	as              *db.AssetStore // asset store (optional; nil = asset tools not available)
 	ts              *db.ExplorationStore
 	worker          string
 	taskID          int64 // PG tasks.id; 0 when unknown (tests / orchestrator cross-task reads)
-	// coverageDisabled mirrors tasks.coverage_enabled=false. Stored inverted so the
-	// zero value (all existing ToolSet constructions) means ENABLED — matching the
-	// DB default (true). When true: graphOverviewData drops the coverage block, the
-	// auto-scope hook (insertAssets) is skipped, and add_task_scope/list_untested_assets
-	// are filtered out of the agent's tool list. The scope field stays regardless.
-	coverageDisabled bool
 	// ownerNode is the exploration node that writes attach to: assets this run
 	// touches get anchored to it as lineage/provenance (NOT visibility — the asset
 	// graph is global and shared). Worker = its claimed intent; planner = begin root.
@@ -167,42 +160,6 @@ func NewToolSet(ts *db.ExplorationStore, worker string) *ToolSet {
 // SetTaskID sets the PG task id on this ToolSet so that report_finding can
 // dual-write to the standalone findings table (which survives task deletion).
 func (t *ToolSet) SetTaskID(id int64) { t.taskID = id }
-
-// SetCoverageEnabled records whether this task has the asset-coverage feature on
-// (default enabled). Passing false makes graphOverviewData omit the coverage block
-// and DropCoverageTools filter the two coverage-only tools out of the agent's tool
-// list. It does NOT stop scope accumulation: insertAssets' auto-scope hook runs
-// either way, because task_scope is the task's range boundary (the filter basis for
-// asset queries), not merely a coverage denominator.
-func (t *ToolSet) SetCoverageEnabled(enabled bool) { t.coverageDisabled = !enabled }
-
-// CoverageDisabled reports whether the coverage feature is off for this task.
-func (t *ToolSet) CoverageDisabled() bool { return t.coverageDisabled }
-
-// coverageOnlyTools are the LLM tools that only make sense when asset coverage is
-// on. When the feature is off they are filtered out of the agent's tool list so
-// they neither pollute the prompt nor let the model build a disabled denominator.
-// add_task_scope is deliberately NOT here: task_scope is the task's range boundary
-// (the filter basis for asset queries), not merely a coverage denominator, so the
-// agents that own范围定义 keep it either way — in lockstep with insertAssets'
-// auto-scope hook, which also runs regardless of the switch.
-var coverageOnlyTools = map[string]bool{"list_untested_assets": true}
-
-// DropCoverageTools returns tools with the coverage-only ones removed when this
-// task has the feature disabled; otherwise it returns tools unchanged.
-func (t *ToolSet) DropCoverageTools(tools []actool.CoreTool) []actool.CoreTool {
-	if !t.coverageDisabled {
-		return tools
-	}
-	out := tools[:0:0]
-	for _, tool := range tools {
-		if coverageOnlyTools[tool.Name()] {
-			continue
-		}
-		out = append(out, tool)
-	}
-	return out
-}
 
 // Cross-task reuse: exported accessors returning the per-task tool logic bound to
 // THIS ToolSet's store. Host-side orchestration tools build a ToolSet for an
@@ -544,74 +501,11 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	// summaries in a separate field so their intents never enter this task's
 	// frontier or get mistaken for locally claimable work.
 	out["related_tasks"] = t.relatedTaskOverviews()
-	// coverage：粗略的资产测试覆盖度参考——范围(task_scope)内的资产里，被 fact 碰过的
-	// 占比 + by_type(按类型的 总数/已测)。要看未测的具体资产由 agent 按需调 list_untested_assets 自行判断。仅任务上下文有。
-	// 资产覆盖度功能关闭时(coverageDisabled)：只保留 host_count(目标主机数的感知信息)，
-	// 丢弃 denominator/tested/pct/by_type/note 等覆盖度度量，避免污染上下文、也不诱导
-	// 已隐藏的 add_task_scope/list_untested_assets。
 	if t.as != nil && t.ts != nil && t.taskID > 0 {
-		{
-			m := map[string]any{}
-			if !t.coverageDisabled {
-				if rows, err := t.as.ListTaskScope(t.taskID); err == nil {
-					scope := make([]map[string]any, 0, len(rows))
-					for _, row := range rows {
-						entry := map[string]any{"kind": row.Kind, "source": row.Source, "value": row.Value}
-						if row.Domain != "" {
-							entry["value"] = row.Domain
-						}
-						if row.Net != "" {
-							entry["value"] = row.Net
-						}
-						if row.CompanyID != nil && t.cs != nil {
-							entry["company_id"], entry["company_name"] = *row.CompanyID, row.CompanyName
-							if rules, err := t.cs.GetScope(*row.CompanyID); err == nil {
-								companyScope := make([]map[string]any, 0, len(rules))
-								keywords := []string{}
-								for _, rule := range rules {
-									value := rule.Raw
-									if value == "" {
-										value = rule.Value
-									}
-									if value == "" && rule.Domain != "" {
-										value = rule.Domain
-									}
-									if value == "" && rule.Net != "" {
-										value = rule.Net
-									}
-									companyScope = append(companyScope, map[string]any{"kind": rule.Kind, "value": value})
-									if rule.Kind == "keyword" {
-										keywords = append(keywords, value)
-									}
-								}
-								entry["company_scope"], entry["company_keywords"] = companyScope, keywords
-							}
-						}
-						scope = append(scope, entry)
-					}
-					m["scope"] = scope
-				}
-				if cov, err := t.as.TaskCoverageWithSources(t.taskID); err == nil {
-					m["denominator"] = cov.Denominator
-					m["tested"] = cov.Tested
-					m["by_type"] = cov.ByType
-					m["note"] = "coverage资产测试覆盖度（包括接口等各种相关资产），粗略估计、仅供参考：包含当前任务与直接关联任务的 scope、事实锚点；关联 scope 只读。容器型资产/大量枚举会让它偏低，勿据此认为已测完；可用 add_task_scope 增补本任务范围、list_untested_assets 看未测资产【通常不调用list_untested_assets，按照任务推进即可】；"
-					if cov.Denominator == 0 {
-						m["pct"] = nil
-						m["status"] = "范围未锚定"
-					} else {
-						m["pct"] = cov.Pct
-					}
-				}
-			}
-			if hosts, err := t.as.HostsByTaskWithSources(t.taskID); err == nil {
-				// 只给主机总数，不再把 host 列表平铺进 graph_overview（大范围任务里那是每轮
-				// 都重复携带的大量字符串，对规划决策价值有限）；具体主机按需 list_assets 查。
-				m["host_count"] = len(hosts)
-			}
-			if len(m) > 0 {
-				out["coverage"] = m
-			}
+		if hosts, err := t.as.HostsByTaskWithSources(t.taskID); err == nil {
+			// 只给主机总数，不再把 host 列表平铺进 graph_overview（大范围任务里那是每轮
+			// 都重复携带的大量字符串，对规划决策价值有限）；具体主机按需 list_assets 查。
+			out["coverage"] = map[string]any{"host_count": len(hosts)}
 		}
 	}
 	return out
@@ -2166,16 +2060,7 @@ func (t *ToolSet) PlannerTools() []actool.CoreTool {
 		t.killWorkTool(), t.steerWorkTool(),
 		// report_finding：规划态势研判时若自身已确证漏洞，可直接登记（与 worker 同工具）。
 		t.addFinding(),
-		// list_companies：查看企业列表 + scope + 资产数（拿 company_id / 理解归属范围）。
-		t.listCompanies(),
-		// list_assets：规划时按 DSL 检索全资产库（配合 list_untested_assets 的"范围内未测"视角，
-		// 补上"按域名/指纹/端口/状态码等条件在整库里查"的能力）。
+		// list_assets：规划时按 DSL 检索全资产库（按域名/指纹/端口/状态码等条件查）。
 		t.listAssets(),
-		// add_company_scope：规划时可把域名/IP/CIDR/ICP/关键词纳入某公司的资产范围（自动认领命中资产）。
-		t.addCompanyScope(),
-		// add_task_scope：主动把整根域/整公司/某子域/IP 纳入本任务测试范围(覆盖度分母)。
-		t.addTaskScope(),
-		// list_untested_assets：按需查本任务范围内未测资产(类型+分页)，自行决定补测。
-		t.listUntestedAssets(),
 	}
 }

@@ -1772,3 +1772,161 @@ export interface CTFVpnSummary {
   peer_count?: number;
   sidecar?: CTFVpnSidecarStatus;
 }
+
+// ---- Stage 3-5: p3y Precheck / Board / Kits / Tips / Attack-Defense ----
+
+export interface TipCard {
+  id: number;
+  category: string;
+  tags: string[];
+  title: string;
+  pitfall: string;
+  pattern_code?: string;
+  source_task_id?: number;
+  hit_count: number;
+  created_at: string;
+}
+
+export interface PrecheckFile {
+  id: string;
+  name: string;
+  logical_path: string;
+  size: number;
+  sha256: string;
+  kind: string;
+  arch?: string;
+  protections?: Record<string, unknown>;
+  tags?: string[];
+  notes?: string;
+}
+
+export interface PrecheckResult {
+  task_id: number;
+  input_hash: string;
+  challenge_type: string;
+  inferred_category: string;
+  targets?: string[];
+  tags?: string[];
+  files?: PrecheckFile[];
+  matched_tips?: TipCard[];
+  summary: string;
+  generated_at: string;
+}
+
+export type BoardItemKind = "fact" | "step" | "savepoint" | "deadend";
+
+export interface BoardItem {
+  id: number;
+  task_id: number;
+  parent_id?: number;
+  kind: BoardItemKind;
+  title: string;
+  summary: string;
+  detail?: string;
+  snapshot_id?: string;
+  check_cmd?: string;
+  verified: boolean;
+  meta_json?: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface BoardKit {
+  id: number;
+  task_id: number;
+  savepoint_id?: number;
+  name: string;
+  path: string;
+  summary: string;
+  sha256?: string;
+  verified: boolean;
+  meta_json?: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface BoardRewindResult {
+  rewound: boolean;
+  snapshot_id: string;
+  savepoint_id: number;
+  rewind_count: number;
+  deadend_record: BoardItem;
+}
+
+export interface ADWeapon {
+  id: number;
+  task_id: number;
+  target_service: string;
+  script_path: string;
+  check_cmd: string;
+  status: "active" | "blocked" | "paused";
+  targets: string[];
+  flag_regex?: string;
+  submit_url?: string;
+  submit_token?: string;
+  interval_sec: number;
+  success_count: number;
+  fail_count: number;
+  consecutive_fails: number;
+  last_flag?: string;
+  last_error?: string;
+  last_run_at?: string;
+  created_at: string;
+}
+
+export interface ADEvent {
+  id: number;
+  task_id: number;
+  weapon_id?: number;
+  role: string;
+  kind: string;
+  target?: string;
+  summary: string;
+  detail_json?: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface LeadRecommendation {
+  priority: "high" | "medium" | "low";
+  kind: string;
+  target?: string;
+  title: string;
+  detail: string;
+}
+
+export interface ADOverview {
+  weapons: ADWeapon[];
+  events: ADEvent[];
+  recommendations: LeadRecommendation[];
+}
+
+export interface RepeaterRunResult {
+  weapons_run: number;
+  targets_hit: number;
+  targets_miss: number;
+  flags_found: string[];
+  blocked_count: number;
+}
+
+export interface CatcherFinding {
+  signature: string;
+  category: string;
+  target: string;
+  excerpt: string;
+}
+
+export interface CatcherScanResult {
+  scanned: number;
+  findings: CatcherFinding[];
+}
+
+export interface PatchVerifyResult {
+  passed: boolean;
+  patch_applied: boolean;
+  patch_exit_code: number;
+  sla_passed: boolean;
+  sla_exit_code: number;
+  exploit_blocked: boolean;
+  exploit_exit_code: number;
+  leaked_flags: number;
+  verdict: string;
+}
+

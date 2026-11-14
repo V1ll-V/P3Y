@@ -1,6 +1,6 @@
 {
-  "name": "artex-web",
-  "version": "0.8.1",
+  "name": "p3y-web",
+  "version": "0.9.0",
   "private": true,
   "scripts": {
     "dev": "next dev",

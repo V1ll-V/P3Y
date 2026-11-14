@@ -9,15 +9,12 @@ import {
   ChevronRightIcon,
   FileTextIcon,
   FlaskConicalIcon,
-  RotateCcwIcon,
-  ScanSearchIcon,
   ShieldAlertIcon,
   Trash2Icon,
 } from "lucide-react";
 
 import { CopyButton } from "@/components/copy-button";
 import { Markdown } from "@/components/markdown";
-import { FindingVerdictBadge, FindingVerdictScope } from "@/components/finding-verdict";
 import { StatusBadge } from "@/components/status-badge";
 import {
   AlertDialog,
@@ -36,10 +33,9 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Spinner } from "@/components/ui/spinner";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { statusMeta } from "@/lib/status";
-import type { ActiveFindingRetest, Finding, FindingStatus, Severity } from "@/lib/types";
+import type { Finding, FindingStatus, Severity } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 export const SEVERITIES: Severity[] = ["critical", "high", "medium", "low"];
@@ -104,10 +100,6 @@ interface FindingsTableProps {
   saving: boolean;
   onSave: (finding: Finding) => void;
   onStatusChange: (finding: Finding, next: FindingStatus) => void;
-  onRetest: (finding: Finding) => void;
-  onReview: (finding: Finding) => void;
-  activeRetests: Record<string, ActiveFindingRetest>;
-  activeReviews: Record<string, ActiveFindingRetest>;
   onDeepen: (finding: Finding) => void;
   onDelete: (finding: Finding) => void;
   /** 全选框的无障碍标签,平铺视图与分组视图措辞不同。 */
@@ -115,7 +107,7 @@ interface FindingsTableProps {
 }
 
 // FindingsTable 是发现列表的表格主体,平铺视图与按任务分组视图共用同一份行渲染
-// (勾选 / 行内展开 / 行内改名与改状态 / 复测 / 深入 / 删除),差异只在外层容器与分页。
+// (勾选 / 行内展开 / 行内改名与改状态 / 深入 / 删除),差异只在外层容器与分页。
 export function FindingsTable({
   items,
   selectedIds,
@@ -129,10 +121,6 @@ export function FindingsTable({
   saving,
   onSave,
   onStatusChange,
-  onRetest,
-  onReview,
-  activeRetests,
-  activeReviews,
   onDeepen,
   onDelete,
   selectAllLabel = "选择当前页全部",
@@ -159,7 +147,7 @@ export function FindingsTable({
             />
           </TableHead>
           <TableHead className="w-8" />
-          <TableHead className="w-40">验收 / 严重度</TableHead>
+          <TableHead className="w-32">严重度</TableHead>
           <TableHead>漏洞名称</TableHead>
           <TableHead className="w-44">资产</TableHead>
           <TableHead className="w-28">状态</TableHead>
@@ -172,8 +160,6 @@ export function FindingsTable({
         {items.map((f) => {
           const rowKey = findingRowKey(f);
           const open = expandedKey === rowKey;
-          const retest = f.finding_id ? activeRetests[f.finding_id] : undefined;
-          const review = f.finding_id ? activeReviews[f.finding_id] : undefined;
           return (
             <React.Fragment key={rowKey}>
               <TableRow
@@ -203,14 +189,7 @@ export function FindingsTable({
                   />
                 </TableCell>
                 <TableCell>
-                  <div className="flex flex-col items-start gap-1">
-                    <FindingVerdictBadge finding={f} />
-                    {f.effective && !f.display_severity ? (
-                      <Badge variant="outline">等级未独立确认</Badge>
-                    ) : (
-                      <StatusBadge domain="severity" value={f.display_severity || f.severity} dot />
-                    )}
-                  </div>
+                  <StatusBadge domain="severity" value={f.display_severity || f.severity} dot />
                 </TableCell>
                 <TableCell className="overflow-hidden">
                   <div className="flex min-w-0 flex-col gap-0.5">
@@ -286,39 +265,6 @@ export function FindingsTable({
                 <TableCell className="text-xs text-muted-foreground tabular-nums">{fmtTime(f.ts)}</TableCell>
                 <TableCell onClick={(e) => e.stopPropagation()}>
                   <div className="flex items-center gap-1">
-                    {review ? (
-                      <Button asChild size="sm" variant="ghost">
-                        <Link href={`/chat?c=${review.conversation_id}`} title="查看正在进行的复核会话">
-                          <Spinner data-icon="inline-start" />
-                          复核中
-                        </Link>
-                      </Button>
-                    ) : null}
-                    {!review && f.finding_id && !f.inherited ? (
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        onClick={() => onReview(f)}
-                        title="人工审查后复核该漏洞是否误报/夸大"
-                      >
-                        <ScanSearchIcon data-icon="inline-start" />
-                        复核
-                      </Button>
-                    ) : null}
-                    {retest ? (
-                      <Button asChild size="sm" variant="ghost">
-                        <Link href={`/chat?c=${retest.conversation_id}`} title="查看正在进行的复测会话">
-                          <Spinner data-icon="inline-start" />
-                          复测中
-                        </Link>
-                      </Button>
-                    ) : null}
-                    {!retest && f.finding_id && !f.inherited ? (
-                      <Button size="sm" variant="ghost" onClick={() => onRetest(f)} title="在独立会话中复测该漏洞">
-                        <RotateCcwIcon data-icon="inline-start" />
-                        复测
-                      </Button>
-                    ) : null}
                     {f.finding_id && f.task_id && (
                       <Button size="sm" variant="ghost" onClick={() => onDeepen(f)}>
                         <FlaskConicalIcon data-icon="inline-start" />
@@ -364,7 +310,14 @@ export function FindingsTable({
                       被强制单行、直接溢出单元格。 */}
                   <TableCell colSpan={COLUMN_COUNT} className="bg-muted/30 whitespace-normal">
                     <div className="flex flex-col gap-2 px-2 py-1">
-                      <FindingVerdictScope finding={reports[rowKey]?.finding || f} />
+                      {(reports[rowKey]?.finding?.summary || f.summary) && (
+                        <p className="text-sm whitespace-pre-wrap">
+                          {reports[rowKey]?.finding?.display_claim ||
+                            reports[rowKey]?.finding?.summary ||
+                            f.display_claim ||
+                            f.summary}
+                        </p>
+                      )}
                       {/* 行内编辑:名称/类别/严重等级,可改并保存(仅独立 finding 行)。 */}
                       {f.finding_id && edit && (
                         <div className="flex flex-wrap items-end gap-3 rounded-md border bg-background px-3 py-2.5">

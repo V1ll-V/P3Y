@@ -1,4 +1,4 @@
-module github.com/Autumn-27/artex
+module p3y
 
 go 1.26.3
 

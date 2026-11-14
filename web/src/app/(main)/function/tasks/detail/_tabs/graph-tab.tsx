@@ -6,8 +6,10 @@ import { Card, CardContent } from "@/components/ui/card";
 import { ExplorationGraph } from "@/components/exploration-graph";
 import { api } from "@/lib/api";
 import type { Edge, TaskNode } from "@/lib/types";
+import { BoardTreePanel } from "./board-tree-panel";
 
 export function GraphTab({ taskId }: { taskId: string }) {
+  const [view, setView] = React.useState<"board" | "graph">("board");
   const [nodes, setNodes] = React.useState<TaskNode[]>([]);
   const [edges, setEdges] = React.useState<Edge[]>([]);
   // 上一次图数据的签名:轮询拿到相同数据时跳过 setState,避免整图无谓重建(拖动时
@@ -46,10 +48,36 @@ export function GraphTab({ taskId }: { taskId: string }) {
   }, [taskId]);
 
   return (
-    <Card>
-      <CardContent className="p-0">
-        <ExplorationGraph nodes={nodes} edges={edges} className="h-[72vh]" />
-      </CardContent>
-    </Card>
+    <div className="flex flex-col gap-3">
+      <div className="flex items-center gap-1 self-start rounded-lg border bg-muted/40 p-1">
+        <button
+          type="button"
+          onClick={() => setView("board")}
+          className={`rounded-md px-3 py-1 text-sm font-medium transition-colors ${
+            view === "board" ? "bg-background shadow-xs" : "text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          状态看板 Tree (Board / Savepoint)
+        </button>
+        <button
+          type="button"
+          onClick={() => setView("graph")}
+          className={`rounded-md px-3 py-1 text-sm font-medium transition-colors ${
+            view === "graph" ? "bg-background shadow-xs" : "text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          探索关系图 ({nodes.length})
+        </button>
+      </div>
+      {view === "board" ? (
+        <BoardTreePanel taskId={taskId} />
+      ) : (
+        <Card>
+          <CardContent className="p-0">
+            <ExplorationGraph nodes={nodes} edges={edges} className="h-[72vh]" />
+          </CardContent>
+        </Card>
+      )}
+    </div>
   );
 }

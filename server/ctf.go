@@ -10,8 +10,9 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/ctf"
+	"p3y/agent"
+	"p3y/ctf"
+	"github.com/Autumn-27/norma/llm"
 )
 
 func (s *Server) ctfService() *ctf.Service { return ctf.New(s.m.dir, s.m.pg) }
@@ -146,8 +147,12 @@ func (s *Server) decideCTFFlag(w http.ResponseWriter, r *http.Request) {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 			defer cancel()
+			var prov llm.Provider
 			if canOptimize {
-				prov := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "mainagent"}
+				prov = &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "mainagent"}
+			}
+			_, _ = svc.CrystallizeTips(ctx, task, prov)
+			if prov != nil {
 				if _, optErr := svc.GenerateOptimizedWP(ctx, task, prov); optErr == nil {
 					return
 				}
@@ -218,8 +223,12 @@ func (s *Server) ctfCompleteExploit(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
+		var prov llm.Provider
 		if canOptimize {
-			prov := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "mainagent"}
+			prov = &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "mainagent"}
+		}
+		_, _ = svc.CrystallizeTips(ctx, task, prov)
+		if prov != nil {
 			if _, optErr := svc.GenerateOptimizedWP(ctx, task, prov); optErr == nil {
 				return
 			}

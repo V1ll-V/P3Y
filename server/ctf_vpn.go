@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/artex/ctfrunner"
+	"p3y/ctfrunner"
 )
 
 func sanitizeVPNFilename(name string) string {
@@ -217,7 +217,7 @@ func (s *Server) ctfVPNCheck(w http.ResponseWriter, r *http.Request) {
 	summary := prof.Summary(filename)
 	svc := s.ctfService()
 	if svc.Runner == nil || !svc.Runner.Configured() {
-		summary.Sidecar = &ctfrunner.VPNStatus{TaskID: taskID, Error: "CTF 执行器未配置（ARTEX_CTF_RUNNER_URL）"}
+		summary.Sidecar = &ctfrunner.VPNStatus{TaskID: taskID, Error: "沙箱执行器未配置（P3Y_BOX_URL）"}
 		writeJSON(w, 200, summary)
 		return
 	}

@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/Autumn-27/artex/db"
+	"p3y/db"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/llm"
 	acperm "github.com/Autumn-27/norma/permission"
@@ -44,27 +44,6 @@ const goalsDefaultTmpl = `你是渗透测试目标分解器。你的职责是从
 - 严禁臆造用户未提及的目标
 
 调用 set_goals 提交结果。`
-
-// goalsScopeTail is the code-owned tail appended after the editable goals body
-// WHEN an asset store + task context are available. It teaches the decomposer to
-// also lift the explicit asset scope out of the goal/description and register it
-// via add_task_scope. Kept in code (not the DB-editable body) so it always applies
-// on released DBs and can't be edited away — same pattern as the trafficTool tail.
-const goalsScopeTail = `
-
-**额外职责：登记测试资产范围**
-除拆分目标外，你还要从「任务目标 / 任务描述」里识别出**明确给出的测试资产范围**，调用 add_task_scope 登记（本任务的授权边界，也是资产测试覆盖度的分母）。**最小范围原则：只登记用户明确点到的那一个目标，绝不擅自放大。**
-- 目标是 URL 或带主机名的地址（如 https://xxx.example.com/path、app.example.com）→ 取其**完整主机名**，kind=subdomain，value=完整主机名。
-  例：目标 https://a1b2c3.lab.example.net/path → kind=subdomain，value=a1b2c3.lab.example.net（**不是** example.net）。
-  **严禁**把带子域的主机名缩成根域名——看到 xxx.example.com 就登记整个 example.com 会把范围扩到用户目标之外，违背最小范围原则。
-- 仅当用户给的就是**裸根域名、且不含任何子域**（如直接写 example.com），或明确说“整个站点 / 所有子域 / 全域名” → 才用 kind=root_domain，value=example.com。
-- 纯 IP 或网段 → kind=ip / cidr，value=IP 或 CIDR。
-- **不要**登记公司范围（company）——任务刚建立、资产系统里通常还没有这家公司，登记不上，公司级范围交由后续 plan 阶段处理。
-其它规则：
-- 只登记**目标/描述里明确写出**的范围；严禁臆造或推断未提及的域名/IP。
-- reason 简述依据来自哪句话，便于审计。
-- 若目标/描述中没有任何明确资产范围，则**不要**调用 add_task_scope。
-先用 add_task_scope 登记范围（如有），再调用 set_goals 提交目标。`
 
 // GoalSpec is one decomposed objective.
 type GoalSpec struct {
@@ -144,13 +123,6 @@ func DecomposeGoalsWithProvider(ctx context.Context, prov llm.Provider, dataDir,
 	// set_constraints 始终可用(不依赖 asset store):正文已含「先抽操作约束再拆目标」这步
 	// (可在 agent 编辑页改措辞),这里只需接上工具。
 	tools := []actool.CoreTool{tsx.setGoals(), tsx.setConstraints()}
-	// Wire add_task_scope only when we have a real asset store + task to write to.
-	// The scope-extraction tail is appended in lockstep so the prompt never asks for
-	// a tool that isn't present.
-	if as != nil && taskID > 0 && !ctfMode {
-		tools = append(tools, tsx.addTaskScope())
-		sys += goalsScopeTail
-	}
 	userMsg := "任务目标：\n" + goalText
 	if d := strings.TrimSpace(desc); d != "" {
 		userMsg += "\n\n任务描述（背景信息，可能含靶标范围/flag 数量/交战说明；仅供参考，不要臆造其中未提及的内容）：\n" + d

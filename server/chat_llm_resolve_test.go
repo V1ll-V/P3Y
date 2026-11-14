@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/artex/db"
+	"p3y/db"
 )
 
 // TestChatUnavailableReasonDistinguishesStates pins the operator-facing message
@@ -18,7 +18,20 @@ func TestChatUnavailableReasonDistinguishesStates(t *testing.T) {
 	}
 	defer m.Close()
 	td := t.TempDir()
-	s := New(context.Background(), m, td, td, td)
+	ctx, cancel := context.WithCancel(context.Background())
+	s := New(ctx, m, td, td, td)
+	defer func() {
+		cancel()
+		m.mu.RLock()
+		var ids []string
+		for id := range m.tasks {
+			ids = append(ids, id)
+		}
+		m.mu.RUnlock()
+		for _, id := range ids {
+			s.engine.StopTask(id)
+		}
+	}()
 
 	// Start from a clean profile table; other tests in the shared DB may have left rows.
 	existing, _ := m.pg.ListProfiles()
@@ -68,7 +81,20 @@ func TestResolveChatAgentHonoursConversationProfile(t *testing.T) {
 	}
 	defer m.Close()
 	td := t.TempDir()
-	s := New(context.Background(), m, td, td, td)
+	ctx, cancel := context.WithCancel(context.Background())
+	s := New(ctx, m, td, td, td)
+	defer func() {
+		cancel()
+		m.mu.RLock()
+		var ids []string
+		for id := range m.tasks {
+			ids = append(ids, id)
+		}
+		m.mu.RUnlock()
+		for _, id := range ids {
+			s.engine.StopTask(id)
+		}
+	}()
 
 	// Force the global fallback to nil so a non-nil result can ONLY come from the
 	// conversation's own profile — this is exactly the situation the user hit

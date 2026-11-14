@@ -43,7 +43,6 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
-import { AssetInterceptRulesEditor } from "@/components/asset-intercept-rules-editor";
 import { StatusBadge } from "@/components/status-badge";
 import { TablePagination } from "@/components/table-pagination";
 import { TaskAttachments } from "@/components/task-attachments";
@@ -123,8 +122,6 @@ import { api } from "@/lib/api";
 import { getLocalStorageValue, setLocalStorageValue } from "@/lib/local-storage.client";
 import { type SortDirection, useStoredSortPreference } from "@/lib/sort-preference";
 import type {
-  AssetInterceptRuleInput,
-  Company,
   DeleteTaskOptions,
   DeleteTaskResult,
   LLMProfile,
@@ -234,8 +231,8 @@ function taskControlAction(status: TaskStatus): "pause" | "resume" | null {
 type TaskSortField = "id" | "created" | "duration" | "status";
 
 const TASK_SORT_FIELDS: readonly TaskSortField[] = ["id", "created", "duration", "status"];
-const TASK_SORT_PREFERENCE_KEY = "artex_task_list_sort";
-const TASK_FILTER_PREFERENCE_KEY = "artex_task_list_filters";
+const TASK_SORT_PREFERENCE_KEY = "p3y_task_list_sort";
+const TASK_FILTER_PREFERENCE_KEY = "p3y_task_list_filters";
 
 const TASK_STATUS_RANK = new Map(STATUS_OPTIONS.map((option, index) => [option.value, index]));
 
@@ -2534,90 +2531,6 @@ function CategoryPicker({
   );
 }
 
-const COMPANY_SCOPE_LABELS: Record<string, string> = {
-  domain: "域名",
-  ip: "IP",
-  cidr: "CIDR",
-  icp: "ICP",
-  keyword: "关键词",
-};
-
-function companyScopeSummary(company: Company): string {
-  const rows = company.scope ?? [];
-  if (rows.length === 0) return "未配置资产范围";
-  const preview = rows.slice(0, 3).map((row) => {
-    const value = row.raw || row.value || row.domain || row.net || "";
-    return `${COMPANY_SCOPE_LABELS[row.kind] ?? row.kind}：${value}`;
-  });
-  return `${preview.join(" · ")}${rows.length > preview.length ? ` · 另 ${rows.length - preview.length} 条` : ""}`;
-}
-
-function CompanyPicker({
-  companies,
-  value,
-  onValueChange,
-  portalContainer,
-}: {
-  companies: Company[];
-  value: number[];
-  onValueChange: (value: number[]) => void;
-  portalContainer?: React.RefObject<HTMLElement | null>;
-}) {
-  const companiesByID = React.useMemo(
-    () => new Map(companies.map((company) => [String(company.id), company])),
-    [companies],
-  );
-  const companyIDs = React.useMemo(() => companies.map((company) => String(company.id)), [companies]);
-  const selectedIDs = React.useMemo(() => value.map(String), [value]);
-
-  return (
-    <Combobox
-      items={companyIDs}
-      itemToStringValue={(companyID) => {
-        const company = companiesByID.get(companyID);
-        return company ? `${company.name} ${companyScopeSummary(company)}` : companyID;
-      }}
-      multiple
-      value={selectedIDs}
-      onValueChange={(next) => onValueChange(next.map(Number).filter(Number.isFinite))}
-    >
-      <ComboboxChips>
-        <ComboboxValue>
-          {selectedIDs.map((companyID) => (
-            <ComboboxChip key={companyID}>{companiesByID.get(companyID)?.name ?? `企业 #${companyID}`}</ComboboxChip>
-          ))}
-        </ComboboxValue>
-        <ComboboxChipsInput id="task-companies" placeholder="搜索企业名称或资产范围" />
-      </ComboboxChips>
-      <ComboboxContent portalContainer={portalContainer}>
-        <ComboboxEmpty>没有匹配的企业</ComboboxEmpty>
-        <ComboboxList>
-          {(companyID) => {
-            const company = companiesByID.get(companyID);
-            return (
-              <ComboboxItem key={companyID} value={companyID}>
-                <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-                  <div className="flex min-w-0 items-center gap-2">
-                    <span className="min-w-0 flex-1 truncate font-medium">{company?.name ?? `企业 #${companyID}`}</span>
-                    <span className="text-muted-foreground shrink-0 text-xs tabular-nums">
-                      {company?.asset_count ?? 0} 个资产
-                    </span>
-                  </div>
-                  {company && (
-                    <span className="text-muted-foreground truncate text-xs" title={companyScopeSummary(company)}>
-                      {companyScopeSummary(company)}
-                    </span>
-                  )}
-                </div>
-              </ComboboxItem>
-            );
-          }}
-        </ComboboxList>
-      </ComboboxContent>
-    </Combobox>
-  );
-}
-
 type CategoryManagementView = number | "uncategorized" | "new";
 
 function CategoryDropTarget({
@@ -3055,17 +2968,13 @@ function CreateTaskSheet({
   const [goal, setGoal] = React.useState("");
   const [selectedTemplateID, setSelectedTemplateID] = React.useState<number | null>(null);
   const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
-  const [companies, setCompanies] = React.useState<Company[]>([]);
   const [sourceTaskIDs, setSourceTaskIDs] = React.useState<string[]>([]);
-  const [companyIDs, setCompanyIDs] = React.useState<number[]>([]);
   const [llmProfileIDs, setLLMProfileIDs] = React.useState<string[]>([]);
   const [creating, setCreating] = React.useState(false);
   const [timeoutMin, setTimeoutMin] = React.useState(""); // 任务级超时(分钟);空/0 = 不限时
   const [heartbeatMin, setHeartbeatMin] = React.useState("10"); // planner 心跳(分钟);默认10,下限10(与后端一致)
   const [seedFirstIntent, setSeedFirstIntent] = React.useState(false); // 创建时下发种子意图,worker 免等首轮 planner 直接开跑;默认关闭,走标准先规划再执行
-  const [coverageEnabled, setCoverageEnabled] = React.useState(true); // 资产覆盖度功能;默认开。关闭=不计算/展示覆盖度、不累积范围、隐藏范围类工具(company 关联不受影响)
-  const [interceptRules, setInterceptRules] = React.useState<AssetInterceptRuleInput[]>([]); // 任务级资产拦截规则(仅本任务生效,不进全局表)
-  const [mode, setMode] = React.useState<"pentest" | "ctf">("pentest");
+  const [mode, setMode] = React.useState<"pentest" | "ctf">("ctf");
   const [challengeType, setChallengeType] = React.useState<"auto" | "web" | "pwn" | "reverse" | "crypto" | "misc">("auto");
   const [ctfVerifyMode, setCtfVerifyMode] = React.useState<"auto" | "flag" | "exploit_proof" | "flag_and_exploit">("auto");
   const [uploading, setUploading] = React.useState(false);
@@ -3079,10 +2988,6 @@ function CreateTaskSheet({
       .llmProfiles()
       .then(setProfiles)
       .catch(() => setProfiles([]));
-    api
-      .companies()
-      .then(setCompanies)
-      .catch(() => setCompanies([]));
   }, []);
 
   async function createTask() {
@@ -3111,14 +3016,10 @@ function CreateTaskSheet({
         goal: goal.trim(),
         llmProfileIds: llmProfileIDs.map(Number),
         sourceTaskIds: sourceTaskIDs,
-        companyIds: companyIDs,
         timeoutSeconds: timeoutSec,
         seedFirstIntent,
         planHeartbeatSeconds: heartbeatSec,
-        coverageEnabled,
-        interceptRules: interceptRules
-          .map((r) => ({ ...r, pattern: r.pattern.trim() }))
-          .filter((r) => r.pattern !== ""),
+        coverageEnabled: false,
       });
       if (createdTask.inputs_blocked_reason || createdTask.execution_blocked_reason)
         toast.warning(createdTask.inputs_blocked_reason || createdTask.execution_blocked_reason, { duration: 12000 });
@@ -3129,16 +3030,13 @@ function CreateTaskSheet({
       setGoal("");
       setSelectedTemplateID(null);
       setSourceTaskIDs([]);
-      setCompanyIDs([]);
       setLLMProfileIDs([]);
       setTimeoutMin("");
       setHeartbeatMin("10");
       setSeedFirstIntent(false);
-      setCoverageEnabled(true);
-      setInterceptRules([]);
       setAttachmentDraft("");
       setVpnDraft(null);
-      setMode("pentest");
+      setMode("ctf");
       setChallengeType("auto");
       setCtfVerifyMode("auto");
       setOpen(false);
@@ -3175,14 +3073,12 @@ function CreateTaskSheet({
               description={description}
               goal={goal}
               categoryID={categoryID}
-              interceptRules={interceptRules}
               selectedTemplateID={selectedTemplateID}
               onSelectedTemplateIDChange={setSelectedTemplateID}
               onApply={(template) => {
                 setDescription(template.description);
                 setGoal(template.goal);
                 setCategoryID(template.category_id ?? undefined);
-                setInterceptRules(template.intercept_rules ?? []);
               }}
               portalContainer={sheetContentRef}
             />
@@ -3195,12 +3091,11 @@ function CreateTaskSheet({
                 onChange={(e) => {
                   const next = e.target.value as "pentest" | "ctf";
                   setMode(next);
-                  setCoverageEnabled(next === "pentest");
                   if (next === "ctf" && !goal.trim()) setGoal("分析本题并完成平台要求的验收目标，保留核心 PoC 脚本与验证输出。");
                 }}
               >
-                <option value="pentest">授权渗透测试</option>
                 <option value="ctf">CTF 解题</option>
+                <option value="pentest">自主目标分析</option>
               </select>
               {mode === "ctf" && (
                 <>
@@ -3313,26 +3208,6 @@ function CreateTaskSheet({
               </FieldDescription>
             </Field>
             <Field>
-              <FieldLabel htmlFor="task-companies">关联企业资产范围</FieldLabel>
-              <CompanyPicker
-                companies={companies}
-                value={companyIDs}
-                onValueChange={setCompanyIDs}
-                portalContainer={sheetContentRef}
-              />
-              <FieldDescription>
-                创建任务时会将所选企业当前已有资产加入“测试资产”，并将域名、IP、CIDR、ICP 和企业关键词提供给 Agent
-                作为范围上下文；不会自动生成意图或强制改变执行目标。
-              </FieldDescription>
-            </Field>
-            <Field>
-              <FieldLabel htmlFor="task-intercept-rules">任务级资产拦截 / 允许规则（可选）</FieldLabel>
-              <AssetInterceptRulesEditor value={interceptRules} onChange={setInterceptRules} />
-              <FieldDescription>
-                仅对本任务生效，不写入全局规则。判定顺序：先按「拦截」规则（含全局）匹配，命中即禁止测试；未命中且本任务配置了「允许」规则时，须命中某条允许规则才放行，否则同样不允许测试；未配置任何允许规则则不启用白名单。
-              </FieldDescription>
-            </Field>
-            <Field>
               <FieldLabel htmlFor="llm-profiles">LLM 配置链</FieldLabel>
               <TaskLLMProfileChain
                 profiles={profiles}
@@ -3395,20 +3270,6 @@ function CreateTaskSheet({
                   <p className="text-muted-foreground text-xs">
                     开启后创建即把「描述+目标」作为一条意图下发，worker 免等首轮规划直接开跑，跑完再由 planner
                     接手判定/补充。CTF 等常一个 work 直接解决的场景推荐开启；关闭则走标准的先规划再执行。
-                  </p>
-                </div>
-                <div className="grid gap-2">
-                  <label htmlFor="coverage-enabled" className="flex items-center gap-2 text-sm">
-                    <Checkbox
-                      id="coverage-enabled"
-                      checked={coverageEnabled}
-                      onCheckedChange={(v) => setCoverageEnabled(!!v)}
-                    />
-                    资产覆盖度功能
-                  </label>
-                  <p className="text-muted-foreground text-xs">
-                    默认开启：计算并展示测试覆盖度、态势图显示测试进度、自动累积测试范围。关闭后不再计算/展示覆盖度，
-                    态势图仅展示资产不显示进度，agent 也不再获得范围类工具。关闭不影响「关联企业资产范围」。
                   </p>
                 </div>
               </CollapsibleContent>
