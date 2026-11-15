@@ -1749,6 +1749,7 @@ export interface CTFVpnSidecarStatus {
   container_id?: string;
   container?: string;
   network?: string;
+  kind?: "wireguard" | "openvpn" | string;
   interface?: string;
   tunnel_ip?: string;
   endpoint?: string;
@@ -1761,6 +1762,8 @@ export interface CTFVpnSidecarStatus {
 }
 export interface CTFVpnSummary {
   enabled: boolean;
+  kind?: "wireguard" | "openvpn" | string;
+  proto?: string;
   filename?: string;
   hash?: string;
   address?: string;

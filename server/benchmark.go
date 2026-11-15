@@ -241,6 +241,13 @@ func (bm *BenchmarkManager) handleCreateSession(w http.ResponseWriter, r *http.R
 		writeErr(w, 400, err.Error())
 		return
 	}
+	if sanitizedVPN, _, cleanName, verr := prepareTaskVPNForCreate("ctf", req.Config.CTFVPNConfig, req.Config.CTFVPNFilename); verr != nil {
+		writeErr(w, 400, verr.Error())
+		return
+	} else if sanitizedVPN != "" {
+		req.Config.CTFVPNConfig = sanitizedVPN
+		req.Config.CTFVPNFilename = cleanName
+	}
 	cfgRaw, _ := json.Marshal(req.Config)
 	sess, err := bm.s.m.pg.CreateBenchmarkSession(r.Context(), db.BenchmarkSessionCreate{
 		Name:                req.Name,

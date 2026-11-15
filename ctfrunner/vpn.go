@@ -14,14 +14,19 @@ import (
 )
 
 const (
-	// MaxVPNConfigBytes caps uploaded WireGuard config size at 64 KiB.
-	MaxVPNConfigBytes = 64 * 1024
+	// MaxVPNConfigBytes caps uploaded VPN config size at 128 KiB.
+	MaxVPNConfigBytes = 128 * 1024
 	defaultVPNMTU     = 0
+
+	VPNKindWireGuard = "wireguard"
+	VPNKindOpenVPN   = "openvpn"
 )
 
-// VPNProfile represents a strictly validated, sanitized WireGuard client config
-// with dangerous wg-quick hook directives stripped/rejected.
+// VPNProfile represents a strictly validated, sanitized WireGuard or OpenVPN client config
+// with shell-executing hooks stripped/rejected.
 type VPNProfile struct {
+	Kind                string   `json:"kind"`
+	Proto               string   `json:"proto,omitempty"`
 	RawSanitized        string   `json:"-"`
 	RunnerConfig        string   `json:"-"`
 	Hash                string   `json:"hash"`
@@ -35,9 +40,11 @@ type VPNProfile struct {
 	PeerCount           int      `json:"peer_count"`
 }
 
-// VPNSummary is the non-secret public view of a task's WireGuard config.
+// VPNSummary is the non-secret public view of a task's VPN config.
 type VPNSummary struct {
 	Enabled             bool       `json:"enabled"`
+	Kind                string     `json:"kind,omitempty"`
+	Proto               string     `json:"proto,omitempty"`
 	Filename            string     `json:"filename,omitempty"`
 	Hash                string     `json:"hash,omitempty"`
 	Address             string     `json:"address,omitempty"`
@@ -50,9 +57,10 @@ type VPNSummary struct {
 	Sidecar             *VPNStatus `json:"sidecar,omitempty"`
 }
 
-// VPNStatus describes the live state of a task's WireGuard sidecar container.
+// VPNStatus describes the live state of a task's VPN sidecar container.
 type VPNStatus struct {
 	TaskID       int64  `json:"task_id"`
+	Kind         string `json:"kind,omitempty"`
 	Active       bool   `json:"active"`
 	Running      bool   `json:"running"`
 	Hash         string `json:"hash,omitempty"`
@@ -267,6 +275,7 @@ func ParseWireGuardConfig(raw string) (VPNProfile, error) {
 	sum := sha256.Sum256([]byte(sanitized))
 	keepalive := peers[0].PersistentKeepalive
 	return VPNProfile{
+		Kind:                VPNKindWireGuard,
 		RawSanitized:        sanitized,
 		RunnerConfig:        runnerConf,
 		Hash:                hex.EncodeToString(sum[:]),
@@ -281,13 +290,343 @@ func ParseWireGuardConfig(raw string) (VPNProfile, error) {
 	}, nil
 }
 
+// DetectVPNKind inspects configuration content and returns "wireguard", "openvpn", or "".
+func DetectVPNKind(raw string) string {
+	lines := strings.Split(strings.ReplaceAll(raw, "\r\n", "\n"), "\n")
+	hasWGSection := false
+	ovpnSignals := 0
+	for _, line := range lines {
+		t := strings.TrimSpace(line)
+		if t == "" || strings.HasPrefix(t, "#") || strings.HasPrefix(t, ";") {
+			continue
+		}
+		if strings.HasPrefix(t, "[") && strings.HasSuffix(t, "]") {
+			sec := strings.ToLower(strings.TrimSpace(t[1 : len(t)-1]))
+			if sec == "interface" || sec == "peer" {
+				hasWGSection = true
+			}
+		}
+		lower := strings.ToLower(t)
+		switch {
+		case lower == "client" || lower == "tls-client" ||
+			strings.HasPrefix(lower, "remote ") ||
+			strings.HasPrefix(lower, "proto ") ||
+			strings.HasPrefix(lower, "dev ") ||
+			lower == "<ca>" || lower == "<cert>" || lower == "<key>" ||
+			lower == "<tls-auth>" || lower == "<tls-crypt>" || lower == "<tls-crypt-v2>":
+			ovpnSignals++
+		}
+	}
+	if hasWGSection {
+		return VPNKindWireGuard
+	}
+	if ovpnSignals > 0 {
+		return VPNKindOpenVPN
+	}
+	return ""
+}
+
+// ParseVPNConfig auto-detects and strictly validates either WireGuard (.conf) or OpenVPN (.ovpn) client configs.
+func ParseVPNConfig(raw string) (VPNProfile, error) {
+	if strings.TrimSpace(raw) == "" {
+		return VPNProfile{}, errors.New("VPN 配置内容为空")
+	}
+	if len(raw) > MaxVPNConfigBytes {
+		return VPNProfile{}, fmt.Errorf("VPN 配置文件过大（上限 %d KiB）", MaxVPNConfigBytes/1024)
+	}
+	if strings.ContainsRune(raw, '\x00') {
+		return VPNProfile{}, errors.New("VPN 配置包含非法空字节")
+	}
+	switch DetectVPNKind(raw) {
+	case VPNKindWireGuard:
+		return ParseWireGuardConfig(raw)
+	case VPNKindOpenVPN:
+		return ParseOpenVPNConfig(raw)
+	default:
+		return VPNProfile{}, errors.New("无法识别的 VPN 配置格式，请提供有效的 WireGuard (.conf) 或 OpenVPN (.ovpn) 配置")
+	}
+}
+
+var allowedOVPNInlineTags = map[string]bool{
+	"ca":             true,
+	"cert":           true,
+	"key":            true,
+	"tls-auth":       true,
+	"tls-crypt":      true,
+	"tls-crypt-v2":   true,
+	"extra-certs":    true,
+	"crl-verify":     true,
+	"secret":         true,
+	"auth-user-pass": true,
+}
+
+var blockedOVPNDirectives = map[string]bool{
+	"plugin":                true,
+	"chroot":                true,
+	"management":            true,
+	"askpass":               true,
+	"pkcs12":                true,
+	"ipchange":              true,
+	"route-up":              true,
+	"route-pre-down":        true,
+	"client-connect":        true,
+	"client-disconnect":     true,
+	"learn-address":         true,
+	"auth-user-pass-verify": true,
+	"tls-verify":            true,
+	"tls-crypt-v2-verify":   true,
+	"tmp-dir":               true,
+	"log":                   true,
+	"log-append":            true,
+	"writepid":              true,
+	"status":                true,
+	"daemon":                true,
+}
+
+var fileRefOVPNDirectives = map[string]bool{
+	"ca":             true,
+	"cert":           true,
+	"key":            true,
+	"tls-auth":       true,
+	"tls-crypt":      true,
+	"tls-crypt-v2":   true,
+	"extra-certs":    true,
+	"crl-verify":     true,
+	"secret":         true,
+	"auth-user-pass": true,
+}
+
+func isBenignOVPNResolvHook(fields []string) bool {
+	if len(fields) < 2 {
+		return false
+	}
+	script := strings.TrimSpace(fields[1])
+	return script == "/etc/openvpn/update-resolv-conf" || script == "/etc/openvpn/update-systemd-resolved"
+}
+
+// ParseOpenVPNConfig validates an inline-cert OpenVPN client (.ovpn) config,
+// stripping benign desktop resolv hooks while blocking arbitrary script/file-access directives.
+func ParseOpenVPNConfig(raw string) (VPNProfile, error) {
+	if strings.TrimSpace(raw) == "" {
+		return VPNProfile{}, errors.New("OpenVPN 配置内容为空")
+	}
+	if len(raw) > MaxVPNConfigBytes {
+		return VPNProfile{}, fmt.Errorf("OpenVPN 配置过大（上限 %d KiB）", MaxVPNConfigBytes/1024)
+	}
+	if strings.ContainsRune(raw, '\x00') {
+		return VPNProfile{}, errors.New("OpenVPN 配置包含非法空字节")
+	}
+
+	var (
+		sanitizedLines []string
+		inBlockTag     string
+		hasClient      bool
+		remotes        []string
+		proto          string
+		addresses      []string
+		dnsServers     []string
+		routes         []string
+		mtu            int
+	)
+
+	lines := strings.Split(strings.ReplaceAll(raw, "\r\n", "\n"), "\n")
+	for lineNo, rawLine := range lines {
+		for _, r := range rawLine {
+			if r < 0x20 && r != '\t' {
+				return VPNProfile{}, fmt.Errorf("第 %d 行包含非法控制字符", lineNo+1)
+			}
+		}
+		trimmed := strings.TrimSpace(rawLine)
+		if inBlockTag != "" {
+			closeTag := "</" + inBlockTag + ">"
+			if strings.EqualFold(trimmed, closeTag) {
+				sanitizedLines = append(sanitizedLines, closeTag)
+				inBlockTag = ""
+			} else {
+				sanitizedLines = append(sanitizedLines, strings.TrimRight(rawLine, " \t\r"))
+			}
+			continue
+		}
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";") {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "<") && strings.HasSuffix(trimmed, ">") && !strings.HasPrefix(trimmed, "</") {
+			tag := strings.ToLower(strings.TrimSpace(trimmed[1 : len(trimmed)-1]))
+			if !allowedOVPNInlineTags[tag] {
+				return VPNProfile{}, fmt.Errorf("第 %d 行包含不支持的内联块 <%s>", lineNo+1, tag)
+			}
+			inBlockTag = tag
+			sanitizedLines = append(sanitizedLines, "<"+tag+">")
+			continue
+		}
+		if strings.HasPrefix(trimmed, "</") {
+			return VPNProfile{}, fmt.Errorf("第 %d 行存在未匹配的结束标签 %s", lineNo+1, trimmed)
+		}
+
+		// Strip inline comments only outside quoted/PEM sections.
+		line := trimmed
+		if idx := strings.IndexAny(line, "#;"); idx >= 0 {
+			line = strings.TrimSpace(line[:idx])
+		}
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		dir := strings.ToLower(fields[0])
+
+		switch dir {
+		case "user", "group":
+			// Drop privilege-downgrade directives because the sidecar container runs isolated with minimal caps (without CAP_SETUID/CAP_SETGID).
+			continue
+		case "script-security":
+			// Allow benign desktop boilerplate `script-security 0|1|2`, strip from runner config (container runs --script-security 0).
+			if len(fields) >= 2 && (fields[1] == "0" || fields[1] == "1" || fields[1] == "2") {
+				continue
+			}
+			return VPNProfile{}, fmt.Errorf("第 %d 行禁止设置危险的 script-security 级别", lineNo+1)
+		case "up", "down":
+			if isBenignOVPNResolvHook(fields) {
+				continue
+			}
+			return VPNProfile{}, fmt.Errorf("第 %d 行出于安全策略禁止自定义 %s 脚本指令", lineNo+1, dir)
+		}
+		if blockedOVPNDirectives[dir] {
+			return VPNProfile{}, fmt.Errorf("第 %d 行出于安全策略禁止指令 %q", lineNo+1, fields[0])
+		}
+		if fileRefOVPNDirectives[dir] && len(fields) >= 2 {
+			return VPNProfile{}, fmt.Errorf("第 %d 行 %s 不允许引用外部本地文件路径，请使用内联 <%s>...</%s> 块", lineNo+1, fields[0], dir, dir)
+		}
+
+		switch dir {
+		case "client", "tls-client":
+			hasClient = true
+		case "dev":
+			if len(fields) < 2 {
+				return VPNProfile{}, fmt.Errorf("第 %d 行 dev 缺少设备类型", lineNo+1)
+			}
+			devName := strings.ToLower(fields[1])
+			if !strings.HasPrefix(devName, "tun") && !strings.HasPrefix(devName, "tap") {
+				return VPNProfile{}, fmt.Errorf("第 %d 行 dev 设备类型 %q 不受支持（仅支持 tun/tap）", lineNo+1, fields[1])
+			}
+		case "proto":
+			if len(fields) < 2 {
+				return VPNProfile{}, fmt.Errorf("第 %d 行 proto 缺少协议值", lineNo+1)
+			}
+			p := strings.ToLower(fields[1])
+			switch p {
+			case "udp", "udp4", "udp6", "tcp", "tcp4", "tcp6", "tcp-client":
+				proto = p
+			default:
+				return VPNProfile{}, fmt.Errorf("第 %d 行不支持的协议 %q", lineNo+1, fields[1])
+			}
+		case "remote":
+			if len(fields) < 2 {
+				return VPNProfile{}, fmt.Errorf("第 %d 行 remote 缺少服务器地址", lineNo+1)
+			}
+			host := fields[1]
+			if _, err := netip.ParseAddr(host); err != nil && !isSafeHostname(host) {
+				return VPNProfile{}, fmt.Errorf("第 %d 行 remote 主机名 %q 包含非法字符", lineNo+1, host)
+			}
+			port := "1194"
+			if len(fields) >= 3 {
+				pNum, err := strconv.Atoi(fields[2])
+				if err != nil || pNum < 1 || pNum > 65535 {
+					return VPNProfile{}, fmt.Errorf("第 %d 行 remote 端口 %q 无效（1~65535）", lineNo+1, fields[2])
+				}
+				port = fields[2]
+			}
+			if len(fields) >= 4 && proto == "" {
+				proto = strings.ToLower(fields[3])
+			}
+			remotes = append(remotes, net.JoinHostPort(host, port))
+		case "dhcp-option":
+			if len(fields) >= 3 && strings.EqualFold(fields[1], "DNS") {
+				if addr, err := netip.ParseAddr(fields[2]); err == nil {
+					dnsServers = append(dnsServers, addr.String())
+				} else {
+					return VPNProfile{}, fmt.Errorf("第 %d 行 dhcp-option DNS %q 无效", lineNo+1, fields[2])
+				}
+			}
+		case "ifconfig":
+			hasClient = true
+			if len(fields) >= 2 {
+				if addr, err := netip.ParseAddr(fields[1]); err == nil {
+					addresses = append(addresses, addr.String())
+				}
+			}
+		case "route":
+			if len(fields) >= 2 {
+				if len(fields) >= 3 && strings.Contains(fields[2], ".") {
+					routes = append(routes, fields[1]+"/"+fields[2])
+				} else {
+					routes = append(routes, fields[1])
+				}
+			}
+		case "tun-mtu":
+			if len(fields) >= 2 {
+				if n, err := strconv.Atoi(fields[1]); err == nil && n >= 576 && n <= 9000 {
+					mtu = n
+				}
+			}
+		}
+
+		sanitizedLines = append(sanitizedLines, line)
+	}
+
+	if inBlockTag != "" {
+		return VPNProfile{}, fmt.Errorf("OpenVPN 配置内联块 <%s> 未正常闭合", inBlockTag)
+	}
+	if len(remotes) == 0 {
+		return VPNProfile{}, errors.New("OpenVPN 配置缺少有效的 remote 服务器地址")
+	}
+	if !hasClient {
+		return VPNProfile{}, errors.New("OpenVPN 配置缺少 client / tls-client 客户端声明")
+	}
+
+	sanitized := strings.Join(sanitizedLines, "\n") + "\n"
+	sum := sha256.Sum256([]byte(sanitized))
+	addrStr := strings.Join(addresses, ", ")
+	if addrStr == "" {
+		addrStr = "由服务端动态下发"
+	}
+	if len(routes) == 0 {
+		routes = []string{"由服务端下发路由"}
+	}
+	return VPNProfile{
+		Kind:         VPNKindOpenVPN,
+		Proto:        proto,
+		RawSanitized: sanitized,
+		RunnerConfig: sanitized,
+		Hash:         hex.EncodeToString(sum[:]),
+		Address:      addrStr,
+		Addresses:    addresses,
+		DNS:          dnsServers,
+		MTU:          mtu,
+		Endpoint:     remotes[0],
+		AllowedIPs:   routes,
+		PeerCount:    len(remotes),
+	}, nil
+}
+
 // Summary converts a parsed VPNProfile into its safe, secret-free UI DTO.
 func (p VPNProfile) Summary(filename string) VPNSummary {
 	if p.Hash == "" {
 		return VPNSummary{Enabled: false}
 	}
+	kind := p.Kind
+	if kind == "" {
+		kind = VPNKindWireGuard
+	}
 	return VPNSummary{
 		Enabled:             true,
+		Kind:                kind,
+		Proto:               p.Proto,
 		Filename:            filename,
 		Hash:                p.Hash,
 		Address:             p.Address,

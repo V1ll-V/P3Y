@@ -16,10 +16,14 @@ import (
 	"p3y/db"
 )
 
-func sanitizeVPNFilename(name string) string {
+func sanitizeVPNFilename(name, kind string) string {
+	defaultName := "wg0.conf"
+	if kind == ctfrunner.VPNKindOpenVPN {
+		defaultName = "client.ovpn"
+	}
 	base := filepath.Base(strings.TrimSpace(name))
 	if base == "" || base == "." || base == "/" || base == `\` {
-		return "wg0.conf"
+		return defaultName
 	}
 	base = strings.Map(func(r rune) rune {
 		if r < 0x20 || r == 0x7f || r == '"' || r == '\'' || r == '/' || r == '\\' {
@@ -28,7 +32,7 @@ func sanitizeVPNFilename(name string) string {
 		return r
 	}, base)
 	if base == "" {
-		return "wg0.conf"
+		return defaultName
 	}
 	return base
 }
@@ -38,13 +42,13 @@ func prepareTaskVPNForCreate(mode, rawConfig, filename string) (sanitized, hash,
 		return "", "", "", nil
 	}
 	if !db.IsSandboxTaskMode(mode) {
-		return "", "", "", errors.New("仅 CTF / AD 模式支持配置 WireGuard VPN")
+		return "", "", "", errors.New("仅 CTF / AD 模式支持配置 VPN")
 	}
-	prof, err := ctfrunner.ParseWireGuardConfig(rawConfig)
+	prof, err := ctfrunner.ParseVPNConfig(rawConfig)
 	if err != nil {
-		return "", "", "", errors.New("WireGuard 配置无效：" + err.Error())
+		return "", "", "", errors.New("VPN 配置无效：" + err.Error())
 	}
-	return prof.RawSanitized, prof.Hash, sanitizeVPNFilename(filename), nil
+	return prof.RawSanitized, prof.Hash, sanitizeVPNFilename(filename, prof.Kind), nil
 }
 
 func (s *Server) prewarmTaskVPN(t *Task, vpnHash, vpnConfig string) {
@@ -59,10 +63,10 @@ func (s *Server) prewarmTaskVPN(t *Task, vpnHash, vpnConfig string) {
 	if err != nil || taskID <= 0 {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if _, err := svc.Runner.SyncTaskVPN(ctx, taskID, vpnHash, vpnConfig); err != nil {
-		log.Printf("[ctf-vpn] 任务 #%s 预热 WireGuard 容器失败（将在首次工具调用时重试）：%v", t.ID, err)
+		log.Printf("[ctf-vpn] 任务 #%s 预热 VPN Sidecar 容器失败（将在首次工具调用时重试）：%v", t.ID, err)
 	}
 }
 
@@ -73,7 +77,7 @@ func (s *Server) requireCTFTask(w http.ResponseWriter, r *http.Request) (*Task, 
 		return nil, 0, false
 	}
 	if !db.IsSandboxTaskMode(t.Mode) {
-		writeErr(w, 400, "仅 CTF / AD 任务支持 WireGuard VPN 配置")
+		writeErr(w, 400, "仅 CTF / AD 任务支持 VPN 配置")
 		return nil, 0, false
 	}
 	id, err := strconv.ParseInt(t.ID, 10, 64)
@@ -98,9 +102,9 @@ func (s *Server) ctfVPNGet(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, ctfrunner.VPNSummary{Enabled: false})
 		return
 	}
-	prof, err := ctfrunner.ParseWireGuardConfig(cfg)
+	prof, err := ctfrunner.ParseVPNConfig(cfg)
 	if err != nil {
-		writeErr(w, 500, "已保存的 WireGuard 配置损坏："+err.Error())
+		writeErr(w, 500, "已保存的 VPN 配置损坏："+err.Error())
 		return
 	}
 	summary := prof.Summary(filename)
@@ -122,7 +126,7 @@ func readVPNUploadPayload(w http.ResponseWriter, r *http.Request) (content, file
 	if strings.HasPrefix(ct, "multipart/form-data") {
 		r.Body = http.MaxBytesReader(w, r.Body, ctfrunner.MaxVPNConfigBytes+64*1024)
 		if err := r.ParseMultipartForm(ctfrunner.MaxVPNConfigBytes + 32*1024); err != nil {
-			return "", "", errors.New("上传表单无效或配置文件过大（上限 64 KiB）")
+			return "", "", errors.New("上传表单无效或配置文件过大（上限 128 KiB）")
 		}
 		file, hdr, err := r.FormFile("file")
 		if err != nil {
@@ -134,13 +138,13 @@ func readVPNUploadPayload(w http.ResponseWriter, r *http.Request) (content, file
 			return "", "", errors.New("读取配置文件失败")
 		}
 		if len(raw) > ctfrunner.MaxVPNConfigBytes {
-			return "", "", errors.New("WireGuard 配置文件过大（上限 64 KiB）")
+			return "", "", errors.New("VPN 配置文件过大（上限 128 KiB）")
 		}
 		name := ""
 		if hdr != nil {
 			name = hdr.Filename
 		}
-		return string(raw), sanitizeVPNFilename(name), nil
+		return string(raw), strings.TrimSpace(name), nil
 	}
 
 	var req struct {
@@ -150,7 +154,7 @@ func readVPNUploadPayload(w http.ResponseWriter, r *http.Request) (content, file
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, ctfrunner.MaxVPNConfigBytes+8192)).Decode(&req); err != nil {
 		return "", "", errors.New("请求体无效或超过大小限制")
 	}
-	return req.Content, sanitizeVPNFilename(req.Filename), nil
+	return req.Content, strings.TrimSpace(req.Filename), nil
 }
 
 func (s *Server) ctfVPNPut(w http.ResponseWriter, r *http.Request) {
@@ -162,16 +166,17 @@ func (s *Server) ctfVPNPut(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 409, "已结束任务不可修改 VPN 配置")
 		return
 	}
-	raw, filename, err := readVPNUploadPayload(w, r)
+	raw, rawFilename, err := readVPNUploadPayload(w, r)
 	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	prof, err := ctfrunner.ParseWireGuardConfig(raw)
+	prof, err := ctfrunner.ParseVPNConfig(raw)
 	if err != nil {
-		writeErr(w, 400, "WireGuard 配置无效："+err.Error())
+		writeErr(w, 400, "VPN 配置无效："+err.Error())
 		return
 	}
+	filename := sanitizeVPNFilename(rawFilename, prof.Kind)
 	if err := s.m.pg.SetTaskCTFVPN(r.Context(), taskID, prof.RawSanitized, prof.Hash, filename); err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -185,7 +190,7 @@ func (s *Server) ctfVPNPut(w http.ResponseWriter, r *http.Request) {
 	summary := prof.Summary(filename)
 	svc := s.ctfService()
 	if svc.Runner != nil && svc.Runner.Configured() {
-		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		st, syncErr := svc.Runner.SyncTaskVPN(ctx, taskID, prof.Hash, prof.RawSanitized)
 		cancel()
 		if syncErr != nil {
@@ -207,12 +212,12 @@ func (s *Server) ctfVPNCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if hash == "" || strings.TrimSpace(cfg) == "" {
-		writeErr(w, 400, "当前任务尚未配置 WireGuard VPN")
+		writeErr(w, 400, "当前任务尚未配置 VPN")
 		return
 	}
-	prof, err := ctfrunner.ParseWireGuardConfig(cfg)
+	prof, err := ctfrunner.ParseVPNConfig(cfg)
 	if err != nil {
-		writeErr(w, 500, "已保存的 WireGuard 配置损坏："+err.Error())
+		writeErr(w, 500, "已保存的 VPN 配置损坏："+err.Error())
 		return
 	}
 	summary := prof.Summary(filename)
@@ -222,7 +227,7 @@ func (s *Server) ctfVPNCheck(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, summary)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	st, syncErr := svc.Runner.SyncTaskVPN(ctx, taskID, prof.Hash, prof.RawSanitized)
 	cancel()
 	if syncErr != nil {

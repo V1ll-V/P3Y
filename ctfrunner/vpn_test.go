@@ -87,3 +87,122 @@ func TestParseWireGuardConfigRejectsDangerousHooks(t *testing.T) {
 		})
 	}
 }
+
+const sampleOpenVPNConf = `client
+dev tun
+proto udp
+remote vpn.tsecbench.example 1194
+resolv-retry infinite
+nobind
+user nobody
+group nogroup
+persist-key
+persist-tun
+remote-cert-tls server
+cipher AES-256-GCM
+script-security 2
+up /etc/openvpn/update-resolv-conf
+down /etc/openvpn/update-resolv-conf
+dhcp-option DNS 10.8.0.2
+dhcp-option DNS 1.1.1.1
+route 10.66.0.0 255.255.0.0
+verb 3
+<ca>
+-----BEGIN CERTIFICATE-----
+MIIBFAKECA==
+-----END CERTIFICATE-----
+</ca>
+<cert>
+-----BEGIN CERTIFICATE-----
+MIIBFAKECERT==
+-----END CERTIFICATE-----
+</cert>
+<key>
+-----BEGIN PRIVATE KEY-----
+MIIBFAKEKEY==
+-----END PRIVATE KEY-----
+</key>
+<tls-crypt>
+-----BEGIN OpenVPN Static key V1-----
+00112233445566778899aabbccddeeff
+-----END OpenVPN Static key V1-----
+</tls-crypt>
+`
+
+func TestParseOpenVPNConfigSampleAndDetect(t *testing.T) {
+	if got := DetectVPNKind(sampleTPCTFConf); got != VPNKindWireGuard {
+		t.Fatalf("expected wireguard detect, got %q", got)
+	}
+	if got := DetectVPNKind(sampleOpenVPNConf); got != VPNKindOpenVPN {
+		t.Fatalf("expected openvpn detect, got %q", got)
+	}
+
+	prof, err := ParseVPNConfig(sampleOpenVPNConf)
+	if err != nil {
+		t.Fatalf("ParseVPNConfig failed: %v", err)
+	}
+	if prof.Kind != VPNKindOpenVPN {
+		t.Fatalf("expected Kind=%s, got %q", VPNKindOpenVPN, prof.Kind)
+	}
+	if prof.Proto != "udp" {
+		t.Fatalf("expected proto udp, got %q", prof.Proto)
+	}
+	if prof.Endpoint != "vpn.tsecbench.example:1194" {
+		t.Fatalf("unexpected endpoint: %q", prof.Endpoint)
+	}
+	if len(prof.DNS) != 2 || prof.DNS[0] != "10.8.0.2" {
+		t.Fatalf("unexpected DNS: %+v", prof.DNS)
+	}
+	if len(prof.AllowedIPs) != 1 || prof.AllowedIPs[0] != "10.66.0.0/255.255.0.0" {
+		t.Fatalf("unexpected routes: %+v", prof.AllowedIPs)
+	}
+	if strings.Contains(prof.RawSanitized, "update-resolv-conf") ||
+		strings.Contains(prof.RawSanitized, "script-security") ||
+		strings.Contains(prof.RawSanitized, "user nobody") ||
+		strings.Contains(prof.RawSanitized, "group nogroup") {
+		t.Fatalf("expected benign boilerplate directives stripped, got:\n%s", prof.RawSanitized)
+	}
+	if !strings.Contains(prof.RunnerConfig, "<tls-crypt>") {
+		t.Fatalf("expected inline <tls-crypt> preserved")
+	}
+
+	summary := prof.Summary("task_202611klci1w5y69_vpn_config.ovpn")
+	if !summary.Enabled || summary.Kind != VPNKindOpenVPN || summary.Proto != "udp" || summary.Filename != "task_202611klci1w5y69_vpn_config.ovpn" {
+		t.Fatalf("unexpected openvpn summary: %+v", summary)
+	}
+}
+
+func TestParseOpenVPNConfigRejectsUnsafeDirectives(t *testing.T) {
+	cases := []struct {
+		name string
+		conf string
+	}{
+		{
+			name: "CustomUpScript",
+			conf: strings.Replace(sampleOpenVPNConf, "up /etc/openvpn/update-resolv-conf", "up /tmp/pwn.sh", 1),
+		},
+		{
+			name: "Plugin",
+			conf: sampleOpenVPNConf + "\nplugin /tmp/evil.so\n",
+		},
+		{
+			name: "ExternalCAPath",
+			conf: sampleOpenVPNConf + "\nca /etc/passwd\n",
+		},
+		{
+			name: "ScriptSecurity3",
+			conf: strings.Replace(sampleOpenVPNConf, "script-security 2", "script-security 3", 1),
+		},
+		{
+			name: "MissingRemote",
+			conf: strings.Replace(sampleOpenVPNConf, "remote vpn.tsecbench.example 1194", "", 1),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := ParseOpenVPNConfig(tc.conf); err == nil {
+				t.Fatalf("expected error for %s", tc.name)
+			}
+		})
+	}
+}

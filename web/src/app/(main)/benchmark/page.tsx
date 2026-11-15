@@ -561,13 +561,13 @@ export default function BenchmarkListPage() {
               <div className="flex flex-col gap-2.5 rounded-lg border p-3.5">
                 <Label className="flex items-center gap-1.5 text-xs font-medium">
                   <ShieldCheckIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                  赛题内网 WireGuard VPN (.conf 可选)
+                  赛题内网 VPN (.conf / .ovpn 可选)
                 </Label>
                 <div className="flex items-center gap-2">
                   <Button asChild type="button" variant="outline" size="sm" className="shrink-0 text-xs">
                     <label className="cursor-pointer">
-                      选择 .conf 文件
-                      <input type="file" accept=".conf,.txt" className="sr-only" onChange={(e) => void handleVpnFileChange(e)} />
+                      选择 .conf / .ovpn
+                      <input type="file" accept=".conf,.ovpn,.txt" className="sr-only" onChange={(e) => void handleVpnFileChange(e)} />
                     </label>
                   </Button>
                   <span className="truncate text-xs text-muted-foreground">
@@ -578,7 +578,7 @@ export default function BenchmarkListPage() {
                   rows={2}
                   value={vpnConfig}
                   onChange={(e) => setVpnConfig(e.target.value)}
-                  placeholder="或直接粘贴 [Interface] / [Peer] 配置..."
+                  placeholder="或直接粘贴 WireGuard (.conf) / OpenVPN (.ovpn) 配置..."
                   className="text-xs"
                 />
               </div>

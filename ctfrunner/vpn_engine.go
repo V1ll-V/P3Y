@@ -103,30 +103,38 @@ func (e *Engine) resolveSessionNetwork(ctx context.Context, task, vpnHash string
 	return "container:" + wg.ID, wg.ID, nil
 }
 
+func normalizeVPNKind(kind string) string {
+	if strings.EqualFold(strings.TrimSpace(kind), VPNKindOpenVPN) {
+		return VPNKindOpenVPN
+	}
+	return VPNKindWireGuard
+}
+
 func (e *Engine) requireVPNContainer(ctx context.Context, task, vpnHash string) (Container, error) {
 	c, err := e.Container(ctx, vpnContainerName(task))
 	if err != nil {
-		return Container{}, fmt.Errorf("任务 #%s 的 WireGuard VPN 容器未就绪：%w", task, err)
+		return Container{}, fmt.Errorf("任务 #%s 的 VPN 容器未就绪：%w", task, err)
 	}
 	if c.Config.Labels["p3y.box.managed"] != "true" ||
 		c.Config.Labels["p3y.box.role"] != "wg" ||
 		c.Config.Labels["p3y.box.task"] != task ||
 		c.Config.Labels["p3y.box.vpn"] != vpnHash {
-		return Container{}, fmt.Errorf("任务 #%s 的 WireGuard VPN 容器配置版本不一致，需要重新同步", task)
+		return Container{}, fmt.Errorf("任务 #%s 的 VPN 容器配置版本不一致，需要重新同步", task)
 	}
+	kind := normalizeVPNKind(c.Config.Labels["p3y.box.vpn_kind"])
 	if !c.State.Running {
 		if err = e.json(ctx, "POST", "/containers/"+c.ID+"/start", nil, nil); err != nil {
-			return Container{}, fmt.Errorf("启动 WireGuard VPN 容器失败：%w", err)
+			return Container{}, fmt.Errorf("启动 VPN 容器失败：%w", err)
 		}
-		if err = e.waitVPNReady(ctx, c.ID); err != nil {
+		if err = e.waitVPNReady(ctx, c.ID, kind); err != nil {
 			return Container{}, err
 		}
 	}
 	return c, nil
 }
 
-// EnsureVPN ensures a dedicated per-task WireGuard sidecar container is running
-// with the exact validated VPN configuration and tears down stale containers on update.
+// EnsureVPN ensures a dedicated per-task VPN sidecar container (WireGuard or OpenVPN)
+// is running with the exact validated VPN configuration and tears down stale containers on update.
 func (e *Engine) EnsureVPN(ctx context.Context, taskID, expectedHash, rawConfig string) (VPNStatus, error) {
 	taskID = strings.TrimSpace(taskID)
 	if taskID == "" {
@@ -135,23 +143,25 @@ func (e *Engine) EnsureVPN(ctx context.Context, taskID, expectedHash, rawConfig 
 	unlock := lockVPNTask(taskID)
 	defer unlock()
 
-	prof, err := ParseWireGuardConfig(rawConfig)
+	prof, err := ParseVPNConfig(rawConfig)
 	if err != nil {
 		return VPNStatus{}, err
 	}
 	if expectedHash != "" && prof.Hash != expectedHash {
-		return VPNStatus{}, fmt.Errorf("WireGuard 配置摘要不匹配：%s != %s", prof.Hash, expectedHash)
+		return VPNStatus{}, fmt.Errorf("VPN 配置摘要不匹配：%s != %s", prof.Hash, expectedHash)
 	}
 
 	name := vpnContainerName(taskID)
 	if existing, err := e.Container(ctx, name); err == nil {
+		existingKind := normalizeVPNKind(existing.Config.Labels["p3y.box.vpn_kind"])
 		if existing.Config.Labels["p3y.box.managed"] == "true" &&
 			existing.Config.Labels["p3y.box.role"] == "wg" &&
 			existing.Config.Labels["p3y.box.task"] == taskID &&
-			existing.Config.Labels["p3y.box.vpn"] == prof.Hash {
+			existing.Config.Labels["p3y.box.vpn"] == prof.Hash &&
+			existingKind == prof.Kind {
 			if !existing.State.Running {
 				if startErr := e.json(ctx, "POST", "/containers/"+existing.ID+"/start", nil, nil); startErr == nil {
-					if readyErr := e.waitVPNReady(ctx, existing.ID); readyErr == nil {
+					if readyErr := e.waitVPNReady(ctx, existing.ID, prof.Kind); readyErr == nil {
 						return e.ProbeVPN(ctx, taskID)
 					}
 				}
@@ -182,10 +192,11 @@ func (e *Engine) EnsureVPN(ctx context.Context, taskID, expectedHash, rawConfig 
 		"Image": wgImg,
 		"User":  "0:0",
 		"Labels": map[string]string{
-			"p3y.box.managed": "true",
-			"p3y.box.role":    "wg",
-			"p3y.box.task":    taskID,
-			"p3y.box.vpn":     prof.Hash,
+			"p3y.box.managed":  "true",
+			"p3y.box.role":     "wg",
+			"p3y.box.task":     taskID,
+			"p3y.box.vpn":      prof.Hash,
+			"p3y.box.vpn_kind": prof.Kind,
 		},
 		"HostConfig": map[string]any{
 			"Memory":      int64(128 << 20),
@@ -209,23 +220,23 @@ func (e *Engine) EnsureVPN(ctx context.Context, taskID, expectedHash, rawConfig 
 	}
 	var created struct{ ID string }
 	if err = e.json(ctx, "POST", "/containers/create?name="+url.QueryEscape(name), payload, &created); err != nil {
-		return VPNStatus{}, fmt.Errorf("创建 WireGuard 容器失败：%w", err)
+		return VPNStatus{}, fmt.Errorf("创建 VPN 容器失败：%w", err)
 	}
 
-	tarBuf, err := buildVPNTar(prof.RunnerConfig, prof.DNS)
+	tarBuf, err := buildVPNTar(prof.Kind, prof.RunnerConfig, prof.DNS)
 	if err != nil {
 		_ = e.removeContainerOnly(ctx, name)
 		return VPNStatus{}, err
 	}
 	if err = e.putArchiveRoot(ctx, created.ID, bytes.NewReader(tarBuf)); err != nil {
 		_ = e.removeContainerOnly(ctx, name)
-		return VPNStatus{}, fmt.Errorf("注入 WireGuard 配置失败：%w", err)
+		return VPNStatus{}, fmt.Errorf("注入 VPN 配置失败：%w", err)
 	}
 	if err = e.json(ctx, "POST", "/containers/"+created.ID+"/start", nil, nil); err != nil {
 		_ = e.removeContainerOnly(ctx, name)
-		return VPNStatus{}, fmt.Errorf("启动 WireGuard 容器失败：%w", err)
+		return VPNStatus{}, fmt.Errorf("启动 VPN 容器失败：%w", err)
 	}
-	if err = e.waitVPNReady(ctx, created.ID); err != nil {
+	if err = e.waitVPNReady(ctx, created.ID, prof.Kind); err != nil {
 		logs := e.containerLogs(ctx, created.ID)
 		_ = e.removeContainerOnly(ctx, name)
 		if logs != "" {
@@ -303,16 +314,32 @@ func (e *Engine) ProbeVPN(ctx context.Context, taskID string) (VPNStatus, error)
 		st.Error = err.Error()
 		return st, err
 	}
+	kind := normalizeVPNKind(c.Config.Labels["p3y.box.vpn_kind"])
 	st.Active = true
+	st.Kind = kind
 	st.Running = c.State.Running
 	st.ContainerID = c.ID
 	st.Hash = c.Config.Labels["p3y.box.vpn"]
 	if !c.State.Running {
-		st.Error = "WireGuard Sidecar 容器未处于运行状态"
+		st.Error = "VPN Sidecar 容器未处于运行状态"
 		return st, nil
 	}
 
-	probeCmd := `test -f /run/wg/ready && echo "READY=1" || echo "READY=0"; ip -4 -o addr show dev wg0 2>/dev/null | awk '{print "ADDR="$4}'; wg show wg0 dump 2>/dev/null | sed -n '2,$p'; grep -E '^nameserver ' /etc/resolv.conf 2>/dev/null | awk '{print "DNS="$2}'`
+	var probeCmd string
+	if kind == VPNKindOpenVPN {
+		probeCmd = `test -f /run/wg/ready && echo "READY=1" || echo "READY=0"; ` +
+			`IFACE=$(ip -4 -o addr show 2>/dev/null | awk '$2 ~ /^(tun|tap)[0-9]+$/ {print $2; exit}'); ` +
+			`if [ -n "$IFACE" ]; then ` +
+			`echo "IFACE=$IFACE"; ` +
+			`ip -4 -o addr show dev "$IFACE" 2>/dev/null | awk '{print "ADDR="$4; exit}'; ` +
+			`[ -r "/sys/class/net/$IFACE/statistics/rx_bytes" ] && echo "RX=$(cat "/sys/class/net/$IFACE/statistics/rx_bytes")"; ` +
+			`[ -r "/sys/class/net/$IFACE/statistics/tx_bytes" ] && echo "TX=$(cat "/sys/class/net/$IFACE/statistics/tx_bytes")"; ` +
+			`fi; ` +
+			`awk '/^remote[[:space:]]+/ {print "REMOTE="$2":"($3?$3:"1194"); exit}' /run/wg/client.ovpn 2>/dev/null || true; ` +
+			`grep -E '^nameserver ' /etc/resolv.conf 2>/dev/null | awk '{print "DNS="$2}'`
+	} else {
+		probeCmd = `test -f /run/wg/ready && echo "READY=1" || echo "READY=0"; ip -4 -o addr show dev wg0 2>/dev/null | awk '{print "ADDR="$4}'; wg show wg0 dump 2>/dev/null | sed -n '2,$p'; grep -E '^nameserver ' /etc/resolv.conf 2>/dev/null | awk '{print "DNS="$2}'`
+	}
 	res, err := e.execRoot(ctx, c.ID, probeCmd)
 	if err != nil {
 		st.Error = err.Error()
@@ -325,12 +352,26 @@ func (e *Engine) ProbeVPN(ctx context.Context, taskID string) (VPNStatus, error)
 			continue
 		}
 		switch {
+		case strings.HasPrefix(line, "IFACE="):
+			st.Interface = strings.TrimPrefix(line, "IFACE=")
 		case strings.HasPrefix(line, "ADDR="):
 			st.TunnelIP = strings.TrimPrefix(line, "ADDR=")
-			st.Interface = "wg0"
+			if st.Interface == "" && kind == VPNKindWireGuard {
+				st.Interface = "wg0"
+			}
+		case strings.HasPrefix(line, "REMOTE="):
+			st.Endpoint = strings.TrimPrefix(line, "REMOTE=")
+		case strings.HasPrefix(line, "RX="):
+			if rx, parseErr := strconv.ParseInt(strings.TrimPrefix(line, "RX="), 10, 64); parseErr == nil {
+				st.RxBytes = rx
+			}
+		case strings.HasPrefix(line, "TX="):
+			if tx, parseErr := strconv.ParseInt(strings.TrimPrefix(line, "TX="), 10, 64); parseErr == nil {
+				st.TxBytes = tx
+			}
 		case strings.HasPrefix(line, "DNS="):
 			dnsList = append(dnsList, strings.TrimPrefix(line, "DNS="))
-		case !strings.HasPrefix(line, "READY="):
+		case kind == VPNKindWireGuard && !strings.HasPrefix(line, "READY="):
 			fields := strings.Split(line, "\t")
 			if len(fields) >= 7 {
 				if fields[2] != "(none)" {
@@ -355,17 +396,25 @@ func (e *Engine) ProbeVPN(ctx context.Context, taskID string) (VPNStatus, error)
 	return st, nil
 }
 
-func (e *Engine) waitVPNReady(ctx context.Context, containerID string) error {
-	deadline := time.Now().Add(12 * time.Second)
+func (e *Engine) waitVPNReady(ctx context.Context, containerID, kind string) error {
+	timeout := 12 * time.Second
+	checkCmd := `test -f /run/wg/ready && ip link show dev wg0 >/dev/null 2>&1`
+	timeoutErr := "等待 WireGuard 隧道 wg0 就绪超时"
+	if normalizeVPNKind(kind) == VPNKindOpenVPN {
+		timeout = 25 * time.Second
+		checkCmd = `test -f /run/wg/ready && ip -4 -o addr show 2>/dev/null | grep -Eq ' (tun|tap)[0-9]+ '`
+		timeoutErr = "等待 OpenVPN 隧道 (tun/tap) 就绪超时"
+	}
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		c, err := e.Container(ctx, containerID)
 		if err != nil {
 			return err
 		}
 		if !c.State.Running {
-			return errors.New("WireGuard 容器启动后提前退出")
+			return errors.New("VPN 容器启动后提前退出")
 		}
-		res, err := e.execRoot(ctx, containerID, `test -f /run/wg/ready && ip link show dev wg0 >/dev/null 2>&1`)
+		res, err := e.execRoot(ctx, containerID, checkCmd)
 		if err == nil && res.ExitCode == 0 {
 			return nil
 		}
@@ -375,7 +424,7 @@ func (e *Engine) waitVPNReady(ctx context.Context, containerID string) error {
 		case <-time.After(200 * time.Millisecond):
 		}
 	}
-	return errors.New("等待 WireGuard 隧道 wg0 就绪超时")
+	return errors.New(timeoutErr)
 }
 
 func (e *Engine) containerLogs(ctx context.Context, id string) string {
@@ -513,10 +562,18 @@ func (e *Engine) listTaskVolumes(ctx context.Context, taskID string) ([]string, 
 	return names, nil
 }
 
-func buildVPNTar(runnerConfig string, dns []string) ([]byte, error) {
+func buildVPNTar(kind, runnerConfig string, dns []string) ([]byte, error) {
+	kind = normalizeVPNKind(kind)
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
-	if err := writeTarFile(tw, "run/wg/wg0.conf", []byte(runnerConfig), 0600); err != nil {
+	if err := writeTarFile(tw, "run/wg/kind", []byte(kind+"\n"), 0644); err != nil {
+		return nil, err
+	}
+	cfgPath := "run/wg/wg0.conf"
+	if kind == VPNKindOpenVPN {
+		cfgPath = "run/wg/client.ovpn"
+	}
+	if err := writeTarFile(tw, cfgPath, []byte(runnerConfig), 0600); err != nil {
 		return nil, err
 	}
 	dnsBody := ""
