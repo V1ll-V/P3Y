@@ -53,7 +53,7 @@ func NewCTF2Client(mcpURL, token string, cfg SessionConfig) *CTF2Client {
 		headers:     headers,
 		insecureTLS: cfg.InsecureTLS,
 		cfg:         cfg,
-		httpDL:      &http.Client{Timeout: 90 * time.Second},
+		httpDL:      &http.Client{Timeout: 90 * time.Second, Transport: newIPv4FirstTransport()},
 	}
 }
 

@@ -61,7 +61,7 @@ const STATUS_BADGE: Record<string, { label: string; variant: "default" | "second
 const PROVIDER_META: Record<BenchmarkProviderKind, { name: string; defaultUrl: string; desc: string }> = {
   tsecbench: {
     name: "TSecBench REST API",
-    defaultUrl: "http://127.0.0.1:8000",
+    defaultUrl: "https://tsecbench.zc.tencent.com",
     desc: "标准赛题平台 HTTP 接口（BENCHMARK_TOKEN 鉴权、最多 3 并发靶机、多 Flag 累加计分）",
   },
   ctf2: {

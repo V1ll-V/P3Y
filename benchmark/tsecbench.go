@@ -7,11 +7,36 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 )
+
+// newIPv4FirstTransport clones http.DefaultTransport and dials tcp4 first for
+// non-literal IPv6 addresses so Docker Desktop's embedded resolver (127.0.0.11),
+// which can stall on AAAA queries, does not delay or time out HTTPS handshakes.
+func newIPv4FirstTransport() *http.Transport {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if network == "tcp" {
+			host, _, err := net.SplitHostPort(addr)
+			if err == nil {
+				if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+					return dialer.DialContext(ctx, network, addr)
+				}
+			}
+			conn, err := dialer.DialContext(ctx, "tcp4", addr)
+			if err == nil {
+				return conn, nil
+			}
+		}
+		return dialer.DialContext(ctx, network, addr)
+	}
+	return tr
+}
 
 // TSecBenchClient implements Provider for CHALLENGES_API.md (/openapi/v1/challenges/*).
 type TSecBenchClient struct {
@@ -24,7 +49,7 @@ func NewTSecBenchClient(baseURL, token string) *TSecBenchClient {
 	return &TSecBenchClient{
 		baseURL: strings.TrimRight(strings.TrimSpace(baseURL), "/"),
 		token:   strings.TrimSpace(token),
-		http:    &http.Client{Timeout: 45 * time.Second},
+		http:    &http.Client{Timeout: 45 * time.Second, Transport: newIPv4FirstTransport()},
 	}
 }
 

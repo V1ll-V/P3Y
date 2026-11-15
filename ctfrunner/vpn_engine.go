@@ -52,8 +52,18 @@ func (e *Engine) vpnSubnet() string {
 	return "10.220.0.0/16"
 }
 
+func isPoolOverlapErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "pool overlaps") || strings.Contains(msg, "overlaps with other one")
+}
+
 // EnsureVPNNetwork creates an isolated bridge network outside Docker's default
 // 172.17.0.0/16 subnet so challenge VPNs using 172.17.x.0/24 never collide.
+// If the preferred subnet collides with another Docker network (e.g. legacy artex-ctf-vpn),
+// it falls back to alternative private /16 pools or Docker's automatic IPAM.
 func (e *Engine) EnsureVPNNetwork(ctx context.Context) error {
 	netName := e.vpnNetworkName()
 	var existing map[string]any
@@ -64,31 +74,49 @@ func (e *Engine) EnsureVPNNetwork(ctx context.Context) error {
 	if !strings.Contains(err.Error(), ": 404 ") {
 		return err
 	}
-	payload := map[string]any{
-		"Name":           netName,
-		"Driver":         "bridge",
-		"CheckDuplicate": true,
-		"Labels": map[string]string{
-			"p3y.box.managed": "true",
-			"p3y.box.role":    "vpn-net",
-		},
-		"IPAM": map[string]any{
-			"Driver": "default",
-			"Config": []map[string]any{
-				{"Subnet": e.vpnSubnet()},
-			},
-		},
+
+	preferred := e.vpnSubnet()
+	candidates := []string{preferred}
+	for _, fb := range []string{"10.221.0.0/16", "10.222.0.0/16", "10.223.0.0/16", "10.224.0.0/16", "10.225.0.0/16", ""} {
+		if fb != preferred {
+			candidates = append(candidates, fb)
+		}
 	}
-	if err = e.json(ctx, "POST", "/networks/create", payload, nil); err != nil {
+
+	var lastErr error
+	for _, subnet := range candidates {
+		payload := map[string]any{
+			"Name":           netName,
+			"Driver":         "bridge",
+			"CheckDuplicate": true,
+			"Labels": map[string]string{
+				"p3y.box.managed": "true",
+				"p3y.box.role":    "vpn-net",
+			},
+		}
+		if subnet != "" {
+			payload["IPAM"] = map[string]any{
+				"Driver": "default",
+				"Config": []map[string]any{
+					{"Subnet": subnet},
+				},
+			}
+		}
+		if err = e.json(ctx, "POST", "/networks/create", payload, nil); err == nil {
+			return nil
+		}
 		// Concurrent network creation returns 409; re-check before failing.
 		if strings.Contains(err.Error(), ": 409 ") {
 			if checkErr := e.json(ctx, "GET", "/networks/"+url.PathEscape(netName), nil, &existing); checkErr == nil {
 				return nil
 			}
 		}
-		return fmt.Errorf("创建隔离 CTF VPN 网络 %s (%s) 失败：%w", netName, e.vpnSubnet(), err)
+		lastErr = err
+		if !isPoolOverlapErr(err) {
+			return fmt.Errorf("创建隔离 CTF VPN 网络 %s (%s) 失败：%w", netName, subnet, err)
+		}
 	}
-	return nil
+	return fmt.Errorf("创建隔离 CTF VPN 网络 %s (%s) 失败：%w", netName, preferred, lastErr)
 }
 
 func (e *Engine) resolveSessionNetwork(ctx context.Context, task, vpnHash string) (netMode, wgID string, err error) {

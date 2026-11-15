@@ -1,6 +1,10 @@
 package ctfrunner
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -204,5 +208,47 @@ func TestParseOpenVPNConfigRejectsUnsafeDirectives(t *testing.T) {
 				t.Fatalf("expected error for %s", tc.name)
 			}
 		})
+	}
+}
+
+func TestEnsureVPNNetworkOverlapsFallback(t *testing.T) {
+	var seenSubnets []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/networks/"):
+			http.Error(w, `{"message":"network not found"}`, http.StatusNotFound)
+		case r.Method == http.MethodPost && r.URL.Path == "/networks/create":
+			var body struct {
+				IPAM struct {
+					Config []struct {
+						Subnet string `json:"Subnet"`
+					} `json:"Config"`
+				} `json:"IPAM"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			subnet := ""
+			if len(body.IPAM.Config) > 0 {
+				subnet = body.IPAM.Config[0].Subnet
+			}
+			seenSubnets = append(seenSubnets, subnet)
+			if subnet == "10.220.0.0/16" {
+				http.Error(w, `{"message":"invalid pool request: Pool overlaps with other one on this address space"}`, http.StatusForbidden)
+				return
+			}
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"Id":"net-1"}`))
+		default:
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+		}
+	}))
+	defer srv.Close()
+
+	t.Setenv("P3Y_VPN_SUBNET", "10.220.0.0/16")
+	e := &Engine{Client: srv.Client(), Base: srv.URL}
+	if err := e.EnsureVPNNetwork(context.Background()); err != nil {
+		t.Fatalf("EnsureVPNNetwork failed: %v", err)
+	}
+	if len(seenSubnets) != 2 || seenSubnets[0] != "10.220.0.0/16" || seenSubnets[1] != "10.221.0.0/16" {
+		t.Fatalf("unexpected subnet fallback sequence: %+v", seenSubnets)
 	}
 }

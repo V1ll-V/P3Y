@@ -110,10 +110,26 @@ func taskInputContextForRole(root string, ts *db.ExplorationStore, taskID, inten
 			b.WriteString(boardIdx)
 		}
 		if vpnCfg, vpnHash, vpnFilename, vpnErr := ts.Database().TaskCTFVPN(context.Background(), taskID); vpnErr == nil && vpnHash != "" {
-			if prof, parseErr := ctfrunner.ParseWireGuardConfig(vpnCfg); parseErr == nil {
+			if prof, parseErr := ctfrunner.ParseVPNConfig(vpnCfg); parseErr == nil {
+				kindLabel := "WireGuard"
+				if prof.Kind == ctfrunner.VPNKindOpenVPN {
+					kindLabel = "OpenVPN"
+				}
+				addrLabel := prof.Address
+				if addrLabel == "" {
+					addrLabel = "tun/tap (服务端分配)"
+				}
+				routesLabel := strings.Join(prof.AllowedIPs, ", ")
+				if routesLabel == "" {
+					routesLabel = "服务端下发"
+				}
 				tunnelIP := strings.Split(prof.Address, "/")[0]
-				fmt.Fprintf(&b, "\n【赛题专属 WireGuard VPN 已连接】配置文件=%s | 隧道IP=%s | DNS=%s | 内部路由=%s\n说明：本任务的工具容器（ctf_http、ctf_probe_target、ctf_python、ctf_bash、ctf_session_start 等）已接入该赛题独立隔离 WireGuard 隧道网络，可直接解析并访问 *.internal 等赛题内网域名与目标端口（无需宿主机代理）。若题目支持带外回连或反弹 Shell，请在容器内监听端口并让目标连接 `ctfy-callback:<端口>`（或 %s:<端口>）。严禁试图读取或修改 VPN 私钥/隧道网卡。\n",
-					vpnFilename, prof.Address, strings.Join(prof.DNS, ", "), strings.Join(prof.AllowedIPs, ", "), tunnelIP)
+				callbackHint := "请在容器内监听端口并结合题目约束回连"
+				if tunnelIP != "" {
+					callbackHint = fmt.Sprintf("请在容器内监听端口并让目标连接 `ctfy-callback:<端口>`（或 %s:<端口>）", tunnelIP)
+				}
+				fmt.Fprintf(&b, "\n【赛题专属 %s VPN 已连接】配置文件=%s | 隧道IP=%s | DNS=%s | 内部路由=%s\n说明：本任务的工具容器（ctf_http、ctf_probe_target、ctf_python、ctf_bash、ctf_session_start 等）已接入该赛题独立隔离 %s 隧道网络，可直接解析并访问赛题内网域名与目标端口（无需宿主机代理）。若题目支持带外回连或反弹 Shell，%s。严禁试图读取或修改 VPN 私钥/证书/隧道网卡。\n",
+					kindLabel, vpnFilename, addrLabel, strings.Join(prof.DNS, ", "), routesLabel, kindLabel, callbackHint)
 			}
 		}
 		b.WriteString("\n")
