@@ -120,6 +120,12 @@ import type {
   RepeaterRunResult,
   CatcherScanResult,
   PatchVerifyResult,
+  BenchmarkDetailResponse,
+  BenchmarkParsedSkill,
+  BenchmarkProviderKind,
+  BenchmarkSession,
+  BenchmarkSessionConfig,
+  BenchmarkTestConnectionResult,
 } from "@/lib/types";
 
 function getToken(): string | null {
@@ -264,7 +270,7 @@ export const api = {
     get<{ tasks: Task[]; active: string }>("/tasks").then((r) => ({ tasks: arr(r.tasks), active: r.active ?? "" })),
   task: (id: string) => get<Task>(`/tasks/${encodeURIComponent(id)}`),
   createTask: (input: {
-    mode?: "pentest" | "ctf";
+    mode?: "pentest" | "ctf" | "ad";
     challengeType?: "auto" | "web" | "pwn" | "reverse" | "crypto" | "misc";
     ctfVerifyMode?: "auto" | "flag" | "exploit_proof" | "flag_and_exploit";
     attachmentBatchId?: string;
@@ -282,14 +288,15 @@ export const api = {
     planHeartbeatSeconds?: number;
     coverageEnabled?: boolean;
     interceptRules?: AssetInterceptRuleInput[];
-  }) =>
-    post<Task>("/tasks", {
+  }) => {
+    const isSandboxMode = input.mode === "ctf" || input.mode === "ad";
+    return post<Task>("/tasks", {
       mode: input.mode ?? "pentest",
-      challenge_type: input.mode === "ctf" ? (input.challengeType ?? "auto") : "",
+      challenge_type: isSandboxMode ? (input.challengeType ?? "auto") : "",
       ctf_verify_mode: input.mode === "ctf" ? (input.ctfVerifyMode ?? "auto") : "",
       attachment_batch_id: input.attachmentBatchId ?? "",
-      ctf_vpn_config: input.mode === "ctf" ? (input.ctfVpnConfig ?? "") : "",
-      ctf_vpn_filename: input.mode === "ctf" ? (input.ctfVpnFilename ?? "") : "",
+      ctf_vpn_config: isSandboxMode ? (input.ctfVpnConfig ?? "") : "",
+      ctf_vpn_filename: isSandboxMode ? (input.ctfVpnFilename ?? "") : "",
       name: input.name ?? "",
       category_id: input.categoryId ?? null,
       description: input.description,
@@ -300,9 +307,10 @@ export const api = {
       timeout_seconds: input.timeoutSeconds ?? 0,
       seed_first_intent: input.seedFirstIntent ?? false,
       plan_heartbeat_seconds: input.planHeartbeatSeconds ?? 0, // 0 = 后端归一到默认 600(10min)
-      coverage_enabled: input.coverageEnabled ?? input.mode !== "ctf",
+      coverage_enabled: input.coverageEnabled ?? !isSandboxMode,
       intercept_rules: input.interceptRules ?? [], // 任务级资产拦截规则
-    }),
+    });
+  },
   createArtifactDraft: () => post<{ id: string }>("/task-upload-drafts", {}),
   artifacts: (base: string) => get<ArtifactManifest>(base),
   uploadArtifacts: (base: string, files: File[]) => {
@@ -1493,4 +1501,68 @@ export const api = {
     taskId: string,
     body: { service_name: string; patch_cmd?: string; check_cmd: string; exploit_cmd: string },
   ) => post<PatchVerifyResult>(`/tasks/${taskId}/ad/patcher/verify`, body),
+
+  // ---- Zero-Touch Multi-Platform Benchmark ----
+  benchmarkTestConnection: (body: {
+    provider: BenchmarkProviderKind;
+    base_url: string;
+    token?: string;
+    config?: BenchmarkSessionConfig;
+  }) => post<BenchmarkTestConnectionResult>("/benchmarks/test-connection", body),
+
+  benchmarkParseSkill: (file: File) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    return http<BenchmarkParsedSkill>("/benchmarks/parse-skill", { method: "POST", body: fd });
+  },
+
+  benchmarkListSessions: () => get<BenchmarkSession[]>("/benchmarks").then(arr),
+
+  benchmarkCreateSession: (
+    payload: {
+      name: string;
+      provider: BenchmarkProviderKind;
+      base_url: string;
+      token?: string;
+      config?: BenchmarkSessionConfig;
+      max_concurrent?: number;
+      hint_policy?: "never" | "stagnant_only";
+      per_challenge_timeout?: number;
+      llm_profile_ids?: number[];
+      auto_start?: boolean;
+    },
+    skillZipFile?: File | null,
+  ) => {
+    if (skillZipFile) {
+      const fd = new FormData();
+      fd.append("payload", JSON.stringify(payload));
+      fd.append("skill_zip", skillZipFile);
+      return http<BenchmarkSession>("/benchmarks", { method: "POST", body: fd });
+    }
+    return post<BenchmarkSession>("/benchmarks", payload);
+  },
+
+  benchmarkGetSession: (id: number | string) => get<BenchmarkDetailResponse>(`/benchmarks/${id}`),
+  benchmarkStartSession: (id: number | string) => post<BenchmarkSession>(`/benchmarks/${id}/start`),
+  benchmarkStopSession: (id: number | string) => post<BenchmarkSession>(`/benchmarks/${id}/stop`),
+  benchmarkSyncSession: (id: number | string) =>
+    post<{ synced: number; session: BenchmarkSession }>(`/benchmarks/${id}/sync`),
+  benchmarkRetryFailed: (id: number | string) =>
+    post<{ reset: number; session: BenchmarkSession }>(`/benchmarks/${id}/retry-failed`),
+  benchmarkDeleteSession: (id: number | string) =>
+    del<{ deleted: boolean; id: number }>(`/benchmarks/${id}`),
+  benchmarkExportSession: async (id: number | string) => {
+    const token = getToken();
+    const res = await fetch(`/api/benchmarks/${id}/export`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+    });
+    if (!res.ok) throw new Error(`导出失败 (${res.status})`);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `benchmark-${id}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  },
 };

@@ -123,6 +123,17 @@ func (d *DB) SetTaskCTFVerifyMode(ctx context.Context, taskID int64, raw string)
 	return "", ErrTaskModeInvalid
 }
 
+// IsSandboxTaskMode reports whether mode uses the isolated p3y-box sandbox,
+// WireGuard VPN, Phase-0 Precheck, and shared artifact container mount.
+func IsSandboxTaskMode(mode string) bool {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "ctf", "ad":
+		return true
+	default:
+		return false
+	}
+}
+
 func NormalizeTaskMode(mode, challenge string) (string, string, error) {
 	mode = strings.TrimSpace(mode)
 	challenge = strings.TrimSpace(challenge)
@@ -132,7 +143,7 @@ func NormalizeTaskMode(mode, challenge string) (string, string, error) {
 	if mode == "pentest" && challenge == "" {
 		return mode, challenge, nil
 	}
-	if mode == "ctf" {
+	if mode == "ctf" || mode == "ad" {
 		if challenge == "" {
 			challenge = "auto"
 		}

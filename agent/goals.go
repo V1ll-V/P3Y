@@ -110,7 +110,7 @@ func DecomposeGoalsWithProvider(ctx context.Context, prov llm.Provider, dataDir,
 	ctfMode := false
 	if ts != nil {
 		mode, _, _, _ := ts.TaskInputMetadata()
-		ctfMode = mode == "ctf"
+		ctfMode = db.IsSandboxTaskMode(mode)
 	}
 	if ctfMode {
 		sys = ctfGoalsSystem

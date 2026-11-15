@@ -16,6 +16,7 @@ import {
   Sparkles,
   Target,
   Terminal,
+  Trophy,
   Wrench,
 } from "lucide-react";
 
@@ -74,6 +75,13 @@ export const sidebarItems: NavGroup[] = [
   },
   {
     id: 2,
+    label: "测评",
+    items: [
+      { id: "benchmark", title: "自动测评", url: "/benchmark", icon: Trophy },
+    ],
+  },
+  {
+    id: 3,
     label: "系统",
     items: [
       { id: "llm", title: "LLM", url: "/system/llm", icon: Brain },

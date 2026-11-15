@@ -30,8 +30,8 @@ func (s *Server) taskPrecheckGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer done()
-	if t.Mode != "ctf" {
-		writeErr(w, 400, "仅 CTF 任务支持 Phase-0 Precheck")
+	if !db.IsSandboxTaskMode(t.Mode) {
+		writeErr(w, 400, "仅 CTF / AD 任务支持 Phase-0 Precheck")
 		return
 	}
 	res, err := s.ctfService().RunPrecheck(r.Context(), id, false)
@@ -48,8 +48,8 @@ func (s *Server) taskPrecheckRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer done()
-	if t.Mode != "ctf" {
-		writeErr(w, 400, "仅 CTF 任务支持 Phase-0 Precheck")
+	if !db.IsSandboxTaskMode(t.Mode) {
+		writeErr(w, 400, "仅 CTF / AD 任务支持 Phase-0 Precheck")
 		return
 	}
 	res, err := s.ctfService().RunPrecheck(r.Context(), id, true)

@@ -1346,7 +1346,8 @@ function TaskNameEditor({ task, onRename }: { task: Task; onRename: (task: Task,
         {task.name?.trim() ? task.name : <span className="text-muted-foreground">未命名</span>}
       </Link>
       {task.mode === "ctf" && <Badge variant="secondary" className="shrink-0 text-[10px]">CTF · {(task.challenge_type || "auto").toUpperCase()}</Badge>}
-      {task.mode === "ctf" && task.ctf_vpn_enabled && <Badge variant="outline" className="shrink-0 text-[10px] text-emerald-600 border-emerald-500/40">VPN</Badge>}
+      {task.mode === "ad" && <Badge variant="secondary" className="shrink-0 text-[10px] border-rose-500/30 bg-rose-500/10 text-rose-700 dark:text-rose-300">AD · {(task.challenge_type || "auto").toUpperCase()}</Badge>}
+      {(task.mode === "ctf" || task.mode === "ad") && task.ctf_vpn_enabled && <Badge variant="outline" className="shrink-0 text-[10px] text-emerald-600 border-emerald-500/40">VPN</Badge>}
       <Button
         type="button"
         variant="ghost"
@@ -2974,7 +2975,7 @@ function CreateTaskSheet({
   const [timeoutMin, setTimeoutMin] = React.useState(""); // 任务级超时(分钟);空/0 = 不限时
   const [heartbeatMin, setHeartbeatMin] = React.useState("10"); // planner 心跳(分钟);默认10,下限10(与后端一致)
   const [seedFirstIntent, setSeedFirstIntent] = React.useState(false); // 创建时下发种子意图,worker 免等首轮 planner 直接开跑;默认关闭,走标准先规划再执行
-  const [mode, setMode] = React.useState<"pentest" | "ctf">("ctf");
+  const [mode, setMode] = React.useState<"pentest" | "ctf" | "ad">("ctf");
   const [challengeType, setChallengeType] = React.useState<"auto" | "web" | "pwn" | "reverse" | "crypto" | "misc">("auto");
   const [ctfVerifyMode, setCtfVerifyMode] = React.useState<"auto" | "flag" | "exploit_proof" | "flag_and_exploit">("auto");
   const [uploading, setUploading] = React.useState(false);
@@ -3003,13 +3004,14 @@ function CreateTaskSheet({
     try {
       const timeoutSec = Math.max(0, Math.floor(Number(timeoutMin) || 0)) * 60;
       const heartbeatSec = Math.max(10, Math.floor(Number(heartbeatMin) || 10)) * 60; // 下限 10min，与后端归一一致
+      const isSandboxMode = mode === "ctf" || mode === "ad";
       const createdTask = await api.createTask({
         mode,
         challengeType,
         ctfVerifyMode: mode === "ctf" ? ctfVerifyMode : undefined,
         attachmentBatchId: attachmentDraft,
-        ctfVpnConfig: mode === "ctf" ? vpnDraft?.config : undefined,
-        ctfVpnFilename: mode === "ctf" ? vpnDraft?.filename : undefined,
+        ctfVpnConfig: isSandboxMode ? vpnDraft?.config : undefined,
+        ctfVpnFilename: isSandboxMode ? vpnDraft?.filename : undefined,
         name: name.trim(),
         categoryId: categoryID,
         description: description.trim(),
@@ -3089,17 +3091,25 @@ function CreateTaskSheet({
                 className="h-9 rounded-md border bg-background px-3 text-sm"
                 value={mode}
                 onChange={(e) => {
-                  const next = e.target.value as "pentest" | "ctf";
+                  const next = e.target.value as "pentest" | "ctf" | "ad";
                   setMode(next);
-                  if (next === "ctf" && !goal.trim()) setGoal("分析本题并完成平台要求的验收目标，保留核心 PoC 脚本与验证输出。");
+                  const trimmed = goal.trim();
+                  const defaultCtfGoal = "分析本题并完成平台要求的验收目标，保留核心 PoC 脚本与验证输出。";
+                  const defaultAdGoal = "审计赛题服务漏洞，构建可对多队靶机批量复现的 PoC/Exp 脚本（Repeater）、沉淀攻击特征（Catcher），并生成不破坏 Checker 的最小安全补丁（Patcher）。";
+                  if (next === "ctf" && (!trimmed || trimmed === defaultAdGoal)) {
+                    setGoal(defaultCtfGoal);
+                  } else if (next === "ad" && (!trimmed || trimmed === defaultCtfGoal)) {
+                    setGoal(defaultAdGoal);
+                  }
                 }}
               >
                 <option value="ctf">CTF 解题</option>
+                <option value="ad">AD 攻防对抗</option>
                 <option value="pentest">自主目标分析</option>
               </select>
-              {mode === "ctf" && (
+              {(mode === "ctf" || mode === "ad") && (
                 <>
-                  <Label htmlFor="challenge-type">题型</Label>
+                  <Label htmlFor="challenge-type">{mode === "ad" ? "服务主方向" : "题型"}</Label>
                   <select
                     id="challenge-type"
                     className="h-9 rounded-md border bg-background px-3 text-sm"
@@ -3113,37 +3123,43 @@ function CreateTaskSheet({
                     <option value="crypto">Crypto / 密码学</option>
                     <option value="misc">Misc / 杂项安全</option>
                   </select>
-                  <Label htmlFor="ctf-verify-mode">验收方式</Label>
-                  <select
-                    id="ctf-verify-mode"
-                    className="h-9 rounded-md border bg-background px-3 text-sm"
-                    value={ctfVerifyMode}
-                    onChange={(e) => {
-                      const next = e.target.value as typeof ctfVerifyMode;
-                      setCtfVerifyMode(next);
-                      const trimmed = goal.trim();
-                      if (
-                        !trimmed ||
-                        trimmed === "分析本题并获得可验证的 flag，保留解题脚本和原始输出。" ||
-                        trimmed === "分析本题并完成平台要求的验收目标，保留核心 PoC 脚本与验证输出。"
-                      ) {
-                        if (next === "exploit_proof") {
-                          setGoal("完成题干要求的漏洞利用并核实持久效果（无需提交 flag），提交漏洞利用证明供平台验证。");
-                        } else if (next === "flag_and_exploit") {
-                          setGoal("第 1 阶段先找到并验证真实 Flag；第 2 阶段完成题干要求的漏洞利用并提交证明供平台验证。");
-                        } else {
-                          setGoal("分析本题并获得可验证的 flag，保留解题脚本和原始输出。");
-                        }
-                      }
-                    }}
-                  >
-                    <option value="auto">自动识别（根据描述与目标自动判断，推荐）</option>
-                    <option value="flag">提交 Flag（常规赛题）</option>
-                    <option value="exploit_proof">漏洞利用证明（无需 Flag，平台裁判验证）</option>
-                    <option value="flag_and_exploit">复合验收（先找 Flag 再完成漏洞利用证明）</option>
-                  </select>
+                  {mode === "ctf" && (
+                    <>
+                      <Label htmlFor="ctf-verify-mode">验收方式</Label>
+                      <select
+                        id="ctf-verify-mode"
+                        className="h-9 rounded-md border bg-background px-3 text-sm"
+                        value={ctfVerifyMode}
+                        onChange={(e) => {
+                          const next = e.target.value as typeof ctfVerifyMode;
+                          setCtfVerifyMode(next);
+                          const trimmed = goal.trim();
+                          if (
+                            !trimmed ||
+                            trimmed === "分析本题并获得可验证的 flag，保留解题脚本和原始输出。" ||
+                            trimmed === "分析本题并完成平台要求的验收目标，保留核心 PoC 脚本与验证输出。"
+                          ) {
+                            if (next === "exploit_proof") {
+                              setGoal("完成题干要求的漏洞利用并核实持久效果（无需提交 flag），提交漏洞利用证明供平台验证。");
+                            } else if (next === "flag_and_exploit") {
+                              setGoal("第 1 阶段先找到并验证真实 Flag；第 2 阶段完成题干要求的漏洞利用并提交证明供平台验证。");
+                            } else {
+                              setGoal("分析本题并获得可验证的 flag，保留解题脚本和原始输出。");
+                            }
+                          }
+                        }}
+                      >
+                        <option value="auto">自动识别（根据描述与目标自动判断，推荐）</option>
+                        <option value="flag">提交 Flag（常规赛题）</option>
+                        <option value="exploit_proof">漏洞利用证明（无需 Flag，平台裁判验证）</option>
+                        <option value="flag_and_exploit">复合验收（先找 Flag 再完成漏洞利用证明）</option>
+                      </select>
+                    </>
+                  )}
                   <p className="text-xs text-muted-foreground">
-                    沿用任务规划、执行和验收流程。支持常规 Flag、无需 Flag 的漏洞利用证明，以及先 Flag 后利用的复合题型；可按需上传题面附件与赛题 WireGuard VPN 配置。
+                    {mode === "ad"
+                      ? "Attack-Defense 攻防对抗专用模式：任务详情将开启「AD 攻防」专属标签页（Repeater 批量打榜、Catcher 流量反打、Patcher 补丁对比），不触发 Jeopardy Flag 暂停；支持上传服务源码/二进制附件与赛网 WireGuard VPN。"
+                      : "沿用任务规划、执行和验收流程。支持常规 Flag、无需 Flag 的漏洞利用证明，以及先 Flag 后利用的复合题型；可按需上传题面附件与赛题 WireGuard VPN 配置。"}
                   </p>
                   <CTFVpnConfig draftValue={vpnDraft} onDraftChange={setVpnDraft} />
                 </>

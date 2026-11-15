@@ -43,6 +43,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { api } from "@/lib/api";
 import type { LLMProfile, Task } from "@/lib/types";
 
+import { ADConsolePanel } from "./_tabs/ad-console-panel";
 import { BroadcastTab } from "./_tabs/broadcast-tab";
 import { FindingsTab } from "./_tabs/findings-tab";
 import { GraphTab } from "./_tabs/graph-tab";
@@ -407,10 +408,19 @@ function TaskDetailInner() {
             {task.ctf_vpn_enabled ? ` · WireGuard VPN (${task.ctf_vpn_filename || "wg0.conf"})` : ""}
           </p>
         )}
+        {task.mode === "ad" && (
+          <p className="text-xs text-muted-foreground">
+            AD 攻防对抗 · {task.challenge_type === "reverse" ? "RE" : (task.challenge_type || "auto").toUpperCase()} ·
+            Repeater / Catcher / Patcher
+            {task.ctf_vpn_enabled ? ` · WireGuard VPN (${task.ctf_vpn_filename || "wg0.conf"})` : ""}
+          </p>
+        )}
         {/* Tabs */}
         <div className="no-scrollbar min-w-0 overflow-x-auto">
           <TabsList variant="default" className="min-w-max">
-            {TABS.map((t) => (
+            {TABS.flatMap((t) =>
+              t.value === "overview" && task.mode === "ad" ? [t, { value: "ad", label: "AD 攻防" }] : [t],
+            ).map((t) => (
               <TabsTrigger key={t.value} value={t.value}>
                 {t.value === "report" && task.mode === "ctf" ? "解题报告（WP）" : t.label}
                 {t.value === "intercept" && interceptPendingCount > 0 && (
@@ -428,8 +438,8 @@ function TaskDetailInner() {
       <div className="flex-1 p-4 lg:p-6">
         <TabsContent value="artifacts" className="mt-0">
           <TaskAttachments taskId={id} readOnly={terminal} />
-            {task.mode === "ctf" && <CTFVpnConfig taskId={id} readOnly={terminal} onUpdated={load} />}
-            {task.mode === "ctf" && <CTFToolStatusCard />}
+            {(task.mode === "ctf" || task.mode === "ad") && <CTFVpnConfig taskId={id} readOnly={terminal} onUpdated={load} />}
+            {(task.mode === "ctf" || task.mode === "ad") && <CTFToolStatusCard />}
         </TabsContent>
         <TabsContent value="sessions" className="mt-0">
           <SessionsTab taskId={id} />
@@ -437,6 +447,11 @@ function TaskDetailInner() {
         <TabsContent value="overview" className="mt-0">
           <OverviewTab taskId={id} />
         </TabsContent>
+        {task.mode === "ad" && (
+          <TabsContent value="ad" className="mt-0">
+            <ADConsolePanel taskId={id} />
+          </TabsContent>
+        )}
         <TabsContent value="graph" className="mt-0">
           <GraphTab taskId={id} />
         </TabsContent>

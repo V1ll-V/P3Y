@@ -68,6 +68,8 @@ type Task struct {
 	TimeoutSeconds       int                    `json:"timeout_seconds"`
 	PlanHeartbeatSeconds int                    `json:"plan_heartbeat_seconds"` // planner 心跳触发间隔(秒)
 	CoverageEnabled      bool                   `json:"coverage_enabled"`       // 资产覆盖度功能开关(创建时定,默认开)
+	ZeroTouch            bool                   `json:"zero_touch,omitempty"`
+	BenchmarkSessionID   *int64                 `json:"benchmark_session_id,omitempty"`
 	FirstRunAt           int64                  `json:"first_run_at,omitempty"`
 	DeadlineAt           int64                  `json:"deadline_at,omitempty"`
 	Store                *pgdb.ExplorationStore `json:"-"`
@@ -864,6 +866,8 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 		CompanyIDs:     append([]int64(nil), pt.CompanyIDs...),
 		TimeoutSeconds: pt.TimeoutSeconds, PlanHeartbeatSeconds: pt.PlanHeartbeatSeconds,
 		CoverageEnabled: pt.CoverageEnabled,
+		ZeroTouch:       pt.ZeroTouch,
+		BenchmarkSessionID: cloneInt64Ptr(pt.BenchmarkSessionID),
 		FirstRunAt:      unixOrZero(pt.FirstRunAt), DeadlineAt: unixOrZero(pt.DeadlineAt),
 		Store: store, Guard: guard.NewWithInterceptor(ic), notify: make(chan struct{}, 1),
 	}
@@ -1528,7 +1532,7 @@ func (m *Manager) DeleteTask(id string, opts DeleteTaskOptions) (DeleteTaskResul
 			finalizeErrs = append(finalizeErrs, fmt.Errorf("finalize task file deletion: %w", err))
 		}
 	}
-	if registered.Mode == "ctf" {
+	if pgdb.IsSandboxTaskMode(registered.Mode) {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		if ctfErr := ctf.New(m.dir, m.pg).CleanupTask(cleanupCtx, n); ctfErr != nil {
 			log.Printf("[task] 清理任务 #%d CTF 容器/VPN 资源失败（可忽略）：%v", n, ctfErr)

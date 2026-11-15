@@ -34,6 +34,15 @@ type ctfDeferredVal struct {
 	targets  *[]*actool.UnlockSet
 }
 
+// BenchmarkChoiceHook submits objective choice-question answers on zero-touch benchmark tasks.
+var BenchmarkChoiceHook func(ctx context.Context, taskID int64, choices []string) (verdictJSON string, handled bool, err error)
+
+// BenchmarkExtraToolsHook injects platform-specific safe MCP tools for a benchmark task.
+var BenchmarkExtraToolsHook func(ctx context.Context, taskID int64) []actool.CoreTool
+
+// BenchmarkContextHook appends live benchmark context (targets, multi-flag slots, skills) to prompts.
+var BenchmarkContextHook func(ctx context.Context, taskID int64, role string) string
+
 // WithCTFProxy attaches optional MITM proxy coordinates so CTF container tools
 // can route HTTP/HTTPS traffic through the host's recording proxy.
 func WithCTFProxy(ctx context.Context, addr, caCert string) context.Context {
@@ -94,21 +103,29 @@ func ctfBase(ctx context.Context, root string, ts *db.ExplorationStore, task, in
 		return ctx, base
 	}
 	mode, challenge, _, err := ts.TaskInputMetadata()
-	if err != nil || mode != "ctf" {
+	if err != nil || !db.IsSandboxTaskMode(mode) {
 		return ctx, base
 	}
 	service := ctf.New(root, ts.Database())
 	if proxyAddr, proxyCA := ctfProxyFromContext(ctx); proxyAddr != "" {
 		service.WithProxy(proxyAddr, proxyCA)
 	}
-	verifyMode, _ := ts.Database().TaskCTFVerifyMode(ctx, task)
+	verifyMode := ""
+	if mode == "ctf" {
+		verifyMode, _ = ts.Database().TaskCTFVerifyMode(ctx, task)
+	} else if mode == "ad" {
+		// AD tasks use Attack-Defense workflows (Repeater/Catcher/Patcher + findings) rather than Jeopardy flag/proof confirmation.
+		verifyMode = "ad_none"
+	}
 	out := []actool.CoreTool{}
 	for _, t := range base {
 		switch t.Name() {
 		case "Bash", "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "LS", "http_send":
 			continue
 		case "report_finding", "update_finding_report":
-			continue // CTF answers use their own evidence/WP flow, not vulnerability reports.
+			if mode == "ctf" {
+				continue // CTF answers use their own evidence/WP flow, not vulnerability reports.
+			}
 		}
 		out = append(out, t)
 	}
@@ -129,6 +146,9 @@ func ctfBase(ctx context.Context, root string, ts *db.ExplorationStore, task, in
 		}
 	}
 	out = append(out, built...)
+	if BenchmarkExtraToolsHook != nil && ts.Database().IsZeroTouchTask(task) {
+		out = append(out, BenchmarkExtraToolsHook(ctx, task)...)
+	}
 	ctx = context.WithValue(ctx, ctfRunKey{}, true)
 	if strings.EqualFold(strings.TrimSpace(challenge), "web") {
 		ctx = context.WithValue(ctx, ctfWebSkillsKey{}, true)
@@ -171,7 +191,7 @@ func ctfBaseForPlanner(ctx context.Context, ts *db.ExplorationStore, base []acto
 		return ctx, base
 	}
 	mode, _, _, err := ts.TaskInputMetadata()
-	if err != nil || mode != "ctf" {
+	if err != nil || !db.IsSandboxTaskMode(mode) {
 		return ctx, base
 	}
 	return context.WithValue(ctx, ctfRunKey{}, true), stripCTFPlannerBase(base)
@@ -362,17 +382,49 @@ func ctfToolsWithUnlock(s *ctf.Service, task, intent int64, verifyMode string, u
 			b, _ := json.Marshal(progress)
 			return actool.Text(string(b)), nil
 		}),
-		writeTool("ctf_submit_flag", "将实际执行输出中的答案登记为候选，供用户在 WP 页面确认。不能将模型回复直接作为已验证答案。", obj(map[string]any{"execution_id": str("真实执行 ID"), "value": str("必须出现在该执行 stdout/stderr 中的答案")}, "execution_id", "value"), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+		writeTool("ctf_submit_flag", "将实际执行输出中的答案登记为候选；零交互自动测评任务会自动提交到平台并即时返回判定结果（多 Flag 题可传入 sub_flag_id）。不能将模型回复直接作为已验证答案。", obj(map[string]any{
+			"execution_id": str("真实执行 ID"),
+			"value":        str("必须出现在该执行 stdout/stderr 中的答案"),
+			"sub_flag_id":  str("可选：多 Flag 题目的子 Flag ID"),
+		}, "execution_id", "value"), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a map[string]json.RawMessage
 			_ = json.Unmarshal(in, &a)
 			if s == nil {
 				return actool.Errorf("需要 CTF 上下文"), nil
 			}
-			id, err := s.Submit(ctx, task, text(a, "execution_id"), text(a, "value"))
+			id, verdict, err := s.SubmitWithSubFlag(ctx, task, text(a, "execution_id"), text(a, "value"), text(a, "sub_flag_id"))
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
+			if verdict != "" {
+				return actool.Text(fmt.Sprintf("已登记候选 #%d 并自动提交至测评平台：%s", id, verdict)), nil
+			}
 			return actool.Text(fmt.Sprintf("候选 #%d 已登记；尚未确认，请保留脚本与复现步骤。", id)), nil
+		}),
+		writeTool("benchmark_submit_choice", "专用于零交互自动测评中的客观选择题：提交已确认的选项 ID 数组（如 [\"A\"] 或 [\"A\", \"C\"]）至测评平台验证并获取判定。", obj(map[string]any{
+			"choices": map[string]any{
+				"type":        "array",
+				"items":       map[string]any{"type": "string"},
+				"description": "选中的选项 ID 列表，例如 [\"A\"] 或 [\"B\", \"D\"]",
+			},
+		}, "choices"), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+			var a struct {
+				Choices []string `json:"choices"`
+			}
+			if err := json.Unmarshal(in, &a); err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			if BenchmarkChoiceHook == nil || s == nil || s.DB == nil || !s.DB.IsZeroTouchTask(task) {
+				return actool.Errorf("当前任务不是零交互自动测评任务，不支持客观选择题提交"), nil
+			}
+			verdict, handled, err := BenchmarkChoiceHook(ctx, task, a.Choices)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			if !handled {
+				return actool.Errorf("未找到对应的测评题提交处理器"), nil
+			}
+			return actool.Text("客观题提交判定结果：" + verdict), nil
 		}),
 		writeTool("ctf_submit_exploit_proof", "专用于「无需 Flag、需平台裁判机验证」的漏洞利用证明类任务（exploit_proof / flag_and_exploit 第 2 阶段）：将真实执行结果作为利用证明提交，触发自动交接等待用户在赛题平台点击「验证漏洞利用」并确认通过。严禁用于传统仅提交 Flag 的题目，也不能凭空编造未执行的证明。", obj(map[string]any{
 			"execution_id":  str("完成并验证利用效果的真实执行 ID（必须有真实输出或脚本产物）"),
@@ -831,7 +883,14 @@ print("\n".join(out))`
 	tools = append(tools, ctfNeuroTools(s, task, intent)...)
 	tools = append(tools, askHelperTool(), plateauForkTool())
 	filtered := make([]actool.CoreTool, 0, len(tools))
+	zeroTouch := s != nil && s.DB != nil && s.DB.IsZeroTouchTask(task)
 	for _, tl := range tools {
+		if tl.Name() == "benchmark_submit_choice" && !zeroTouch {
+			continue
+		}
+		if verifyMode == "ad_none" && (tl.Name() == "ctf_submit_flag" || tl.Name() == "ctf_submit_exploit_proof") {
+			continue
+		}
 		if verifyMode == db.CTFVerifyExploitProof && tl.Name() == "ctf_submit_flag" {
 			continue
 		}

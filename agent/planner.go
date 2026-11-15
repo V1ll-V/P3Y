@@ -356,7 +356,7 @@ func plannerSystem(goal, dataDir, workDir string) string {
 // for time/heartbeat wakes). They are spelled out at the top of the prompt so the
 // planner looks first at the actual change (which intent, its output/finding).
 func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts *db.ExplorationStore, goal string, triggers []TriggerEvent, emit func(db.Activity)) (met bool, reason string, err error) {
-	if mode, _, _, _ := ts.TaskInputMetadata(); mode == "ctf" {
+	if mode, _, _, _ := ts.TaskInputMetadata(); mode == "ctf" && !ts.Database().IsZeroTouchTask(taskID) {
 		pending, err := ts.Database().PendingCTFSubmission(ctx, taskID)
 		if err != nil {
 			return false, "", err

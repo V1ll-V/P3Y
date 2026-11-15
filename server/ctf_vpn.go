@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"p3y/ctfrunner"
+	"p3y/db"
 )
 
 func sanitizeVPNFilename(name string) string {
@@ -36,8 +37,8 @@ func prepareTaskVPNForCreate(mode, rawConfig, filename string) (sanitized, hash,
 	if strings.TrimSpace(rawConfig) == "" {
 		return "", "", "", nil
 	}
-	if strings.TrimSpace(mode) != "ctf" {
-		return "", "", "", errors.New("仅 CTF 模式支持配置 WireGuard VPN")
+	if !db.IsSandboxTaskMode(mode) {
+		return "", "", "", errors.New("仅 CTF / AD 模式支持配置 WireGuard VPN")
 	}
 	prof, err := ctfrunner.ParseWireGuardConfig(rawConfig)
 	if err != nil {
@@ -71,8 +72,8 @@ func (s *Server) requireCTFTask(w http.ResponseWriter, r *http.Request) (*Task, 
 		writeErr(w, 404, "task not found")
 		return nil, 0, false
 	}
-	if t.Mode != "ctf" {
-		writeErr(w, 400, "仅 CTF 任务支持 WireGuard VPN 配置")
+	if !db.IsSandboxTaskMode(t.Mode) {
+		writeErr(w, 400, "仅 CTF / AD 任务支持 WireGuard VPN 配置")
 		return nil, 0, false
 	}
 	id, err := strconv.ParseInt(t.ID, 10, 64)

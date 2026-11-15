@@ -1773,4 +1773,98 @@ CREATE TABLE IF NOT EXISTS ad_events (
 );
 CREATE INDEX IF NOT EXISTS idx_ad_events_task ON ad_events(task_id, id DESC);
 
+-- ============================================================
+--  Stage 6 — 零交互多平台测评中心 (Benchmark Mode)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS benchmark_sessions (
+    id                      BIGSERIAL PRIMARY KEY,
+    name                    TEXT NOT NULL DEFAULT '',
+    provider                TEXT NOT NULL CHECK (provider IN ('tsecbench','ctf2','generic_mcp')),
+    base_url                TEXT NOT NULL DEFAULT '',
+    token                   TEXT NOT NULL DEFAULT '',
+    config_json             JSONB NOT NULL DEFAULT '{}'::jsonb,
+    max_concurrent          INTEGER NOT NULL DEFAULT 3,
+    hint_policy             TEXT NOT NULL DEFAULT 'never', -- never | stagnant_only
+    per_challenge_timeout   INTEGER NOT NULL DEFAULT 1500,
+    llm_profile_ids         BIGINT[] NOT NULL DEFAULT '{}',
+    status                  TEXT NOT NULL DEFAULT 'created', -- created | running | paused | completed | expired | stopped | failed
+    total_score             INTEGER NOT NULL DEFAULT 0,
+    max_possible_score      INTEGER NOT NULL DEFAULT 0,
+    completed_count         INTEGER NOT NULL DEFAULT 0,
+    total_count             INTEGER NOT NULL DEFAULT 0,
+    active_slots            INTEGER NOT NULL DEFAULT 0,
+    last_error              TEXT NOT NULL DEFAULT '',
+    started_at              TIMESTAMPTZ,
+    finished_at             TIMESTAMPTZ,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+DROP TRIGGER IF EXISTS trg_benchmark_sessions_upd ON benchmark_sessions;
+CREATE TRIGGER trg_benchmark_sessions_upd BEFORE UPDATE ON benchmark_sessions
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS zero_touch BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS benchmark_session_id BIGINT REFERENCES benchmark_sessions(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_tasks_benchmark_session ON tasks(benchmark_session_id) WHERE benchmark_session_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS benchmark_challenges (
+    id                    BIGSERIAL PRIMARY KEY,
+    session_id            BIGINT NOT NULL REFERENCES benchmark_sessions(id) ON DELETE CASCADE,
+    unique_code           TEXT NOT NULL,
+    title                 TEXT NOT NULL DEFAULT '',
+    description           TEXT NOT NULL DEFAULT '',
+    category              TEXT NOT NULL DEFAULT 'auto',
+    difficulty            TEXT NOT NULL DEFAULT '',
+    level                 INTEGER NOT NULL DEFAULT 0,
+    submission_type       TEXT NOT NULL DEFAULT 'flag', -- flag | suite | choice
+    total_score           INTEGER NOT NULL DEFAULT 0,
+    cumulative_score      INTEGER NOT NULL DEFAULT 0,
+    flag_count            INTEGER NOT NULL DEFAULT 1,
+    correct_flag_count    INTEGER NOT NULL DEFAULT 0,
+    is_completed          BOOLEAN NOT NULL DEFAULT FALSE,
+    container_status      TEXT NOT NULL DEFAULT 'stopped',
+    container_addr        JSONB NOT NULL DEFAULT '[]'::jsonb,
+    env_expires_at        TIMESTAMPTZ,
+    hint_used             BOOLEAN NOT NULL DEFAULT FALSE,
+    hint_content          TEXT NOT NULL DEFAULT '',
+    bound_task_id         BIGINT REFERENCES tasks(id) ON DELETE SET NULL,
+    attempt_count         INTEGER NOT NULL DEFAULT 0,
+    meta_json             JSONB NOT NULL DEFAULT '{}'::jsonb,
+    last_error            TEXT NOT NULL DEFAULT '',
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (session_id, unique_code)
+);
+CREATE INDEX IF NOT EXISTS idx_benchmark_challenges_session ON benchmark_challenges(session_id, id);
+CREATE INDEX IF NOT EXISTS idx_benchmark_challenges_task ON benchmark_challenges(bound_task_id) WHERE bound_task_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS benchmark_submissions (
+    id                 BIGSERIAL PRIMARY KEY,
+    session_id         BIGINT NOT NULL REFERENCES benchmark_sessions(id) ON DELETE CASCADE,
+    unique_code        TEXT NOT NULL,
+    sub_flag_id        TEXT NOT NULL DEFAULT '',
+    answer_value       TEXT NOT NULL DEFAULT '',
+    answer_sha256      TEXT NOT NULL,
+    correct            BOOLEAN NOT NULL DEFAULT FALSE,
+    awarded            INTEGER NOT NULL DEFAULT 0,
+    matched_flag_index INTEGER,
+    http_status        INTEGER NOT NULL DEFAULT 0,
+    error_code         TEXT NOT NULL DEFAULT '',
+    message            TEXT NOT NULL DEFAULT '',
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_benchmark_sub_dedup ON benchmark_submissions(session_id, unique_code, answer_sha256);
+
+CREATE TABLE IF NOT EXISTS benchmark_events (
+    id          BIGSERIAL PRIMARY KEY,
+    session_id  BIGINT NOT NULL REFERENCES benchmark_sessions(id) ON DELETE CASCADE,
+    unique_code TEXT NOT NULL DEFAULT '',
+    kind        TEXT NOT NULL, -- sync | start | close | attachment | submit | note | hint | extend | cooldown | error
+    summary     TEXT NOT NULL,
+    detail_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_benchmark_events_session ON benchmark_events(session_id, id DESC);
+
+
 

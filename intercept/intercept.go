@@ -30,11 +30,26 @@ type ctxKey int
 
 // ConvIDKey stores the active conversation ID in a context.Context so the
 // interceptor can associate "ask" pending records with the right conversation.
-const ConvIDKey ctxKey = 0
+const (
+	ConvIDKey    ctxKey = 0
+	ZeroTouchKey ctxKey = 10
+)
 
 // WithConvID returns a child context carrying convID.
 func WithConvID(ctx context.Context, convID int64) context.Context {
 	return context.WithValue(ctx, ConvIDKey, convID)
+}
+
+// WithZeroTouch marks ctx as an autonomous benchmark run where "ask" approvals
+// must never block waiting for a human click.
+func WithZeroTouch(ctx context.Context, enabled bool) context.Context {
+	return context.WithValue(ctx, ZeroTouchKey, enabled)
+}
+
+// ZeroTouchFromContext reports whether ctx runs in zero-interaction mode.
+func ZeroTouchFromContext(ctx context.Context) bool {
+	v, _ := ctx.Value(ZeroTouchKey).(bool)
+	return v
 }
 
 // ConvIDFromContext extracts the conversation ID (0 if absent).
@@ -582,6 +597,16 @@ func (i *Interceptor) Log(ctx context.Context, convID int64, dec Decision, toolN
 // page shows it and the sidebar badge lights up. The worker thread blocks just
 // like in a chat session — the user must visit the approvals page to unblock it.
 func (i *Interceptor) HandleAsk(ctx context.Context, convID int64, dec Decision, toolName string, input []byte) bool {
+	if ZeroTouchFromContext(ctx) {
+		auto := dec
+		if auto.Message != "" {
+			auto.Message = "[零交互测评自动放行] " + auto.Message
+		} else {
+			auto.Message = "[零交互测评自动放行]"
+		}
+		i.Log(ctx, convID, auto, toolName, input, "allowed")
+		return true
+	}
 	ruleID := dec.RuleID
 	taskID, agentName := taskInfoFromCtx(ctx)
 	taskEmit := taskEmitFromCtx(ctx)

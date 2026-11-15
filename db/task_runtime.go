@@ -304,7 +304,7 @@ func (d *DB) ClaimIntentGuarded(ctx context.Context, taskID, intentID int64, own
 		if e = LockTaskEvidenceTx(tx, taskID); e != nil {
 			return e
 		}
-		if strings.EqualFold(r.mode, "ctf") && (strings.EqualFold(r.challengeType, "pwn") || strings.EqualFold(r.challengeType, "reverse")) {
+		if IsSandboxTaskMode(r.mode) && (strings.EqualFold(r.challengeType, "pwn") || strings.EqualFold(r.challengeType, "reverse")) {
 			var targetPhase string
 			if e = tx.QueryRowContext(ctx, `SELECT lower(COALESCE(payload->>'phase','')) FROM exploration_nodes WHERE id=$1 AND exploration_id=$2`, intentID, r.expID).Scan(&targetPhase); e != nil && !errors.Is(e, sql.ErrNoRows) {
 				return e

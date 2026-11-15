@@ -345,18 +345,24 @@ func (e *Engine) Resume(t *Task) {
 // execContextFor returns a live per-task context derived from parent, recreating
 // it if a prior pause cancelled it.
 func (e *Engine) execContextFor(parent context.Context, taskID string) context.Context {
+	zeroTouch := false
+	if e.m != nil {
+		if t, ok := e.m.Task(taskID); ok && t != nil {
+			zeroTouch = t.ZeroTouch
+		}
+	}
 	e.execMu.Lock()
 	defer e.execMu.Unlock()
 	if e.IsPaused(taskID) {
 		// never hand out a live context while paused (guards the claim→Execute race)
-		c, cancel := context.WithCancelCause(parent)
+		c, cancel := context.WithCancelCause(intercept.WithZeroTouch(parent, zeroTouch))
 		cancel(agent.AbortPausedRaceGuard)
 		return c
 	}
 	if c := e.execCtx[taskID]; c != nil && c.Err() == nil {
-		return c
+		return intercept.WithZeroTouch(c, zeroTouch)
 	}
-	c, cancel := context.WithCancelCause(parent)
+	c, cancel := context.WithCancelCause(intercept.WithZeroTouch(parent, zeroTouch))
 	e.execCtx[taskID] = c
 	e.execCancel[taskID] = cancel
 	return c
@@ -1193,7 +1199,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	if err != nil {
 		log.Printf("[worker %s] intent %d: %v", name, intent.ID, err)
 	}
-	if reason == agent.ReasonCTFSubmission && err == nil && t.Mode == "ctf" {
+	if reason == agent.ReasonCTFSubmission && err == nil && t.Mode == "ctf" && !t.ZeroTouch {
 		if stateErr := parkCTFSubmissionIntent(t.Store, intent.ID); stateErr != nil {
 			log.Printf("[ctf] task %s waiting intention %d: %v", t.ID, intent.ID, stateErr)
 		}

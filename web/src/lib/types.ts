@@ -7,7 +7,7 @@ export type EngineMode = "exploring" | "paused" | "stalled" | "idle";
 export type CTFVerifyMode = "auto" | "flag" | "exploit_proof" | "flag_and_exploit";
 
 export interface Task {
-  mode?: "pentest" | "ctf";
+  mode?: "pentest" | "ctf" | "ad";
   challenge_type?: "auto" | "web" | "pwn" | "reverse" | "crypto" | "misc";
   ctf_verify_mode?: CTFVerifyMode;
   ctf_vpn_enabled?: boolean;
@@ -1928,5 +1928,151 @@ export interface PatchVerifyResult {
   exploit_exit_code: number;
   leaked_flags: number;
   verdict: string;
+}
+
+export type BenchmarkProviderKind = "tsecbench" | "ctf2" | "generic_mcp";
+
+export interface BenchmarkSessionConfig {
+  source?: "auto" | "competition" | "practice";
+  competition_id?: string;
+  stage_id?: string;
+  invite_code?: string;
+  custom_headers?: Record<string, string>;
+  ctf_vpn_config?: string;
+  ctf_vpn_filename?: string;
+  skill_name?: string;
+  skill_instructions?: string;
+  discovered_mcp_tools?: string[];
+  insecure_tls?: boolean;
+}
+
+export interface BenchmarkTokenUsage {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  total_tokens: number;
+}
+
+export interface BenchmarkSession {
+  id: number;
+  name: string;
+  provider: BenchmarkProviderKind;
+  base_url: string;
+  has_token: boolean;
+  config: BenchmarkSessionConfig;
+  max_concurrent: number;
+  hint_policy: "never" | "stagnant_only";
+  per_challenge_timeout: number;
+  llm_profile_ids: number[];
+  status: string;
+  total_score: number;
+  max_possible_score: number;
+  completed_count: number;
+  total_count: number;
+  active_slots: number;
+  tokens?: BenchmarkTokenUsage;
+  last_error?: string;
+  started_at?: string;
+  finished_at?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface BenchmarkChallenge {
+  id: number;
+  session_id: number;
+  unique_code: string;
+  title: string;
+  description: string;
+  category: string;
+  difficulty: string;
+  level: number;
+  submission_type: "flag" | "suite" | "choice";
+  total_score: number;
+  cumulative_score: number;
+  flag_count: number;
+  correct_flag_count: number;
+  is_completed: boolean;
+  container_status: string;
+  container_addr: string[];
+  env_expires_at?: string;
+  hint_used: boolean;
+  hint_content?: string;
+  bound_task_id?: number;
+  bound_task_status?: string;
+  tokens?: BenchmarkTokenUsage;
+  attempt_count: number;
+  meta: {
+    has_container?: boolean;
+    files?: Array<{ id: string; name: string; kind?: string; url?: string; size?: number }>;
+    sub_flags?: Array<{ id: string; title?: string; score?: number; done?: boolean }>;
+    choice?: {
+      question_type?: string;
+      options?: Array<{ label: string; text: string }>;
+      attempts_left?: number;
+      locked?: boolean;
+    };
+    window_state?: string;
+    personal_files_status?: string;
+  };
+  last_error?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface BenchmarkSubmission {
+  id: number;
+  session_id: number;
+  unique_code: string;
+  sub_flag_id?: string;
+  answer_value: string;
+  answer_sha256: string;
+  correct: boolean;
+  awarded: number;
+  matched_flag_index?: number;
+  http_status: number;
+  error_code?: string;
+  message?: string;
+  created_at: string;
+}
+
+export interface BenchmarkEvent {
+  id: number;
+  session_id: number;
+  unique_code?: string;
+  kind: string;
+  summary: string;
+  detail?: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface BenchmarkDetailResponse {
+  session: BenchmarkSession;
+  challenges: BenchmarkChallenge[];
+  submissions: BenchmarkSubmission[];
+  events: BenchmarkEvent[];
+}
+
+export interface BenchmarkTestConnectionResult {
+  ok: boolean;
+  provider: BenchmarkProviderKind;
+  profile?: {
+    agent_id?: string;
+    agent_name?: string;
+    max_environments: number;
+    competition_enabled: boolean;
+    active_competitions?: string[];
+  };
+  challenge_count: number;
+  discovered_tools?: string[];
+  error?: string;
+}
+
+export interface BenchmarkParsedSkill {
+  name: string;
+  description?: string;
+  instructions: string;
+  files: string[];
 }
 

@@ -36,6 +36,10 @@ type Service struct {
 	ProxyCACert string
 }
 
+// BenchmarkFlagHook is registered by the server to auto-submit captured or explicit
+// CTF candidate flags on zero-touch benchmark tasks.
+var BenchmarkFlagHook func(ctx context.Context, taskID int64, execID, value, subFlagID string) (verdictJSON string, handled bool, err error)
+
 func New(root string, pg *db.DB) *Service {
 	return &Service{
 		Root:      root,
@@ -81,6 +85,10 @@ func (s *Service) Sync(ctx context.Context, id int64) error {
 	if err != nil {
 		return err
 	}
+	if mode, _, err := s.DB.TaskChallengeType(ctx, id); err == nil && strings.EqualFold(strings.TrimSpace(mode), "ad") {
+		_, _ = s.RunPrecheck(ctx, id, false)
+		return nil
+	}
 	if err := s.DB.SyncCTFInput(ctx, id, Hash(m)); err != nil {
 		return err
 	}
@@ -107,7 +115,7 @@ func (s *Service) LogicalPath(a artifacts.Artifact) string {
 
 func (s *Service) resolveScope(ctx context.Context, task, intent int64) (sessionIntent int64, workDir, lockKey string, shared bool) {
 	if s != nil && s.DB != nil && task > 0 {
-		if mode, challenge, err := s.DB.TaskChallengeType(ctx, task); err == nil && mode == "ctf" && (challenge == "pwn" || challenge == "reverse") {
+		if mode, challenge, err := s.DB.TaskChallengeType(ctx, task); err == nil && db.IsSandboxTaskMode(mode) && (challenge == "pwn" || challenge == "reverse") {
 			return 0, s.SharedWorkDir(task), fmt.Sprintf("%s/%d/shared", s.Root, task), true
 		}
 	}
@@ -285,8 +293,10 @@ func (s *Service) execute(ctx context.Context, task, intent int64, command strin
 				if IsSelfConstructedMockFlag(command, flag) {
 					continue
 				}
-				if _, err = s.DB.AddCTFOutputCandidate(saveCtx, task, e.ID, flag); err != nil {
-					return nil, err
+				if cid, addErr := s.DB.AddCTFOutputCandidate(saveCtx, task, e.ID, flag); addErr != nil {
+					return nil, addErr
+				} else if cid > 0 && BenchmarkFlagHook != nil {
+					_, _, _ = BenchmarkFlagHook(saveCtx, task, e.ID, flag, "")
 				}
 			}
 		}
@@ -369,7 +379,9 @@ func (s *Service) JobStatus(ctx context.Context, task, intent int64, jobID strin
 			if execID == "" {
 				execID = status.ID
 			}
-			_, _ = s.DB.AddCTFOutputCandidate(ctx, task, execID, flag)
+			if cid, addErr := s.DB.AddCTFOutputCandidate(ctx, task, execID, flag); addErr == nil && cid > 0 && BenchmarkFlagHook != nil {
+				_, _, _ = BenchmarkFlagHook(ctx, task, execID, flag, "")
+			}
 		}
 	}
 	return status, nil
@@ -443,7 +455,9 @@ func (s *Service) ReadInteractive(ctx context.Context, task, intent int64, sid s
 				execID = sid
 			}
 			for _, flag := range ExtractFlags(res.Output, 16) {
-				_, _ = s.DB.AddCTFOutputCandidate(ctx, task, execID, flag)
+				if cid, addErr := s.DB.AddCTFOutputCandidate(ctx, task, execID, flag); addErr == nil && cid > 0 && BenchmarkFlagHook != nil {
+					_, _, _ = BenchmarkFlagHook(ctx, task, execID, flag, "")
+				}
 			}
 		}
 	}
@@ -916,22 +930,39 @@ func (s *Service) EvidenceFile(task int64, name, hash string) ([]byte, error) {
 	return b, nil
 }
 func (s *Service) Submit(ctx context.Context, task int64, exec, value string) (int64, error) {
+	id, _, err := s.SubmitWithSubFlag(ctx, task, exec, value, "")
+	return id, err
+}
+
+func (s *Service) SubmitWithSubFlag(ctx context.Context, task int64, exec, value, subFlagID string) (int64, string, error) {
 	e, err := s.DB.CTFExecution(ctx, task, exec)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	out, err := s.EvidenceFile(task, e.StdoutPath, e.StdoutSHA)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	stderr, err := s.EvidenceFile(task, e.StderrPath, e.StderrSHA)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	if value == "" || (!bytes.Contains(out, []byte(value)) && !bytes.Contains(stderr, []byte(value))) {
-		return 0, errors.New("候选答案必须出现在本任务该次执行的真实输出中")
+		return 0, "", errors.New("候选答案必须出现在本任务该次执行的真实输出中")
 	}
-	return s.DB.AddCTFCandidate(ctx, task, exec, value)
+	id, err := s.DB.AddCTFCandidate(ctx, task, exec, value)
+	if err != nil {
+		return 0, "", err
+	}
+	var verdict string
+	if BenchmarkFlagHook != nil {
+		if v, handled, hookErr := BenchmarkFlagHook(ctx, task, exec, value, strings.TrimSpace(subFlagID)); hookErr != nil {
+			return id, "", hookErr
+		} else if handled {
+			verdict = v
+		}
+	}
+	return id, verdict, nil
 }
 
 // SubmitExploitProof records a non-flag exploit proof candidate backed by a real

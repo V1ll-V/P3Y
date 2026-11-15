@@ -1053,7 +1053,7 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 		payload["phase"] = phase
 	}
 	if t.ts != nil && phase == "exploit" {
-		if mode, challenge, _, err := t.ts.TaskInputMetadata(); err == nil && mode == "ctf" {
+		if mode, challenge, _, err := t.ts.TaskInputMetadata(); err == nil && db.IsSandboxTaskMode(mode) {
 			ch := strings.ToLower(strings.TrimSpace(challenge))
 			if ch == "pwn" || ch == "reverse" {
 				existing, _ := t.ts.ListByKind(db.KindIntent, 100)

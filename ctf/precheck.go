@@ -326,8 +326,8 @@ func (s *Service) RunPrecheck(ctx context.Context, taskID int64, force bool) (*P
 	if err != nil {
 		return nil, err
 	}
-	if taskRow == nil || taskRow.Mode != "ctf" {
-		return nil, fmt.Errorf("CTF task %d not found", taskID)
+	if taskRow == nil || !db.IsSandboxTaskMode(taskRow.Mode) {
+		return nil, fmt.Errorf("CTF/AD sandbox task %d not found", taskID)
 	}
 	store := artifacts.Store{Root: s.Root}
 	m, err := store.Inputs(taskID, 0)

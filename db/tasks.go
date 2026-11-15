@@ -57,7 +57,9 @@ type Task struct {
 	// 覆盖度、不自动累积 task_scope(source=auto)、不给 agent 开放 add_task_scope/
 	// list_untested_assets、态势里不注入 coverage 块(scope 字段仍保留)。company 关联
 	// (task_scope kind=company)与此开关无关，永不受影响。见 db/task_scope.go。
-	CoverageEnabled bool `json:"coverage_enabled"`
+	CoverageEnabled    bool   `json:"coverage_enabled"`
+	ZeroTouch          bool   `json:"zero_touch,omitempty"`
+	BenchmarkSessionID *int64 `json:"benchmark_session_id,omitempty"`
 }
 
 // TaskDeleteResult reports optional related-data cleanup performed in the same
@@ -170,7 +172,9 @@ type TaskCreateOptions struct {
 	// 路径(编排 spawn、老 API)沿用原行为。仅 web 创建任务时可显式传 false 关闭。
 	CoverageEnabled *bool
 	// InterceptRules 是任务级资产拦截规则,创建时随任务在同一事务内写入 task_intercept_rules。
-	InterceptRules []TaskInterceptRuleInput
+	InterceptRules     []TaskInterceptRuleInput
+	ZeroTouch          bool
+	BenchmarkSessionID *int64
 }
 
 // CreateTaskWithOptions creates an exploration, task, direct source relations,
@@ -224,7 +228,7 @@ VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); 
 	}
 	opts.PlanHeartbeatSeconds = normalizeHeartbeat(opts.PlanHeartbeatSeconds)
 	coverageEnabled := opts.CoverageEnabled == nil || *opts.CoverageEnabled
-	if mode == "ctf" && opts.CoverageEnabled == nil {
+	if IsSandboxTaskMode(mode) && opts.CoverageEnabled == nil {
 		coverageEnabled = false
 	}
 	var categoryName string
@@ -247,7 +251,7 @@ VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); 
 	vpnConfig := ""
 	vpnHash := ""
 	vpnFilename := ""
-	if mode == "ctf" {
+	if IsSandboxTaskMode(mode) {
 		vpnConfig = opts.CTFVPNConfig
 		vpnHash = opts.CTFVPNHash
 		vpnFilename = opts.CTFVPNFilename
@@ -262,12 +266,12 @@ VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); 
 		SourceTaskIDs:  append([]int64(nil), opts.SourceTaskIDs...),
 		CompanyIDs:     append([]int64(nil), opts.CompanyIDs...),
 		TimeoutSeconds: opts.TimeoutSeconds, PlanHeartbeatSeconds: opts.PlanHeartbeatSeconds,
-		CoverageEnabled: coverageEnabled,
+		CoverageEnabled: coverageEnabled, ZeroTouch: opts.ZeroTouch, BenchmarkSessionID: opts.BenchmarkSessionID,
 	}
 	if err := tx.QueryRow(`
-INSERT INTO tasks(name, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled,mode,challenge_type,ctf_verify_mode,attachment_batch_id,ctf_vpn_config,ctf_vpn_hash,ctf_vpn_filename)
-VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-RETURNING id, status, paused, created_at`, opts.Name, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled, mode, challenge, verifyMode, opts.AttachmentBatchID, vpnConfig, vpnHash, vpnFilename).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
+INSERT INTO tasks(name, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled,mode,challenge_type,ctf_verify_mode,attachment_batch_id,ctf_vpn_config,ctf_vpn_hash,ctf_vpn_filename,zero_touch,benchmark_session_id)
+VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+RETURNING id, status, paused, created_at`, opts.Name, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled, mode, challenge, verifyMode, opts.AttachmentBatchID, vpnConfig, vpnHash, vpnFilename, opts.ZeroTouch, opts.BenchmarkSessionID).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
 		return nil, err
 	}
 	if err := insertTaskRelations(tx, t.ID, opts.SourceTaskIDs); err != nil {
@@ -381,14 +385,14 @@ func insertTaskLLMProfiles(tx *sql.Tx, taskID int64, profileIDs []int64) error {
 	return nil
 }
 
-const taskCols = `mode,challenge_type,COALESCE(ctf_verify_mode,''),attachment_batch_id,COALESCE(ctf_vpn_config,''),COALESCE(ctf_vpn_hash,''),COALESCE(ctf_vpn_filename,''),id, COALESCE(name,''), category_id,
+const taskCols = `mode,challenge_type,COALESCE(ctf_verify_mode,''),attachment_batch_id,COALESCE(ctf_vpn_config,''),COALESCE(ctf_vpn_hash,''),COALESCE(ctf_vpn_filename,''),COALESCE(zero_touch,false),benchmark_session_id,id, COALESCE(name,''), category_id,
 COALESCE((SELECT category.name FROM task_categories category WHERE category.id=tasks.category_id),''),
 description, goal, exploration_id, status, paused, queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), first_run_at, deadline_at`
 
 func scanTask(sc interface{ Scan(...any) error }) (*Task, error) {
 	var t Task
 	var rawVerify string
-	if err := sc.Scan(&t.Mode, &t.ChallengeType, &rawVerify, &t.AttachmentBatchID, &t.CTFVPNConfig, &t.CTFVPNHash, &t.CTFVPNFilename, &t.ID, &t.Name, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.FirstRunAt, &t.DeadlineAt); err != nil {
+	if err := sc.Scan(&t.Mode, &t.ChallengeType, &rawVerify, &t.AttachmentBatchID, &t.CTFVPNConfig, &t.CTFVPNHash, &t.CTFVPNFilename, &t.ZeroTouch, &t.BenchmarkSessionID, &t.ID, &t.Name, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.FirstRunAt, &t.DeadlineAt); err != nil {
 		return nil, err
 	}
 	if strings.ToLower(strings.TrimSpace(t.Mode)) == "ctf" {
@@ -396,6 +400,18 @@ func scanTask(sc interface{ Scan(...any) error }) (*Task, error) {
 	}
 	t.Pinned = t.PinnedAt != nil
 	return &t, nil
+}
+
+// IsZeroTouchTask reports whether taskID runs in zero-interaction benchmark mode.
+func (d *DB) IsZeroTouchTask(taskID int64) bool {
+	if d == nil || taskID <= 0 {
+		return false
+	}
+	var z bool
+	if err := d.QueryRow(`SELECT COALESCE(zero_touch,false) FROM tasks WHERE id=$1 AND deleted_at IS NULL`, taskID).Scan(&z); err != nil {
+		return false
+	}
+	return z
 }
 
 // SetParentRef records a task's parent task id (编排 agent spawn_task 关联).

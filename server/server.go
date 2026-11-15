@@ -123,6 +123,7 @@ type Server struct {
 	archiveWake chan struct{}
 	archiveWG   sync.WaitGroup
 	side        *sideQuestionState
+	bench       *BenchmarkManager
 }
 
 // provEntry is a cached provider + its config for one LLM profile id.
@@ -260,6 +261,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	go s.reconcileConcurrency()
 	s.startTaskArchiveWorker()
 	s.startADRepeaterLoop()
+	s.registerBenchmarkHooks()
 	s.wireInterceptReviewer() // LLM 兜底审批:未命中拦截规则的命令交给模型判定
 	return s
 }
@@ -665,6 +667,7 @@ func (s *Server) chatAgentRef() *agent.ChatAgent {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	s.registerSideRoutes(mux)
+	s.registerBenchmarkRoutes(mux)
 
 	// Auth routes — exempt from JWT check (handled in requireAuth)
 	mux.HandleFunc("GET /api/auth/status", s.authStatus)
@@ -1078,6 +1081,9 @@ func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
 	archiveBlockers, _ := s.m.PG().TaskArchiveBlockers()
 	dtos := make([]TaskDTO, 0, len(list))
 	for _, t := range list {
+		if t.BenchmarkSessionID != nil {
+			continue
+		}
 		dto := taskDTO(t, s.resolvedTaskStatus(t))
 		dto.InputsBlockedReason = s.taskInputsBlockReason(t)
 		applyTaskArchiveBlocker(&dto, archiveBlockers)

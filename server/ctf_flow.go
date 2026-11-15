@@ -12,7 +12,7 @@ import (
 // switch. Rejecting/confirming the candidate releases it, while a manual pause
 // remains paused. Ordinary task admission and completion are untouched.
 func (e *Engine) ctfSubmissionWaiting(ctx context.Context, t *Task) bool {
-	if t.Mode != "ctf" || e.m == nil || e.m.pg == nil {
+	if t.Mode != "ctf" || t.ZeroTouch || e.m == nil || e.m.pg == nil {
 		return false
 	}
 	id, err := strconv.ParseInt(t.ID, 10, 64)

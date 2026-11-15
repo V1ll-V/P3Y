@@ -12,6 +12,7 @@ import (
 
 	"p3y/artifacts"
 	"p3y/ctf"
+	"p3y/db"
 )
 
 func (s *Server) artifactStore() artifacts.Store { return artifacts.Store{Root: s.m.dir} }
@@ -27,7 +28,7 @@ func (m *Manager) taskInputsError(t *Task) error {
 			err = nil
 		}
 	}
-	if err == nil && t.Mode == "ctf" {
+	if err == nil && db.IsSandboxTaskMode(t.Mode) {
 		id, e := strconv.ParseInt(t.ID, 10, 64)
 		if e != nil {
 			return e

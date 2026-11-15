@@ -4,7 +4,7 @@ const currentYear = new Date().getFullYear();
 
 export const APP_CONFIG = {
   name: "p3y",
-  displayVersion: "v0.9.0",
+  displayVersion: "v0.91",
   version: packageJson.version,
   copyright: `© ${currentYear}, p3y.`,
   meta: {
