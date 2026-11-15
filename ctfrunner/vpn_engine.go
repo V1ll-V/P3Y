@@ -19,6 +19,7 @@ import (
 )
 
 var vpnTaskLocks sync.Map
+var vpnHashLocks sync.Map
 
 func lockVPNTask(taskID string) func() {
 	v, _ := vpnTaskLocks.LoadOrStore(taskID, &sync.Mutex{})
@@ -27,8 +28,23 @@ func lockVPNTask(taskID string) func() {
 	return mu.Unlock
 }
 
+func lockVPNHash(vpnHash string) func() {
+	v, _ := vpnHashLocks.LoadOrStore(vpnHash, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
 func vpnContainerName(taskID string) string {
 	return "p3y-box-wg-" + taskID
+}
+
+func vpnSharedContainerName(vpnHash string) string {
+	h := strings.TrimSpace(vpnHash)
+	if len(h) > 16 {
+		h = h[:16]
+	}
+	return "p3y-box-vpn-" + h
 }
 
 func (e *Engine) wgImage() string {
@@ -138,14 +154,30 @@ func normalizeVPNKind(kind string) string {
 	return VPNKindWireGuard
 }
 
+func (e *Engine) findVPNContainer(ctx context.Context, task, vpnHash string) (Container, error) {
+	if strings.TrimSpace(vpnHash) != "" {
+		c, err := e.Container(ctx, vpnSharedContainerName(vpnHash))
+		if err == nil {
+			return c, nil
+		}
+		if !strings.Contains(err.Error(), ": 404 ") {
+			return Container{}, err
+		}
+	}
+	return e.Container(ctx, vpnContainerName(task))
+}
+
 func (e *Engine) requireVPNContainer(ctx context.Context, task, vpnHash string) (Container, error) {
-	c, err := e.Container(ctx, vpnContainerName(task))
+	if strings.TrimSpace(vpnHash) != "" {
+		unlockHash := lockVPNHash(vpnHash)
+		defer unlockHash()
+	}
+	c, err := e.findVPNContainer(ctx, task, vpnHash)
 	if err != nil {
 		return Container{}, fmt.Errorf("任务 #%s 的 VPN 容器未就绪：%w", task, err)
 	}
 	if c.Config.Labels["p3y.box.managed"] != "true" ||
 		c.Config.Labels["p3y.box.role"] != "wg" ||
-		c.Config.Labels["p3y.box.task"] != task ||
 		c.Config.Labels["p3y.box.vpn"] != vpnHash {
 		return Container{}, fmt.Errorf("任务 #%s 的 VPN 容器配置版本不一致，需要重新同步", task)
 	}
@@ -161,15 +193,14 @@ func (e *Engine) requireVPNContainer(ctx context.Context, task, vpnHash string) 
 	return c, nil
 }
 
-// EnsureVPN ensures a dedicated per-task VPN sidecar container (WireGuard or OpenVPN)
-// is running with the exact validated VPN configuration and tears down stale containers on update.
+// EnsureVPN ensures a shared VPN sidecar container keyed by config hash (WireGuard or OpenVPN)
+// is running with the exact validated VPN configuration so concurrent tasks using the same
+// .ovpn/.conf credential never kick each other off the VPN server.
 func (e *Engine) EnsureVPN(ctx context.Context, taskID, expectedHash, rawConfig string) (VPNStatus, error) {
 	taskID = strings.TrimSpace(taskID)
 	if taskID == "" {
 		return VPNStatus{}, errors.New("task_id 不能为空")
 	}
-	unlock := lockVPNTask(taskID)
-	defer unlock()
 
 	prof, err := ParseVPNConfig(rawConfig)
 	if err != nil {
@@ -179,25 +210,37 @@ func (e *Engine) EnsureVPN(ctx context.Context, taskID, expectedHash, rawConfig 
 		return VPNStatus{}, fmt.Errorf("VPN 配置摘要不匹配：%s != %s", prof.Hash, expectedHash)
 	}
 
-	name := vpnContainerName(taskID)
+	unlockHash := lockVPNHash(prof.Hash)
+	defer unlockHash()
+
+	// Remove any legacy per-task sidecar container so upgrades don't leave a competing dialer behind.
+	legacyName := vpnContainerName(taskID)
+	if legacy, lerr := e.Container(ctx, legacyName); lerr == nil {
+		_ = e.removeToolContainersByWGID(ctx, legacy.ID)
+		_ = e.removeContainerOnly(ctx, legacyName)
+	}
+
+	name := vpnSharedContainerName(prof.Hash)
 	if existing, err := e.Container(ctx, name); err == nil {
 		existingKind := normalizeVPNKind(existing.Config.Labels["p3y.box.vpn_kind"])
 		if existing.Config.Labels["p3y.box.managed"] == "true" &&
 			existing.Config.Labels["p3y.box.role"] == "wg" &&
-			existing.Config.Labels["p3y.box.task"] == taskID &&
 			existing.Config.Labels["p3y.box.vpn"] == prof.Hash &&
 			existingKind == prof.Kind {
 			if !existing.State.Running {
 				if startErr := e.json(ctx, "POST", "/containers/"+existing.ID+"/start", nil, nil); startErr == nil {
 					if readyErr := e.waitVPNReady(ctx, existing.ID, prof.Kind); readyErr == nil {
-						return e.ProbeVPN(ctx, taskID)
+						_ = e.removeTaskToolContainersWithWrongVPN(ctx, taskID, prof.Hash, existing.ID)
+						return e.ProbeVPN(ctx, taskID, prof.Hash)
 					}
 				}
-			} else if st, probeErr := e.ProbeVPN(ctx, taskID); probeErr == nil && st.Running && st.TunnelIP != "" {
+			} else if st, probeErr := e.probeVPNContainer(ctx, name, taskID); probeErr == nil && st.Running && st.TunnelIP != "" {
+				_ = e.removeTaskToolContainersWithWrongVPN(ctx, taskID, prof.Hash, existing.ID)
 				return st, nil
 			}
 		}
-		// Hash changed or previous sidecar unhealthy: drop tool containers first so none keep dead netns refs.
+		// Unhealthy or mismatched sidecar: drop referencing tool containers across tasks before recreating.
+		_ = e.removeToolContainersByWGID(ctx, existing.ID)
 		_ = e.removeTaskToolContainers(ctx, taskID)
 		if err = e.removeContainerOnly(ctx, name); err != nil {
 			return VPNStatus{}, err
@@ -213,7 +256,7 @@ func (e *Engine) EnsureVPN(ctx context.Context, taskID, expectedHash, rawConfig 
 	wgImg := e.wgImage()
 	var img struct{ ID string }
 	if err = e.json(ctx, "GET", "/images/"+url.PathEscape(wgImg)+"/json", nil, &img); err != nil {
-		return VPNStatus{}, fmt.Errorf("WireGuard Sidecar 镜像 %s 不可用（请构建 Dockerfile.ctf-wg）：%w", wgImg, err)
+		return VPNStatus{}, fmt.Errorf("VPN Sidecar 镜像 %s 不可用（请构建 Dockerfile.ctf-wg）：%w", wgImg, err)
 	}
 
 	payload := map[string]any{
@@ -222,7 +265,6 @@ func (e *Engine) EnsureVPN(ctx context.Context, taskID, expectedHash, rawConfig 
 		"Labels": map[string]string{
 			"p3y.box.managed":  "true",
 			"p3y.box.role":     "wg",
-			"p3y.box.task":     taskID,
 			"p3y.box.vpn":      prof.Hash,
 			"p3y.box.vpn_kind": prof.Kind,
 		},
@@ -266,19 +308,29 @@ func (e *Engine) EnsureVPN(ctx context.Context, taskID, expectedHash, rawConfig 
 	}
 	if err = e.waitVPNReady(ctx, created.ID, prof.Kind); err != nil {
 		logs := e.containerLogs(ctx, created.ID)
+		if prof.Kind == VPNKindOpenVPN {
+			if ovpnTail, _ := e.execRoot(ctx, created.ID, "tail -n 20 /run/wg/openvpn.log 2>/dev/null || true"); len(ovpnTail.Stdout) > 0 {
+				if tailText := strings.TrimSpace(string(ovpnTail.Stdout)); tailText != "" {
+					if logs != "" {
+						logs += "\n"
+					}
+					logs += tailText
+				}
+			}
+		}
 		_ = e.removeContainerOnly(ctx, name)
 		if logs != "" {
 			return VPNStatus{}, fmt.Errorf("%w：%s", err, logs)
 		}
 		return VPNStatus{}, err
 	}
-	// Trigger cleanup of any previously created non-VPN tool containers so the next execution re-attaches to wg0.
+	// Trigger cleanup of any previously created non-VPN tool containers so the next execution re-attaches to the VPN container.
 	_ = e.removeTaskToolContainersWithWrongVPN(ctx, taskID, prof.Hash, created.ID)
-	return e.ProbeVPN(ctx, taskID)
+	return e.probeVPNContainer(ctx, name, taskID)
 }
 
-// RemoveVPN stops and deletes a task's WireGuard sidecar container and detaches
-// any existing tool containers (without deleting their /work volumes).
+// RemoveVPN detaches any existing tool containers for taskID and removes the VPN sidecar
+// if no other task's tool containers still reference that shared VPN config hash.
 func (e *Engine) RemoveVPN(ctx context.Context, taskID string) error {
 	taskID = strings.TrimSpace(taskID)
 	if taskID == "" {
@@ -287,13 +339,16 @@ func (e *Engine) RemoveVPN(ctx context.Context, taskID string) error {
 	unlock := lockVPNTask(taskID)
 	defer unlock()
 
+	hashes := e.taskToolVPNHashes(ctx, taskID)
 	if err := e.removeTaskToolContainersWithWrongVPN(ctx, taskID, "", ""); err != nil {
 		return err
 	}
-	return e.removeContainerOnly(ctx, vpnContainerName(taskID))
+	_ = e.removeContainerOnly(ctx, vpnContainerName(taskID))
+	return e.cleanupUnusedSharedVPNs(ctx, hashes)
 }
 
-// RemoveTaskContainers deletes all managed containers and volumes belonging to taskID.
+// RemoveTaskContainers deletes all managed containers and volumes belonging to taskID,
+// and cleans up any shared VPN sidecar no longer referenced by other tasks.
 func (e *Engine) RemoveTaskContainers(ctx context.Context, taskID string) error {
 	taskID = strings.TrimSpace(taskID)
 	if taskID == "" {
@@ -302,6 +357,7 @@ func (e *Engine) RemoveTaskContainers(ctx context.Context, taskID string) error 
 	unlock := lockVPNTask(taskID)
 	defer unlock()
 
+	hashes := e.taskToolVPNHashes(ctx, taskID)
 	containers, err := e.listTaskContainers(ctx, taskID)
 	if err != nil {
 		return err
@@ -311,6 +367,9 @@ func (e *Engine) RemoveTaskContainers(ctx context.Context, taskID string) error 
 		if rmErr := e.removeContainerOnly(ctx, id); rmErr != nil {
 			errs = append(errs, rmErr)
 		}
+	}
+	if rmErr := e.removeContainerOnly(ctx, vpnContainerName(taskID)); rmErr != nil {
+		errs = append(errs, rmErr)
 	}
 	vols, err := e.listTaskVolumes(ctx, taskID)
 	if err != nil {
@@ -322,13 +381,35 @@ func (e *Engine) RemoveTaskContainers(ctx context.Context, taskID string) error 
 			}
 		}
 	}
+	if rmErr := e.cleanupUnusedSharedVPNs(ctx, hashes); rmErr != nil {
+		errs = append(errs, rmErr)
+	}
 	return errors.Join(errs...)
 }
 
-// ProbeVPN inspects a task's WireGuard sidecar container without exposing private keys.
-func (e *Engine) ProbeVPN(ctx context.Context, taskID string) (VPNStatus, error) {
+// ProbeVPN inspects a task's VPN sidecar container without exposing private keys.
+func (e *Engine) ProbeVPN(ctx context.Context, taskID string, expectedHash ...string) (VPNStatus, error) {
+	vpnHash := ""
+	if len(expectedHash) > 0 {
+		vpnHash = strings.TrimSpace(expectedHash[0])
+	}
+	if vpnHash == "" {
+		if hashes := e.taskToolVPNHashes(ctx, taskID); len(hashes) > 0 {
+			vpnHash = hashes[0]
+		}
+	}
+	if vpnHash != "" {
+		sharedName := vpnSharedContainerName(vpnHash)
+		st, err := e.probeVPNContainer(ctx, sharedName, taskID)
+		if err == nil && st.Active {
+			return st, nil
+		}
+	}
+	return e.probeVPNContainer(ctx, vpnContainerName(taskID), taskID)
+}
+
+func (e *Engine) probeVPNContainer(ctx context.Context, name, taskID string) (VPNStatus, error) {
 	numID, _ := strconv.ParseInt(taskID, 10, 64)
-	name := vpnContainerName(taskID)
 	st := VPNStatus{
 		TaskID:    numID,
 		Container: name,
@@ -528,6 +609,81 @@ func (e *Engine) listTaskContainers(ctx context.Context, taskID string) ([]strin
 	return ids, nil
 }
 
+func (e *Engine) removeToolContainersByWGID(ctx context.Context, wgID string) error {
+	if strings.TrimSpace(wgID) == "" {
+		return nil
+	}
+	filterBytes, _ := json.Marshal(map[string][]string{
+		"label": {"p3y.box.managed=true", "p3y.box.wg_id=" + wgID},
+	})
+	var list []dockerListedContainer
+	if err := e.json(ctx, "GET", "/containers/json?all=1&filters="+url.QueryEscape(string(filterBytes)), nil, &list); err != nil {
+		return err
+	}
+	var errs []error
+	for _, c := range list {
+		if c.Labels["p3y.box.role"] == "wg" {
+			continue
+		}
+		if err := e.removeContainerOnly(ctx, c.ID); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (e *Engine) taskToolVPNHashes(ctx context.Context, taskID string) []string {
+	filterBytes, _ := json.Marshal(map[string][]string{
+		"label": {"p3y.box.managed=true", "p3y.box.task=" + taskID},
+	})
+	var list []dockerListedContainer
+	if err := e.json(ctx, "GET", "/containers/json?all=1&filters="+url.QueryEscape(string(filterBytes)), nil, &list); err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var hashes []string
+	for _, c := range list {
+		h := strings.TrimSpace(c.Labels["p3y.box.vpn"])
+		if h != "" && !seen[h] {
+			seen[h] = true
+			hashes = append(hashes, h)
+		}
+	}
+	return hashes
+}
+
+func (e *Engine) cleanupUnusedSharedVPNs(ctx context.Context, hashes []string) error {
+	var errs []error
+	for _, h := range hashes {
+		if h == "" {
+			continue
+		}
+		unlockHash := lockVPNHash(h)
+		filterBytes, _ := json.Marshal(map[string][]string{
+			"label": {"p3y.box.managed=true", "p3y.box.vpn=" + h},
+		})
+		var list []dockerListedContainer
+		inUse := false
+		if err := e.json(ctx, "GET", "/containers/json?all=1&filters="+url.QueryEscape(string(filterBytes)), nil, &list); err == nil {
+			for _, c := range list {
+				if c.Labels["p3y.box.role"] != "wg" {
+					inUse = true
+					break
+				}
+			}
+		} else {
+			inUse = true
+		}
+		if !inUse {
+			if err := e.removeContainerOnly(ctx, vpnSharedContainerName(h)); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		unlockHash()
+	}
+	return errors.Join(errs...)
+}
+
 func (e *Engine) removeTaskToolContainers(ctx context.Context, taskID string) error {
 	filterBytes, _ := json.Marshal(map[string][]string{
 		"label": {"p3y.box.managed=true", "p3y.box.task=" + taskID},
@@ -639,7 +795,7 @@ func (s *Server) registerVPNRoutes(mux *http.ServeMux) {
 			fail(w, err)
 			return
 		}
-		st, err := s.Engine.ProbeVPN(r.Context(), fmt.Sprint(taskID))
+		st, err := s.Engine.ProbeVPN(r.Context(), fmt.Sprint(taskID), r.URL.Query().Get("hash"))
 		if err != nil {
 			fail(w, err)
 			return

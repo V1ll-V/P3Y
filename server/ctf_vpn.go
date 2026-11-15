@@ -111,7 +111,7 @@ func (s *Server) ctfVPNGet(w http.ResponseWriter, r *http.Request) {
 	svc := s.ctfService()
 	if svc.Runner != nil && svc.Runner.Configured() {
 		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-		st, probeErr := svc.Runner.ProbeTaskVPN(ctx, taskID)
+		st, probeErr := svc.Runner.ProbeTaskVPN(ctx, taskID, hash)
 		cancel()
 		if probeErr != nil {
 			st.Error = probeErr.Error()

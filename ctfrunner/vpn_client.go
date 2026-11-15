@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -17,7 +18,7 @@ func (c *Client) Configured() bool {
 	return c != nil && strings.TrimSpace(c.URL) != "" && strings.TrimSpace(c.Token) != ""
 }
 
-// SyncTaskVPN ensures the task's WireGuard sidecar container is active and matches config/hash.
+// SyncTaskVPN ensures the VPN sidecar container for taskID is active and matches config/hash.
 func (c *Client) SyncTaskVPN(ctx context.Context, taskID int64, hash, rawConfig string) (VPNStatus, error) {
 	var out VPNStatus
 	err := c.doVPNRequest(ctx, http.MethodPut, fmt.Sprintf("/tasks/%d/vpn", taskID), map[string]string{
@@ -27,10 +28,14 @@ func (c *Client) SyncTaskVPN(ctx context.Context, taskID int64, hash, rawConfig 
 	return out, err
 }
 
-// ProbeTaskVPN checks live WireGuard sidecar container state for taskID.
-func (c *Client) ProbeTaskVPN(ctx context.Context, taskID int64) (VPNStatus, error) {
+// ProbeTaskVPN checks live VPN sidecar container state for taskID (optionally filtered by config hash).
+func (c *Client) ProbeTaskVPN(ctx context.Context, taskID int64, hash ...string) (VPNStatus, error) {
 	var out VPNStatus
-	err := c.doVPNRequest(ctx, http.MethodGet, fmt.Sprintf("/tasks/%d/vpn", taskID), nil, &out)
+	path := fmt.Sprintf("/tasks/%d/vpn", taskID)
+	if len(hash) > 0 && strings.TrimSpace(hash[0]) != "" {
+		path += "?hash=" + url.QueryEscape(strings.TrimSpace(hash[0]))
+	}
+	err := c.doVPNRequest(ctx, http.MethodGet, path, nil, &out)
 	return out, err
 }
 
