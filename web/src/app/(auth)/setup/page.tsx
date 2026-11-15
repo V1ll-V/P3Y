@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 
 import { useRouter } from "next/navigation";
 
+import { P3YLogo } from "@/components/p3y-logo";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -68,8 +69,7 @@ export default function SetupPage() {
           <div className="absolute size-80 rounded-full border border-primary-foreground/10" />
           <div className="absolute size-60 rounded-full border border-primary-foreground/15" />
           <div className="absolute size-40 rounded-full border border-primary-foreground/20" />
-          {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src="/logo.png" alt={APP_CONFIG.name} width={160} height={160} className="relative brightness-0 invert" />
+          <P3YLogo variant="hero" />
         </div>
       </div>
 

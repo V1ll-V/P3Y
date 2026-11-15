@@ -4,6 +4,7 @@ import Link from "next/link";
 
 import { useShallow } from "zustand/react/shallow";
 
+import { P3YLogo } from "@/components/p3y-logo";
 import {
   Sidebar,
   SidebarContent,
@@ -42,9 +43,8 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
           <SidebarMenuItem>
             <SidebarMenuButton asChild>
               <Link prefetch={false} href="/function/tasks">
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img src="/logo.png" alt={APP_CONFIG.name} width={40} height={40} className="shrink-0" />
-                <span className="font-semibold text-base">{APP_CONFIG.name}</span>
+                <P3YLogo variant="mark" className="size-7 shrink-0" />
+                <span className="font-semibold text-base tracking-tight">{APP_CONFIG.name}</span>
                 <span className="text-muted-foreground text-xs">{APP_CONFIG.displayVersion}</span>
               </Link>
             </SidebarMenuButton>

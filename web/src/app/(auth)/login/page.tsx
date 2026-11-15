@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 
 import { AlertTriangle, ShieldCheck } from "lucide-react";
 
+import { P3YLogo } from "@/components/p3y-logo";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogClose, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -15,9 +16,27 @@ import { APP_CONFIG } from "@/config/app-config";
 import { api } from "@/lib/api";
 import { auth } from "@/lib/auth";
 
+const SAVED_LOGIN_KEY = "p3y_saved_login";
+
+function encodeSavedPassword(pw: string): string {
+  const bytes = new TextEncoder().encode(pw);
+  let bin = "";
+  bytes.forEach((b) => {
+    bin += String.fromCharCode(b);
+  });
+  return btoa(bin);
+}
+
+function decodeSavedPassword(raw: string): string {
+  const bin = atob(raw);
+  const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+
 export default function LoginPage() {
   const router = useRouter();
   const [password, setPassword] = useState("");
+  const [rememberPassword, setRememberPassword] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [checking, setChecking] = useState(true);
@@ -51,6 +70,19 @@ export default function LoginPage() {
       window.location.replace("/function/tasks");
       return;
     }
+    try {
+      const raw = localStorage.getItem(SAVED_LOGIN_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as { p?: string; r?: boolean; a?: boolean };
+        if (parsed.r && typeof parsed.p === "string" && parsed.p.length > 0) {
+          setPassword(decodeSavedPassword(parsed.p));
+          setRememberPassword(true);
+          if (parsed.a) setAgreed(true);
+        }
+      }
+    } catch {
+      localStorage.removeItem(SAVED_LOGIN_KEY);
+    }
     api
       .authStatus()
       .then(({ initialized }) => {
@@ -69,10 +101,23 @@ export default function LoginPage() {
     setLoading(true);
     setError("");
     try {
-      const { token } = await api.login("p3y", password);
+      const { token } = await api.login("P3Y", password);
+      if (rememberPassword) {
+        try {
+          localStorage.setItem(
+            SAVED_LOGIN_KEY,
+            JSON.stringify({ p: encodeSavedPassword(password), r: true, a: agreed }),
+          );
+        } catch {
+          // 忽略浏览器隐私模式存储限制
+        }
+      } else {
+        localStorage.removeItem(SAVED_LOGIN_KEY);
+      }
       auth.setToken(token);
       window.location.replace("/function/tasks");
     } catch {
+      localStorage.removeItem(SAVED_LOGIN_KEY);
       setError("用户名或密码错误");
     } finally {
       setLoading(false);
@@ -95,8 +140,7 @@ export default function LoginPage() {
           <div className="absolute size-80 rounded-full border border-primary-foreground/10" />
           <div className="absolute size-60 rounded-full border border-primary-foreground/15" />
           <div className="absolute size-40 rounded-full border border-primary-foreground/20" />
-          {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src="/logo.png" alt={APP_CONFIG.name} width={160} height={160} className="relative brightness-0 invert" />
+          <P3YLogo variant="hero" />
         </div>
       </div>
 
@@ -111,7 +155,7 @@ export default function LoginPage() {
           <form onSubmit={handleSubmit} className="flex flex-col gap-4">
             <div className="space-y-1.5">
               <Label htmlFor="username">用户名</Label>
-              <Input id="username" value="p3y" readOnly className="bg-muted text-muted-foreground" />
+              <Input id="username" value="P3Y" readOnly className="bg-muted text-muted-foreground" />
             </div>
             <div className="space-y-1.5">
               <Label htmlFor="password">密码</Label>
@@ -124,6 +168,22 @@ export default function LoginPage() {
                 autoFocus
                 autoComplete="current-password"
               />
+            </div>
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <Checkbox
+                  id="remember-password"
+                  checked={rememberPassword}
+                  onCheckedChange={(v) => {
+                    const checked = v === true;
+                    setRememberPassword(checked);
+                    if (!checked) localStorage.removeItem(SAVED_LOGIN_KEY);
+                  }}
+                />
+                <Label htmlFor="remember-password" className="cursor-pointer text-sm font-normal text-muted-foreground">
+                  记住密码
+                </Label>
+              </div>
             </div>
             <div className="flex items-start gap-2">
               <Checkbox
@@ -171,7 +231,7 @@ export default function LoginPage() {
             className="max-h-[60vh] space-y-5 overflow-y-auto px-6 py-5 text-sm leading-relaxed text-muted-foreground"
           >
             <p className="rounded-lg border bg-muted/40 p-3 text-foreground/80">
-              本《使用须知与免责声明》（以下简称"本声明"）是您与 ARTEX
+              本《使用须知与免责声明》（以下简称"本声明"）是您与 P3Y
               项目作者及贡献者之间就使用本软件所达成的约定。请您在使用前审慎阅读、充分理解各条款内容，特别是以粗体或色块标注的免责、责任限制及禁止性条款。
               <span className="font-medium text-foreground">
                 {" "}
@@ -187,7 +247,7 @@ export default function LoginPage() {
                 第一条 · 定义与开源许可
               </h4>
               <p className="pl-7">
-                本软件（ARTEX）是一款基于 GNU Affero General Public License
+                本软件（P3Y）是一款基于 GNU Affero General Public License
                 v3.0（AGPL-3.0）发布的开源程序。您可依据该协议自由使用、复制、修改和分发本软件；但任何衍生作品（包括通过网络向第三方提供的在线服务）均须同样以
                 AGPL-3.0 协议开源并向使用者公开对应的完整源代码。AGPL-3.0 完整条款以随附的 LICENSE 文件为准。
               </p>
