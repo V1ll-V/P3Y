@@ -67,12 +67,26 @@ func (s *Server) registerBenchmarkRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/benchmarks", s.bench.handleListSessions)
 	mux.HandleFunc("POST /api/benchmarks", s.bench.handleCreateSession)
 	mux.HandleFunc("GET /api/benchmarks/{id}", s.bench.handleGetSession)
+	mux.HandleFunc("PATCH /api/benchmarks/{id}", s.bench.handleUpdateSession)
 	mux.HandleFunc("POST /api/benchmarks/{id}/start", s.bench.handleStartSession)
 	mux.HandleFunc("POST /api/benchmarks/{id}/stop", s.bench.handleStopSession)
 	mux.HandleFunc("POST /api/benchmarks/{id}/sync", s.bench.handleSyncSession)
 	mux.HandleFunc("POST /api/benchmarks/{id}/retry-failed", s.bench.handleRetryFailed)
 	mux.HandleFunc("DELETE /api/benchmarks/{id}", s.bench.handleDeleteSession)
 	mux.HandleFunc("GET /api/benchmarks/{id}/export", s.bench.handleExportSession)
+}
+
+const maxBenchmarkAutoRetries = 3
+
+func benchmarkRetryCooldown(nextAttempt int) time.Duration {
+	switch {
+	case nextAttempt <= 1:
+		return 30 * time.Second
+	case nextAttempt == 2:
+		return 60 * time.Second
+	default:
+		return 120 * time.Second
+	}
 }
 
 func parseSessionConfig(raw json.RawMessage) benchmark.SessionConfig {
@@ -386,6 +400,72 @@ func (bm *BenchmarkManager) handleRetryFailed(w http.ResponseWriter, r *http.Req
 	writeJSON(w, 200, map[string]any{"reset": resetCount, "session": sess})
 }
 
+func (bm *BenchmarkManager) handleUpdateSession(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeErr(w, 400, "无效的测评会话 ID")
+		return
+	}
+	var req struct {
+		MaxConcurrent       int `json:"max_concurrent"`
+		PerChallengeTimeout int `json:"per_challenge_timeout"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		writeErr(w, 400, "JSON 格式无效")
+		return
+	}
+	sess, err := bm.s.m.pg.GetBenchmarkSession(r.Context(), id)
+	if err != nil || sess == nil {
+		writeErr(w, 404, "测评会话不存在")
+		return
+	}
+	if req.MaxConcurrent <= 0 && req.PerChallengeTimeout <= 0 {
+		writeErr(w, 400, "请提供有效的并发槽位或单题预算时间")
+		return
+	}
+	if err := bm.s.m.pg.UpdateBenchmarkSessionSettings(r.Context(), id, req.MaxConcurrent, req.PerChallengeTimeout); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	updated, _ := bm.s.m.pg.GetBenchmarkSession(r.Context(), id)
+	if updated != nil {
+		_ = bm.s.m.pg.AppendBenchmarkEvent(r.Context(), id, "", "session_updated",
+			fmt.Sprintf("已更新测评参数：并发槽位 %d，单题预算 %ds（%d 分钟）",
+				updated.MaxConcurrent, updated.PerChallengeTimeout, updated.PerChallengeTimeout/60), nil)
+	}
+	writeJSON(w, 200, updated)
+}
+
+func (bm *BenchmarkManager) scheduleChallengeAutoRetry(ctx context.Context, sessionID int64, ch *db.BenchmarkChallenge, reason string) {
+	if ch == nil || ch.IsCompleted {
+		return
+	}
+	cleanReason := strings.TrimSpace(reason)
+	if cleanReason == "" {
+		cleanReason = "执行异常"
+	}
+	if ch.AutoRetryCount >= maxBenchmarkAutoRetries {
+		msg := fmt.Sprintf("%s（已自动重试 %d 次仍异常，等待手动重排）", cleanReason, maxBenchmarkAutoRetries)
+		_ = bm.s.m.pg.ScheduleBenchmarkChallengeRetry(ctx, sessionID, ch.UniqueCode, nil, ch.AutoRetryCount, msg)
+		ch.NextRetryAt = nil
+		ch.LastError = msg
+		_ = bm.s.m.pg.AppendBenchmarkEvent(ctx, sessionID, ch.UniqueCode, "challenge_retry_exhausted",
+			fmt.Sprintf("题目 %s %s", ch.UniqueCode, msg), nil)
+		return
+	}
+	nextAttempt := ch.AutoRetryCount + 1
+	cooldown := benchmarkRetryCooldown(nextAttempt)
+	retryAt := time.Now().Add(cooldown)
+	msg := fmt.Sprintf("%s（冷却 %ds 后自动重排重试 %d/%d）", cleanReason, int(cooldown.Seconds()), nextAttempt, maxBenchmarkAutoRetries)
+	if err := bm.s.m.pg.ScheduleBenchmarkChallengeRetry(ctx, sessionID, ch.UniqueCode, &retryAt, nextAttempt, msg); err == nil {
+		ch.NextRetryAt = &retryAt
+		ch.AutoRetryCount = nextAttempt
+		ch.LastError = msg
+		_ = bm.s.m.pg.AppendBenchmarkEvent(ctx, sessionID, ch.UniqueCode, "challenge_auto_retry_scheduled",
+			fmt.Sprintf("题目 %s %s", ch.UniqueCode, msg), nil)
+	}
+}
+
 func (bm *BenchmarkManager) resumeRunningSessions() {
 	if bm == nil || bm.s == nil || bm.s.m == nil || bm.s.m.pg == nil || bm.s.ctx == nil {
 		return
@@ -638,6 +718,7 @@ func (bm *BenchmarkManager) tickSession(ctx context.Context, sessionID int64, rt
 		return err
 	}
 	unsolved := make([]*db.BenchmarkChallenge, 0, len(challenges))
+	runningList := make([]*db.BenchmarkChallenge, 0, len(challenges))
 	activeContainers := 0
 	activeTasks := 0
 
@@ -661,6 +742,8 @@ func (bm *BenchmarkManager) tickSession(ctx context.Context, sessionID int64, rt
 				ch.BoundTaskID = nil
 				ch.BoundTaskStatus = ""
 				ch.AttemptCount = 0
+				ch.AutoRetryCount = 0
+				ch.NextRetryAt = nil
 				ch.LastError = ""
 				ch.ContainerStatus = "stopped"
 				ch.ContainerAddr = nil
@@ -672,12 +755,44 @@ func (bm *BenchmarkManager) tickSession(ctx context.Context, sessionID int64, rt
 		// platform environment quota is released immediately.
 		if hasContainer && (ch.IsCompleted || !boundRunning) {
 			_ = rt.prov.CloseEnvironment(ctx, ch.UniqueCode)
-			_ = bm.s.m.pg.UpdateBenchmarkChallengeEnv(ctx, sessionID, ch.UniqueCode, "stopped", nil, nil, "")
+			keepErr := ""
+			if !ch.IsCompleted {
+				keepErr = ch.LastError
+			}
+			_ = bm.s.m.pg.UpdateBenchmarkChallengeEnv(ctx, sessionID, ch.UniqueCode, "stopped", nil, nil, keepErr)
 			hasContainer = false
 		}
 		if ch.IsCompleted {
 			continue
 		}
+
+		// Check cooldown auto-requeue or schedule cooldown for newly terminated failed/timed-out tasks.
+		if !boundRunning {
+			if ch.NextRetryAt != nil {
+				if !time.Now().Before(*ch.NextRetryAt) {
+					if rerr := bm.s.m.pg.RequeueBenchmarkChallengeFromCooldown(ctx, sessionID, ch.UniqueCode); rerr == nil {
+						ch.BoundTaskID = nil
+						ch.BoundTaskStatus = ""
+						ch.LastError = ""
+						ch.NextRetryAt = nil
+						ch.ContainerStatus = "stopped"
+						ch.ContainerAddr = nil
+						_ = bm.s.m.pg.AppendBenchmarkEvent(ctx, sessionID, ch.UniqueCode, "challenge_auto_requeued",
+							fmt.Sprintf("冷却结束，题目 %s 已自动重新进入待调度队列（第 %d/%d 次重试，将继承前序探索记忆）",
+								ch.UniqueCode, ch.AutoRetryCount, maxBenchmarkAutoRetries), nil)
+					}
+				}
+			} else if ch.BoundTaskID != nil {
+				if ch.AutoRetryCount < maxBenchmarkAutoRetries || !strings.Contains(ch.LastError, "等待手动重排") {
+					statusTag := ch.BoundTaskStatus
+					if statusTag == "" {
+						statusTag = "terminated"
+					}
+					bm.scheduleChallengeAutoRetry(ctx, sessionID, ch, "前序任务状态为 "+statusTag)
+				}
+			}
+		}
+
 		unsolved = append(unsolved, ch)
 
 		if hasContainer {
@@ -685,7 +800,19 @@ func (bm *BenchmarkManager) tickSession(ctx context.Context, sessionID int64, rt
 			bm.refreshActiveEnv(ctx, rt, sess, ch)
 		}
 		if boundRunning {
-			bm.checkChallengeTimeoutAndHint(ctx, rt, sess, ch, len(unsolved) > activeTasks)
+			runningList = append(runningList, ch)
+		}
+	}
+
+	hasWaiting := len(unsolved) > activeTasks
+	for _, ch := range runningList {
+		if bm.checkChallengeTimeoutAndHint(ctx, rt, sess, ch, hasWaiting) {
+			if activeTasks > 0 {
+				activeTasks--
+			}
+			if activeContainers > 0 && challengeHasContainer(sess.Provider, ch) {
+				activeContainers--
+			}
 		}
 	}
 
@@ -747,7 +874,7 @@ func (bm *BenchmarkManager) tickSession(ctx context.Context, sessionID int64, rt
 					fmt.Sprintf("%s（冷却 %ds）：%v", reason, int(cooldown.Seconds()), err), nil)
 				break
 			}
-			_ = bm.s.m.pg.UpdateBenchmarkChallengeEnv(ctx, sessionID, ch.UniqueCode, ch.ContainerStatus, ch.ContainerAddr, ch.EnvExpiresAt, err.Error())
+			bm.scheduleChallengeAutoRetry(ctx, sessionID, ch, err.Error())
 			_ = bm.s.m.pg.AppendBenchmarkEvent(ctx, sessionID, ch.UniqueCode, "slot_error", err.Error(), nil)
 			continue
 		}
@@ -850,14 +977,24 @@ func (bm *BenchmarkManager) refreshActiveEnv(ctx context.Context, rt *benchSessi
 	}
 }
 
-func (bm *BenchmarkManager) checkChallengeTimeoutAndHint(ctx context.Context, rt *benchSessionRuntime, sess *db.BenchmarkSession, ch *db.BenchmarkChallenge, hasWaiting bool) {
+func (bm *BenchmarkManager) checkChallengeTimeoutAndHint(ctx context.Context, rt *benchSessionRuntime, sess *db.BenchmarkSession, ch *db.BenchmarkChallenge, hasWaiting bool) bool {
 	if ch.BoundTaskID == nil {
-		return
+		return false
 	}
 	bm.mu.Lock()
 	started := rt.taskStartAt[ch.UniqueCode]
 	if started.IsZero() {
-		started = ch.UpdatedAt
+		if t, ok := bm.s.m.Task(strconv.FormatInt(*ch.BoundTaskID, 10)); ok {
+			snap := t.lifecycleSnapshot()
+			if snap.FirstRunAt > 0 {
+				started = time.Unix(snap.FirstRunAt, 0)
+			} else if t.CreatedAt > 0 {
+				started = time.Unix(t.CreatedAt, 0)
+			}
+		}
+		if started.IsZero() {
+			started = ch.UpdatedAt
+		}
 		rt.taskStartAt[ch.UniqueCode] = started
 	}
 	bm.mu.Unlock()
@@ -882,11 +1019,14 @@ func (bm *BenchmarkManager) checkChallengeTimeoutAndHint(ctx context.Context, rt
 		bm.stopBoundTask(taskID, "timeout", errors.New("单题预算超时，让出并发槽位"))
 		if ch.ContainerStatus == "available" || ch.ContainerStatus == "pending" {
 			_ = rt.prov.CloseEnvironment(ctx, ch.UniqueCode)
-			_ = bm.s.m.pg.UpdateBenchmarkChallengeEnv(ctx, sess.ID, ch.UniqueCode, "stopped", nil, nil, "超时让出槽位")
+			_ = bm.s.m.pg.UpdateBenchmarkChallengeEnv(ctx, sess.ID, ch.UniqueCode, "stopped", nil, nil, "")
 		}
 		_ = bm.s.m.pg.AppendBenchmarkEvent(ctx, sess.ID, ch.UniqueCode, "challenge_timeout_rotate",
 			fmt.Sprintf("题目 %s 超过单题时间预算（%ds），已释放槽位调度后续题目", ch.UniqueCode, sess.PerChallengeTimeout), nil)
+		bm.scheduleChallengeAutoRetry(ctx, sess.ID, ch, fmt.Sprintf("单题预算超时（%ds）", sess.PerChallengeTimeout))
+		return true
 	}
+	return false
 }
 
 func challengeHasContainer(provider string, ch *db.BenchmarkChallenge) bool {
@@ -958,6 +1098,7 @@ func isTransientPlatformUnavailableError(err error) (time.Duration, string) {
 }
 
 func pickChallengeQueue(unsolved []*db.BenchmarkChallenge, m *Manager) []*db.BenchmarkChallenge {
+	now := time.Now()
 	idle := make([]*db.BenchmarkChallenge, 0, len(unsolved))
 	for _, ch := range unsolved {
 		if isNoFlagBenchmarkChallenge(ch) {
@@ -968,14 +1109,20 @@ func pickChallengeQueue(unsolved []*db.BenchmarkChallenge, m *Manager) []*db.Ben
 				continue
 			}
 		}
-		if ch.AttemptCount > 0 && ch.LastError != "" {
-			// Still allow retry only if all fresh ones are exhausted; order after fresh ones.
+		if ch.NextRetryAt != nil && now.Before(*ch.NextRetryAt) {
+			continue
+		}
+		if ch.AutoRetryCount >= maxBenchmarkAutoRetries && (ch.LastError != "" || ch.BoundTaskID != nil) {
+			continue
 		}
 		idle = append(idle, ch)
 	}
 	sort.SliceStable(idle, func(i, j int) bool {
 		if idle[i].AttemptCount != idle[j].AttemptCount {
 			return idle[i].AttemptCount < idle[j].AttemptCount
+		}
+		if idle[i].AutoRetryCount != idle[j].AutoRetryCount {
+			return idle[i].AutoRetryCount < idle[j].AutoRetryCount
 		}
 		if idle[i].Level != idle[j].Level {
 			return idle[i].Level < idle[j].Level
@@ -1118,7 +1265,8 @@ func (bm *BenchmarkManager) startChallengeSlot(ctx context.Context, rt *benchSes
 	vpnCfg, vpnHash, vpnFilename, _ := prepareTaskVPNForCreate("ctf", rt.cfg.CTFVPNConfig, rt.cfg.CTFVPNFilename)
 
 	sid := sess.ID
-	goal := buildBenchmarkChallengeGoal(ch, env, attachNames)
+	prevTaskIDs, _ := bm.s.m.pg.ResolveChallengeSourceTaskIDs(ctx, sess.ID, ch.UniqueCode, ch.HistoryTaskIDs, ch.BoundTaskID)
+	goal := buildBenchmarkChallengeGoal(ch, env, attachNames, prevTaskIDs)
 	desc := fmt.Sprintf("[测评#%d %s] %s", sess.ID, ch.UniqueCode, ch.Title)
 
 	t, err := bm.s.m.CreateTaskWithOptions(desc, goal, db.TaskCreateOptions{
@@ -1130,6 +1278,7 @@ func (bm *BenchmarkManager) startChallengeSlot(ctx context.Context, rt *benchSes
 		CTFVPNHash:           vpnHash,
 		CTFVPNFilename:       vpnFilename,
 		LLMProfileIDs:        sess.LLMProfileIDs,
+		SourceTaskIDs:        prevTaskIDs,
 		TimeoutSeconds:       sess.PerChallengeTimeout,
 		PlanHeartbeatSeconds: 30,
 		ZeroTouch:            true,
@@ -1178,15 +1327,20 @@ func (bm *BenchmarkManager) startChallengeSlot(ctx context.Context, rt *benchSes
 	bm.s.prewarmTaskVPN(t, vpnHash, vpnCfg)
 	// seedFirstIntent = false: let Planner run round 1 immediately to create branch intents.
 	bm.s.launchTask(t, goal, false)
+	eventMsg := fmt.Sprintf("题目已分配槽位并启动零交互求解（子任务 #%s）", t.ID)
+	if len(prevTaskIDs) > 0 {
+		eventMsg = fmt.Sprintf("题目已分配槽位并启动零交互求解（子任务 #%s，继承前序任务 #%v 探索记忆）", t.ID, prevTaskIDs)
+	}
 	_ = bm.s.m.pg.AppendBenchmarkEvent(ctx, sess.ID, ch.UniqueCode, "challenge_started",
-		fmt.Sprintf("题目已分配槽位并启动零交互求解（子任务 #%s）", t.ID), map[string]any{
-			"task_id": t.ID,
-			"addrs":   ch.ContainerAddr,
+		eventMsg, map[string]any{
+			"task_id":         t.ID,
+			"addrs":           ch.ContainerAddr,
+			"source_task_ids": prevTaskIDs,
 		})
 	return true, needsContainer, nil
 }
 
-func buildBenchmarkChallengeGoal(ch *db.BenchmarkChallenge, env *benchmark.EnvState, attachNames []string) string {
+func buildBenchmarkChallengeGoal(ch *db.BenchmarkChallenge, env *benchmark.EnvState, attachNames []string, prevTaskIDs []int64) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "题目代号：%s\n标题：%s\n分类：%s | 难度：%s | 提交类型：%s | Flag 数：%d\n",
 		ch.UniqueCode, ch.Title, ch.Category, ch.Difficulty, ch.SubmissionType, ch.FlagCount)
@@ -1202,6 +1356,13 @@ func buildBenchmarkChallengeGoal(ch *db.BenchmarkChallenge, env *benchmark.EnvSt
 	}
 	if ch.Description != "" {
 		fmt.Fprintf(&b, "\n【题目描述】\n%s\n", ch.Description)
+	}
+	if len(prevTaskIDs) > 0 {
+		idStrs := make([]string, 0, len(prevTaskIDs))
+		for _, pid := range prevTaskIDs {
+			idStrs = append(idStrs, fmt.Sprintf("#%d", pid))
+		}
+		fmt.Fprintf(&b, "\n【前序探索记忆继承（来自任务 %s）】\n本题此前因超时或异常中断后重新调度，系统已自动将前序任务的探索黑板（已确认事实 fact、线索 finding、冷摘要与终态意图总结）以只读源任务形式继承到当前探索态势中。\n请先查阅前序任务的已有探索发现，直接沿有效线索推进或避开已知无效方向；若本轮重新启动了靶机容器，一切网络探测与漏洞利用请以本轮最新【靶机访问地址】为准。\n", strings.Join(idStrs, ", "))
 	}
 	if ch.SubmissionType == "choice" {
 		b.WriteString("\n请结合题目描述与附件完成分析，并通过 `benchmark_submit_choice` 提交正确选项 ID 数组。")

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -142,13 +143,23 @@ func TestBenchmarkSessionAndTaskIsolation(t *testing.T) {
 	if listRec.Code != 200 {
 		t.Fatalf("GET /api/tasks status=%d", listRec.Code)
 	}
-	var listed []map[string]any
-	if err := json.Unmarshal(listRec.Body.Bytes(), &listed); err == nil {
-		for _, item := range listed {
-			if item["benchmark_session_id"] != nil {
-				t.Fatalf("benchmark sub-task leaked into /api/tasks: %+v", item)
+	var listedResp struct {
+		Tasks []map[string]any `json:"tasks"`
+	}
+	if err := json.Unmarshal(listRec.Body.Bytes(), &listedResp); err != nil {
+		t.Fatalf("decode /api/tasks: %v", err)
+	}
+	foundSubTask := false
+	for _, item := range listedResp.Tasks {
+		if fmt.Sprint(item["id"]) == subTask.ID {
+			foundSubTask = true
+			if item["benchmark_session_id"] == nil {
+				t.Fatalf("benchmark sub-task missing benchmark_session_id in /api/tasks: %+v", item)
 			}
 		}
+	}
+	if !foundSubTask {
+		t.Fatalf("expected benchmark sub-task %s to appear in /api/tasks for auditing", subTask.ID)
 	}
 
 	// Direct /api/tasks/{id} still resolves for drill-down inspection.
@@ -1018,5 +1029,151 @@ func TestBenchmarkSubmitLoopPreventionAndMaintenanceCooldown(t *testing.T) {
 	doneQ1, _ := s.m.pg.GetBenchmarkChallenge(t.Context(), sess.ID, "prac:pg1:q1")
 	if doneQ1 == nil || !doneQ1.IsCompleted {
 		t.Fatalf("expected q1 to be marked completed, got %+v", doneQ1)
+	}
+}
+
+func TestBenchmarkTimeoutSettingsAutoRetryAndMemoryInheritance(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) - skipping", err)
+	}
+	defer m.Close()
+
+	td := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := New(ctx, m, td, td, td)
+	h := s.Handler()
+	token, err := signJWT(s.jwtKey)
+	if err != nil {
+		t.Fatalf("sign jwt: %v", err)
+	}
+	addAuth := func(req *http.Request) {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	// Default per_challenge_timeout should be 5400s (90 minutes) when omitted.
+	sess, err := s.m.pg.CreateBenchmarkSession(t.Context(), db.BenchmarkSessionCreate{
+		Name:          "auto-retry-inherit-test",
+		Provider:      "ctf2",
+		BaseURL:       "https://ctf2.example/api/ai/v1/mcp",
+		MaxConcurrent: 2,
+		HintPolicy:    "never",
+	})
+	if err != nil {
+		t.Fatalf("CreateBenchmarkSession: %v", err)
+	}
+	if sess.PerChallengeTimeout != 5400 {
+		t.Fatalf("expected default PerChallengeTimeout=5400, got %d", sess.PerChallengeTimeout)
+	}
+	t.Cleanup(func() {
+		cancel()
+		taskIDs, _ := s.m.pg.ListBenchmarkChallengeTaskIDs(context.Background(), sess.ID)
+		for _, tid := range taskIDs {
+			s.engine.StopTask(strconv.FormatInt(tid, 10))
+			_, _ = s.m.DeleteTask(strconv.FormatInt(tid, 10), DeleteTaskOptions{})
+		}
+		_ = s.m.pg.DeleteBenchmarkSession(context.Background(), sess.ID)
+	})
+
+	// PATCH /api/benchmarks/{id} updates budget and concurrency dynamically.
+	patchRec := httptest.NewRecorder()
+	patchReq := httptest.NewRequest("PATCH", "/api/benchmarks/"+strconv.FormatInt(sess.ID, 10),
+		strings.NewReader(`{"max_concurrent":4,"per_challenge_timeout":7200}`))
+	patchReq.Header.Set("Content-Type", "application/json")
+	addAuth(patchReq)
+	h.ServeHTTP(patchRec, patchReq)
+	if patchRec.Code != 200 {
+		t.Fatalf("PATCH /api/benchmarks/{id} status=%d body=%s", patchRec.Code, patchRec.Body.String())
+	}
+	var updatedSess db.BenchmarkSession
+	if err := json.Unmarshal(patchRec.Body.Bytes(), &updatedSess); err != nil {
+		t.Fatalf("decode updated session: %v", err)
+	}
+	if updatedSess.MaxConcurrent != 4 || updatedSess.PerChallengeTimeout != 7200 {
+		t.Fatalf("unexpected patched session: %+v", updatedSess)
+	}
+
+	// Seed challenge with an existing timed-out task so auto-retry cooldown & SourceTaskIDs inheritance run end-to-end.
+	oldTask, err := s.m.CreateTaskWithOptions("prev timed-out", "old goal", db.TaskCreateOptions{
+		Name:               "[prac:pg1:ch1] unipickle",
+		Mode:               "ctf",
+		ZeroTouch:          true,
+		BenchmarkSessionID: &sess.ID,
+	})
+	if err != nil {
+		t.Fatalf("CreateTaskWithOptions oldTask: %v", err)
+	}
+	_ = s.m.SetTaskStatus(oldTask.ID, "timeout")
+	oldTID, _ := strconv.ParseInt(oldTask.ID, 10, 64)
+
+	if err := s.m.pg.SyncBenchmarkChallenges(t.Context(), sess.ID, []db.BenchmarkChallengeUpsert{{
+		UniqueCode:      "prac:pg1:ch1",
+		Title:           "unipickle",
+		Description:     "Existing description before timeout",
+		Category:        "web",
+		SubmissionType:  "flag",
+		TotalScore:      100,
+		FlagCount:       1,
+		ContainerStatus: "stopped",
+		Meta:            json.RawMessage(`{"has_container":false}`),
+	}}); err != nil {
+		t.Fatalf("SyncBenchmarkChallenges: %v", err)
+	}
+	_ = s.m.pg.BindBenchmarkChallengeTask(t.Context(), sess.ID, "prac:pg1:ch1", oldTID)
+	_ = s.m.pg.UpdateBenchmarkSessionStatus(t.Context(), sess.ID, "running", "")
+
+	prov := &mockDetailFirstProvider{}
+	rt := &benchSessionRuntime{
+		sessionID:   sess.ID,
+		prov:        prov,
+		lastEnvPoll: map[string]time.Time{},
+		taskStartAt: map[string]time.Time{},
+	}
+	s.bench.mu.Lock()
+	s.bench.runs[sess.ID] = rt
+	s.bench.mu.Unlock()
+	t.Cleanup(func() {
+		s.bench.mu.Lock()
+		delete(s.bench.runs, sess.ID)
+		s.bench.mu.Unlock()
+	})
+
+	// Tick 1: newly observed timeout task enters cooldown without immediately recreating a task.
+	if err := s.bench.tickSession(t.Context(), sess.ID, rt, 1); err != nil {
+		t.Fatalf("tickSession #1: %v", err)
+	}
+	cooling, _ := s.m.pg.GetBenchmarkChallenge(t.Context(), sess.ID, "prac:pg1:ch1")
+	if cooling == nil || cooling.NextRetryAt == nil || cooling.AutoRetryCount != 1 {
+		t.Fatalf("expected cooldown scheduled (auto_retry_count=1, next_retry_at set), got %+v", cooling)
+	}
+	if cooling.BoundTaskID == nil || *cooling.BoundTaskID != oldTID {
+		t.Fatalf("expected bound_task_id preserved during cooldown, got %+v", cooling.BoundTaskID)
+	}
+
+	// Simulate cooldown elapsed.
+	past := time.Now().Add(-1 * time.Second)
+	if err := s.m.pg.ScheduleBenchmarkChallengeRetry(t.Context(), sess.ID, "prac:pg1:ch1", &past, 1, cooling.LastError); err != nil {
+		t.Fatalf("ScheduleBenchmarkChallengeRetry past: %v", err)
+	}
+
+	// Tick 2: expired cooldown automatically requeues and creates a new task inheriting oldTID.
+	if err := s.bench.tickSession(t.Context(), sess.ID, rt, 1); err != nil {
+		t.Fatalf("tickSession #2: %v", err)
+	}
+	relaunched, _ := s.m.pg.GetBenchmarkChallenge(t.Context(), sess.ID, "prac:pg1:ch1")
+	if relaunched == nil || relaunched.BoundTaskID == nil || *relaunched.BoundTaskID == oldTID {
+		t.Fatalf("expected new bound_task_id replacing %d, got %+v", oldTID, relaunched)
+	}
+	newTask, ok := s.m.Task(strconv.FormatInt(*relaunched.BoundTaskID, 10))
+	if !ok || newTask == nil {
+		t.Fatalf("new bound task %d missing in manager", *relaunched.BoundTaskID)
+	}
+	snap := newTask.lifecycleSnapshot()
+	if len(snap.SourceTaskIDs) != 1 || snap.SourceTaskIDs[0] != oldTID {
+		t.Fatalf("expected new task SourceTaskIDs=[%d], got %+v", oldTID, snap.SourceTaskIDs)
+	}
+	if !strings.Contains(newTask.Goal, "前序探索记忆继承") {
+		t.Fatalf("expected goal to mention inherited prior exploration memory, got %q", newTask.Goal)
 	}
 }

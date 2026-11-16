@@ -18,6 +18,7 @@ import {
   PlayIcon,
   RefreshCwIcon,
   ServerIcon,
+  SlidersHorizontalIcon,
   SquareIcon,
   TrophyIcon,
   XCircleIcon,
@@ -27,6 +28,17 @@ import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { api } from "@/lib/api";
 import { fmtTokens, formatTokenBreakdown } from "@/lib/format-tokens";
 import type { BenchmarkChallenge, BenchmarkDetailResponse } from "@/lib/types";
@@ -68,6 +80,16 @@ function BenchmarkDetailInner() {
   const [loading, setLoading] = React.useState(true);
   const [busy, setBusy] = React.useState(false);
   const [filter, setFilter] = React.useState<"all" | "completed" | "active" | "pending" | "error">("all");
+  const [settingsOpen, setSettingsOpen] = React.useState(false);
+  const [editConcurrent, setEditConcurrent] = React.useState(3);
+  const [editTimeout, setEditTimeout] = React.useState(5400);
+  const [savingSettings, setSavingSettings] = React.useState(false);
+  const [nowMs, setNowMs] = React.useState(() => Date.now());
+
+  React.useEffect(() => {
+    const id = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
 
   const load = React.useCallback(async () => {
     if (!id) return;
@@ -162,12 +184,107 @@ function BenchmarkDetailInner() {
               <Badge variant="outline">{session.provider}</Badge>
             </div>
             <p className="mt-0.5 text-xs text-muted-foreground">
-              {session.base_url} · 最大并发槽位 {session.max_concurrent} · 单题预算 {session.per_challenge_timeout}s
+              {session.base_url} · 最大并发槽位 {session.max_concurrent} · 单题预算 {session.per_challenge_timeout}s ({Math.round(session.per_challenge_timeout / 60)} 分钟)
             </p>
           </div>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          <Dialog
+            open={settingsOpen}
+            onOpenChange={(open) => {
+              if (open) {
+                setEditConcurrent(session.max_concurrent);
+                setEditTimeout(session.per_challenge_timeout);
+              }
+              setSettingsOpen(open);
+            }}
+          >
+            <DialogTrigger asChild>
+              <Button variant="outline" size="sm" disabled={busy}>
+                <SlidersHorizontalIcon className="mr-1.5 h-3.5 w-3.5" />
+                调整预算/并发
+              </Button>
+            </DialogTrigger>
+            <DialogContent className="sm:max-w-md">
+              <DialogHeader>
+                <DialogTitle>调整测评参数</DialogTitle>
+                <DialogDescription>
+                  修改最大并发槽位或单题预算超时时间。待调度或冷却重排的新任务会立即采用新预算。
+                </DialogDescription>
+              </DialogHeader>
+              <div className="grid gap-4 py-2">
+                <div className="space-y-2">
+                  <Label className="text-xs font-medium">最大并发题目/容器数</Label>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={16}
+                    value={editConcurrent}
+                    onChange={(e) => setEditConcurrent(Math.min(16, Math.max(1, Number(e.target.value) || 1)))}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label className="text-xs font-medium">
+                    单题预算超时 (秒 · 约 {Math.round(editTimeout / 60)} 分钟)
+                  </Label>
+                  <Input
+                    type="number"
+                    min={60}
+                    max={14400}
+                    value={editTimeout}
+                    onChange={(e) => setEditTimeout(Math.min(14400, Math.max(60, Number(e.target.value) || 5400)))}
+                  />
+                  <div className="flex flex-wrap gap-1">
+                    {[
+                      { label: "30分", sec: 1800 },
+                      { label: "60分", sec: 3600 },
+                      { label: "90分", sec: 5400 },
+                      { label: "120分", sec: 7200 },
+                      { label: "180分", sec: 10800 },
+                    ].map((preset) => (
+                      <Button
+                        key={preset.sec}
+                        type="button"
+                        variant={editTimeout === preset.sec ? "default" : "outline"}
+                        size="sm"
+                        className="h-6 px-2 text-[11px]"
+                        onClick={() => setEditTimeout(preset.sec)}
+                      >
+                        {preset.label}
+                      </Button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+              <DialogFooter>
+                <Button variant="outline" onClick={() => setSettingsOpen(false)} disabled={savingSettings}>
+                  取消
+                </Button>
+                <Button
+                  disabled={savingSettings}
+                  onClick={async () => {
+                    setSavingSettings(true);
+                    try {
+                      await api.benchmarkUpdateSession(session.id, {
+                        max_concurrent: editConcurrent,
+                        per_challenge_timeout: editTimeout,
+                      });
+                      await load();
+                      toast.success(`已更新并发=${editConcurrent}，单题预算=${editTimeout}s (${Math.round(editTimeout / 60)}分钟)`);
+                      setSettingsOpen(false);
+                    } catch (err) {
+                      toast.error(err instanceof Error ? err.message : "更新失败");
+                    } finally {
+                      setSavingSettings(false);
+                    }
+                  }}
+                >
+                  {savingSettings ? "保存中..." : "保存设置"}
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
           <Button
             variant="outline"
             size="sm"
@@ -410,37 +527,69 @@ function BenchmarkDetailInner() {
                       )}
                     </td>
                     <td className="py-2.5 pr-3">
-                      {c.is_completed ? (
-                        <Badge
-                          variant="default"
-                          className="border-emerald-500/30 bg-emerald-500/15 text-[10px] text-emerald-600 hover:bg-emerald-500/15 dark:text-emerald-400"
-                        >
-                          已完成
-                        </Badge>
-                      ) : c.last_error ? (
-                        <Badge variant="destructive" className="text-[10px]">
-                          异常
-                        </Badge>
-                      ) : active ? (
-                        <Badge variant="default" className="text-[10px]">
-                          求解中
-                        </Badge>
-                      ) : isChallengeInterrupted(c) ? (
-                        <Badge
-                          variant="secondary"
-                          className="border-amber-500/30 bg-amber-500/15 text-[10px] text-amber-700 dark:text-amber-300"
-                        >
-                          已中断 ({c.bound_task_status})
-                        </Badge>
-                      ) : isNoFlagChallenge(c) ? (
-                        <Badge variant="secondary" className="text-[10px] text-muted-foreground">
-                          无Flag跳过
-                        </Badge>
-                      ) : (
-                        <Badge variant="outline" className="text-[10px] text-muted-foreground">
-                          待调度
-                        </Badge>
-                      )}
+                      {(() => {
+                        const retrySec = c.next_retry_at
+                          ? Math.max(0, Math.ceil((Date.parse(c.next_retry_at) - nowMs) / 1000))
+                          : 0;
+                        if (c.is_completed) {
+                          return (
+                            <Badge
+                              variant="default"
+                              className="border-emerald-500/30 bg-emerald-500/15 text-[10px] text-emerald-600 hover:bg-emerald-500/15 dark:text-emerald-400"
+                            >
+                              已完成
+                            </Badge>
+                          );
+                        }
+                        if (c.next_retry_at) {
+                          return (
+                            <Badge
+                              variant="secondary"
+                              className="border-sky-500/30 bg-sky-500/15 text-[10px] text-sky-700 dark:text-sky-300"
+                            >
+                              {retrySec > 0
+                                ? `冷却重排 (${retrySec}s · ${c.auto_retry_count ?? 1}/3)`
+                                : "即将重排"}
+                            </Badge>
+                          );
+                        }
+                        if (c.last_error) {
+                          return (
+                            <Badge variant="destructive" className="text-[10px]">
+                              异常
+                            </Badge>
+                          );
+                        }
+                        if (active) {
+                          return (
+                            <Badge variant="default" className="text-[10px]">
+                              求解中
+                            </Badge>
+                          );
+                        }
+                        if (isChallengeInterrupted(c)) {
+                          return (
+                            <Badge
+                              variant="secondary"
+                              className="border-amber-500/30 bg-amber-500/15 text-[10px] text-amber-700 dark:text-amber-300"
+                            >
+                              已中断 ({c.bound_task_status})
+                            </Badge>
+                          );
+                        }
+                        if (isNoFlagChallenge(c)) {
+                          return (
+                            <Badge variant="secondary" className="text-[10px] text-muted-foreground">
+                              无Flag跳过
+                            </Badge>
+                          );
+                        }
+                        return (
+                          <Badge variant="outline" className="text-[10px] text-muted-foreground">
+                            待调度
+                          </Badge>
+                        );
+                      })()}
                     </td>
                     <td className="py-2.5 pr-3">
                       <Badge variant="outline" className="mr-1 text-[10px]">
@@ -506,8 +655,24 @@ function BenchmarkDetailInner() {
                             任务 #{c.bound_task_id}
                             <ExternalLinkIcon className="h-3 w-3" />
                           </Link>
+                        ) : (c.history_task_ids?.length ?? 0) > 0 ? (
+                          <Link
+                            href={`/function/tasks/detail?id=${c.history_task_ids![c.history_task_ids!.length - 1]}`}
+                            className="inline-flex items-center gap-1 text-muted-foreground hover:text-primary hover:underline"
+                          >
+                            上次 #{c.history_task_ids![c.history_task_ids!.length - 1]}
+                            <ExternalLinkIcon className="h-3 w-3" />
+                          </Link>
                         ) : (
                           <span className="text-muted-foreground">{c.is_completed ? "—" : "待调度"}</span>
+                        )}
+                        {(c.history_task_ids?.length ?? 0) > 1 && (
+                          <span
+                            className="text-[10px] text-muted-foreground"
+                            title={`已关联前序任务：${c.history_task_ids!.map((id) => `#${id}`).join(", ")}`}
+                          >
+                            (记忆链×{c.history_task_ids!.length})
+                          </span>
                         )}
                         {c.hint_used && (
                           <span title={c.hint_content || "已用 Hint"}>

@@ -93,7 +93,7 @@ export default function BenchmarkListPage() {
   const [stageId, setStageId] = React.useState("");
   const [inviteCode, setInviteCode] = React.useState("");
   const [maxConcurrent, setMaxConcurrent] = React.useState(3);
-  const [perTimeout, setPerTimeout] = React.useState(1500);
+  const [perTimeout, setPerTimeout] = React.useState(5400);
   const [hintPolicy, setHintPolicy] = React.useState<"never" | "stagnant_only">("stagnant_only");
   const [insecureTls, setInsecureTls] = React.useState(false);
   const [vpnConfig, setVpnConfig] = React.useState("");
@@ -511,14 +511,38 @@ export default function BenchmarkListPage() {
                 />
               </div>
               <div className="space-y-2">
-                <Label className="text-xs font-medium">单题预算超时 (秒)</Label>
+                <div className="flex items-center justify-between gap-2">
+                  <Label className="text-xs font-medium">
+                    单题预算超时 (秒 · 约 {Math.round(perTimeout / 60)} 分钟)
+                  </Label>
+                </div>
                 <Input
                   type="number"
                   min={60}
-                  max={7200}
+                  max={14400}
                   value={perTimeout}
-                  onChange={(e) => setPerTimeout(Math.max(60, Number(e.target.value) || 1500))}
+                  onChange={(e) => setPerTimeout(Math.min(14400, Math.max(60, Number(e.target.value) || 5400)))}
                 />
+                <div className="flex flex-wrap gap-1">
+                  {[
+                    { label: "30分", sec: 1800 },
+                    { label: "60分", sec: 3600 },
+                    { label: "90分", sec: 5400 },
+                    { label: "120分", sec: 7200 },
+                    { label: "180分", sec: 10800 },
+                  ].map((preset) => (
+                    <Button
+                      key={preset.sec}
+                      type="button"
+                      variant={perTimeout === preset.sec ? "default" : "outline"}
+                      size="sm"
+                      className="h-6 px-2 text-[11px]"
+                      onClick={() => setPerTimeout(preset.sec)}
+                    >
+                      {preset.label}
+                    </Button>
+                  ))}
+                </div>
               </div>
               <div className="space-y-2">
                 <Label className="text-xs font-medium">Hint 获取策略</Label>

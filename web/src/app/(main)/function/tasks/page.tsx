@@ -1347,6 +1347,13 @@ function TaskNameEditor({ task, onRename }: { task: Task; onRename: (task: Task,
       </Link>
       {task.mode === "ctf" && <Badge variant="secondary" className="shrink-0 text-[10px]">CTF · {(task.challenge_type || "auto").toUpperCase()}</Badge>}
       {task.mode === "ad" && <Badge variant="secondary" className="shrink-0 text-[10px] border-rose-500/30 bg-rose-500/10 text-rose-700 dark:text-rose-300">AD · {(task.challenge_type || "auto").toUpperCase()}</Badge>}
+      {task.benchmark_session_id != null && (
+        <Link href={`/benchmark/detail?id=${task.benchmark_session_id}`} className="shrink-0">
+          <Badge variant="outline" className="border-amber-500/40 text-[10px] text-amber-600 hover:bg-amber-500/10 dark:text-amber-400">
+            测评 #{task.benchmark_session_id}
+          </Badge>
+        </Link>
+      )}
       {(task.mode === "ctf" || task.mode === "ad") && task.ctf_vpn_enabled && <Badge variant="outline" className="shrink-0 text-[10px] text-emerald-600 border-emerald-500/40">VPN</Badge>}
       <Button
         type="button"

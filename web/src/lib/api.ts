@@ -1543,6 +1543,10 @@ export const api = {
   },
 
   benchmarkGetSession: (id: number | string) => get<BenchmarkDetailResponse>(`/benchmarks/${id}`),
+  benchmarkUpdateSession: (
+    id: number | string,
+    payload: { max_concurrent?: number; per_challenge_timeout?: number },
+  ) => http<BenchmarkSession>(`/benchmarks/${id}`, { method: "PATCH", body: JSON.stringify(payload) }),
   benchmarkStartSession: (id: number | string) => post<BenchmarkSession>(`/benchmarks/${id}/start`),
   benchmarkStopSession: (id: number | string) => post<BenchmarkSession>(`/benchmarks/${id}/stop`),
   benchmarkSyncSession: (id: number | string) =>

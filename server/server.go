@@ -1081,9 +1081,6 @@ func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
 	archiveBlockers, _ := s.m.PG().TaskArchiveBlockers()
 	dtos := make([]TaskDTO, 0, len(list))
 	for _, t := range list {
-		if t.BenchmarkSessionID != nil {
-			continue
-		}
 		dto := taskDTO(t, s.resolvedTaskStatus(t))
 		dto.InputsBlockedReason = s.taskInputsBlockReason(t)
 		applyTaskArchiveBlocker(&dto, archiveBlockers)

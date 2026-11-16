@@ -1785,7 +1785,7 @@ CREATE TABLE IF NOT EXISTS benchmark_sessions (
     config_json             JSONB NOT NULL DEFAULT '{}'::jsonb,
     max_concurrent          INTEGER NOT NULL DEFAULT 3,
     hint_policy             TEXT NOT NULL DEFAULT 'never', -- never | stagnant_only
-    per_challenge_timeout   INTEGER NOT NULL DEFAULT 1500,
+    per_challenge_timeout   INTEGER NOT NULL DEFAULT 5400,
     llm_profile_ids         BIGINT[] NOT NULL DEFAULT '{}',
     status                  TEXT NOT NULL DEFAULT 'created', -- created | running | paused | completed | expired | stopped | failed
     total_score             INTEGER NOT NULL DEFAULT 0,
@@ -1828,13 +1828,19 @@ CREATE TABLE IF NOT EXISTS benchmark_challenges (
     hint_used             BOOLEAN NOT NULL DEFAULT FALSE,
     hint_content          TEXT NOT NULL DEFAULT '',
     bound_task_id         BIGINT REFERENCES tasks(id) ON DELETE SET NULL,
+    history_task_ids      BIGINT[] NOT NULL DEFAULT '{}',
     attempt_count         INTEGER NOT NULL DEFAULT 0,
+    next_retry_at         TIMESTAMPTZ,
+    auto_retry_count      INTEGER NOT NULL DEFAULT 0,
     meta_json             JSONB NOT NULL DEFAULT '{}'::jsonb,
     last_error            TEXT NOT NULL DEFAULT '',
     created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (session_id, unique_code)
 );
+ALTER TABLE benchmark_challenges ADD COLUMN IF NOT EXISTS history_task_ids BIGINT[] NOT NULL DEFAULT '{}';
+ALTER TABLE benchmark_challenges ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMPTZ;
+ALTER TABLE benchmark_challenges ADD COLUMN IF NOT EXISTS auto_retry_count INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_benchmark_challenges_session ON benchmark_challenges(session_id, id);
 CREATE INDEX IF NOT EXISTS idx_benchmark_challenges_task ON benchmark_challenges(bound_task_id) WHERE bound_task_id IS NOT NULL;
 

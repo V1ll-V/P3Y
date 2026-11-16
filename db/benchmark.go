@@ -68,8 +68,11 @@ type BenchmarkChallenge struct {
 	HintContent      string              `json:"hint_content,omitempty"`
 	BoundTaskID      *int64              `json:"bound_task_id,omitempty"`
 	BoundTaskStatus  string              `json:"bound_task_status,omitempty"`
+	HistoryTaskIDs   []int64             `json:"history_task_ids"`
 	Tokens           BenchmarkTokenUsage `json:"tokens"`
 	AttemptCount     int                 `json:"attempt_count"`
+	NextRetryAt      *time.Time          `json:"next_retry_at,omitempty"`
+	AutoRetryCount   int                 `json:"auto_retry_count"`
 	Meta             json.RawMessage     `json:"meta"`
 	LastError        string              `json:"last_error,omitempty"`
 	CreatedAt        time.Time           `json:"created_at"`
@@ -210,7 +213,13 @@ func (d *DB) CreateBenchmarkSession(ctx context.Context, in BenchmarkSessionCrea
 	}
 	timeoutSec := in.PerChallengeTimeout
 	if timeoutSec <= 0 {
-		timeoutSec = 1500
+		timeoutSec = 5400
+	}
+	if timeoutSec < 60 {
+		timeoutSec = 60
+	}
+	if timeoutSec > 14400 {
+		timeoutSec = 14400
 	}
 	cfg := in.Config
 	if len(cfg) == 0 {
@@ -276,6 +285,29 @@ func (d *DB) UpdateBenchmarkSessionMaxConcurrent(ctx context.Context, id int64, 
 	}
 	_, err := d.ExecContext(ctx, `UPDATE benchmark_sessions SET max_concurrent=$2 WHERE id=$1`, id, maxConc)
 	return err
+}
+
+func (d *DB) UpdateBenchmarkSessionSettings(ctx context.Context, id int64, maxConc, perChallengeTimeout int) error {
+	if maxConc > 0 {
+		if maxConc > 16 {
+			maxConc = 16
+		}
+		if _, err := d.ExecContext(ctx, `UPDATE benchmark_sessions SET max_concurrent=$2 WHERE id=$1`, id, maxConc); err != nil {
+			return err
+		}
+	}
+	if perChallengeTimeout > 0 {
+		if perChallengeTimeout < 60 {
+			perChallengeTimeout = 60
+		}
+		if perChallengeTimeout > 14400 {
+			perChallengeTimeout = 14400
+		}
+		if _, err := d.ExecContext(ctx, `UPDATE benchmark_sessions SET per_challenge_timeout=$2 WHERE id=$1`, id, perChallengeTimeout); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (d *DB) DeleteBenchmarkSession(ctx context.Context, id int64) error {
@@ -399,20 +431,22 @@ func (d *DB) RecomputeBenchmarkSessionAggregates(ctx context.Context, sessionID 
 	return tx.Commit()
 }
 
-const benchChallengeCols = `bc.id,bc.session_id,bc.unique_code,bc.title,bc.description,bc.category,bc.difficulty,bc.level,bc.submission_type,bc.total_score,bc.cumulative_score,bc.flag_count,bc.correct_flag_count,bc.is_completed,bc.container_status,bc.container_addr,bc.env_expires_at,bc.hint_used,bc.hint_content,bc.bound_task_id,COALESCE(t.status, ''),bc.attempt_count,bc.meta_json,bc.last_error,bc.created_at,bc.updated_at`
+const benchChallengeCols = `bc.id,bc.session_id,bc.unique_code,bc.title,bc.description,bc.category,bc.difficulty,bc.level,bc.submission_type,bc.total_score,bc.cumulative_score,bc.flag_count,bc.correct_flag_count,bc.is_completed,bc.container_status,bc.container_addr,bc.env_expires_at,bc.hint_used,bc.hint_content,bc.bound_task_id,COALESCE(t.status, ''),COALESCE(bc.history_task_ids,'{}')::text,bc.attempt_count,bc.next_retry_at,bc.auto_retry_count,bc.meta_json,bc.last_error,bc.created_at,bc.updated_at`
 const benchChallengeFrom = `benchmark_challenges bc LEFT JOIN tasks t ON t.id = bc.bound_task_id AND t.deleted_at IS NULL`
 
 func scanBenchmarkChallenge(sc interface{ Scan(...any) error }) (*BenchmarkChallenge, error) {
 	var c BenchmarkChallenge
 	var addrs, meta []byte
+	var histRaw string
 	if err := sc.Scan(
 		&c.ID, &c.SessionID, &c.UniqueCode, &c.Title, &c.Description, &c.Category, &c.Difficulty, &c.Level,
 		&c.SubmissionType, &c.TotalScore, &c.CumulativeScore, &c.FlagCount, &c.CorrectFlagCount, &c.IsCompleted,
 		&c.ContainerStatus, &addrs, &c.EnvExpiresAt, &c.HintUsed, &c.HintContent, &c.BoundTaskID, &c.BoundTaskStatus,
-		&c.AttemptCount, &meta, &c.LastError, &c.CreatedAt, &c.UpdatedAt,
+		&histRaw, &c.AttemptCount, &c.NextRetryAt, &c.AutoRetryCount, &meta, &c.LastError, &c.CreatedAt, &c.UpdatedAt,
 	); err != nil {
 		return nil, err
 	}
+	c.HistoryTaskIDs = parsePGInt64Array(histRaw)
 	_ = json.Unmarshal(addrs, &c.ContainerAddr)
 	if c.ContainerAddr == nil {
 		c.ContainerAddr = []string{}
@@ -466,18 +500,120 @@ func (d *DB) FindBenchmarkByTaskID(ctx context.Context, taskID int64) (*Benchmar
 }
 
 func (d *DB) BindBenchmarkChallengeTask(ctx context.Context, sessionID int64, uniqueCode string, taskID int64) error {
-	_, err := d.ExecContext(ctx, `UPDATE benchmark_challenges SET bound_task_id=$3, attempt_count=attempt_count+1, last_error='' WHERE session_id=$1 AND unique_code=$2`, sessionID, uniqueCode, taskID)
+	var histRaw string
+	err := d.QueryRowContext(ctx, `SELECT COALESCE(history_task_ids,'{}')::text FROM benchmark_challenges WHERE session_id=$1 AND unique_code=$2`, sessionID, uniqueCode).Scan(&histRaw)
+	if err != nil {
+		return err
+	}
+	existing := parsePGInt64Array(histRaw)
+	merged := make([]int64, 0, len(existing)+1)
+	for _, id := range existing {
+		if id > 0 && id != taskID {
+			merged = append(merged, id)
+		}
+	}
+	if taskID > 0 {
+		merged = append(merged, taskID)
+	}
+	if len(merged) > MaxTaskSourceCount {
+		merged = merged[len(merged)-MaxTaskSourceCount:]
+	}
+	_, err = d.ExecContext(ctx, `UPDATE benchmark_challenges SET bound_task_id=$3, history_task_ids=$4::bigint[], attempt_count=attempt_count+1, next_retry_at=NULL, last_error='' WHERE session_id=$1 AND unique_code=$2`,
+		sessionID, uniqueCode, taskID, formatPGInt64Array(merged))
+	return err
+}
+
+// ResolveChallengeSourceTaskIDs returns live, non-deleted prior task IDs (up to MaxTaskSourceCount,
+// most recent kept) associated with this challenge so relaunched tasks inherit prior exploration memory.
+func (d *DB) ResolveChallengeSourceTaskIDs(ctx context.Context, sessionID int64, uniqueCode string, historyIDs []int64, boundTaskID *int64) ([]int64, error) {
+	seen := map[int64]bool{}
+	var candidates []int64
+	add := func(id int64) {
+		if id > 0 && !seen[id] {
+			seen[id] = true
+			candidates = append(candidates, id)
+		}
+	}
+	for _, id := range historyIDs {
+		add(id)
+	}
+	if boundTaskID != nil {
+		add(*boundTaskID)
+	}
+	prefix := "[" + uniqueCode + "] "
+	rows, err := d.QueryContext(ctx, `
+SELECT id FROM tasks
+WHERE benchmark_session_id=$1 AND deleted_at IS NULL AND LEFT(COALESCE(name,''), char_length($2))=$2
+ORDER BY id ASC`, sessionID, prefix)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var tid int64
+			if rows.Scan(&tid) == nil {
+				add(tid)
+			}
+		}
+	}
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	liveRows, err := d.QueryContext(ctx, `SELECT id FROM tasks WHERE id = ANY($1::bigint[]) AND deleted_at IS NULL ORDER BY id ASC`, formatPGInt64Array(candidates))
+	if err != nil {
+		return nil, err
+	}
+	defer liveRows.Close()
+	var live []int64
+	for liveRows.Next() {
+		var tid int64
+		if liveRows.Scan(&tid) == nil && tid > 0 {
+			live = append(live, tid)
+		}
+	}
+	if len(live) > MaxTaskSourceCount {
+		live = live[len(live)-MaxTaskSourceCount:]
+	}
+	return live, liveRows.Err()
+}
+
+// ScheduleBenchmarkChallengeRetry records a cooldown retry deadline and increments
+// auto_retry_count when a challenge fails or times out. When nextRetryAt is nil,
+// it marks the challenge as having exhausted automatic retries.
+func (d *DB) ScheduleBenchmarkChallengeRetry(ctx context.Context, sessionID int64, uniqueCode string, nextRetryAt *time.Time, autoRetryCount int, lastErr string) error {
+	_, err := d.ExecContext(ctx, `
+UPDATE benchmark_challenges
+SET next_retry_at = $3,
+    auto_retry_count = $4,
+    last_error = $5
+WHERE session_id = $1 AND unique_code = $2 AND is_completed = false`,
+		sessionID, uniqueCode, nextRetryAt, autoRetryCount, lastErr)
+	return err
+}
+
+// RequeueBenchmarkChallengeFromCooldown clears the previous failed/timed-out binding
+// once its retry cooldown has elapsed while preserving history_task_ids and auto_retry_count.
+func (d *DB) RequeueBenchmarkChallengeFromCooldown(ctx context.Context, sessionID int64, uniqueCode string) error {
+	_, err := d.ExecContext(ctx, `
+UPDATE benchmark_challenges
+SET bound_task_id = NULL,
+    last_error = '',
+    next_retry_at = NULL,
+    container_status = 'stopped',
+    container_addr = '[]'::jsonb,
+    env_expires_at = NULL
+WHERE session_id = $1 AND unique_code = $2 AND is_completed = false`, sessionID, uniqueCode)
 	return err
 }
 
 // ResetBenchmarkChallengeForRetry clears an incomplete challenge's bound failed/interrupted
 // task reference and resets attempt_count to 0 so the scheduler re-fetches full detail
-// and re-queues it promptly.
+// and re-queues it promptly (preserving history_task_ids for memory inheritance).
 func (d *DB) ResetBenchmarkChallengeForRetry(ctx context.Context, sessionID int64, uniqueCode string) error {
 	_, err := d.ExecContext(ctx, `
 UPDATE benchmark_challenges
 SET bound_task_id = NULL,
     attempt_count = 0,
+    auto_retry_count = 0,
+    next_retry_at = NULL,
     last_error = '',
     container_status = 'stopped',
     container_addr = '[]'::jsonb,
@@ -487,12 +623,15 @@ WHERE session_id = $1 AND unique_code = $2 AND is_completed = false`, sessionID,
 }
 
 // ResetFailedBenchmarkChallenges re-queues every incomplete challenge in sessionID whose
-// bound sub-task already terminated (failed/stopped/cancelled/done) or vanished.
+// bound sub-task already terminated (failed/stopped/cancelled/done/timeout) or vanished,
+// preserving history_task_ids so relaunched tasks inherit prior exploration memory.
 func (d *DB) ResetFailedBenchmarkChallenges(ctx context.Context, sessionID int64) (int64, error) {
 	res, err := d.ExecContext(ctx, `
 UPDATE benchmark_challenges bc
 SET bound_task_id = NULL,
     attempt_count = 0,
+    auto_retry_count = 0,
+    next_retry_at = NULL,
     last_error = '',
     container_status = 'stopped',
     container_addr = '[]'::jsonb,
@@ -501,6 +640,7 @@ WHERE bc.session_id = $1
   AND bc.is_completed = false
   AND (
     bc.last_error <> ''
+    OR bc.next_retry_at IS NOT NULL
     OR (
       bc.bound_task_id IS NOT NULL
       AND COALESCE((SELECT t.status FROM tasks t WHERE t.id = bc.bound_task_id AND t.deleted_at IS NULL), 'failed')
@@ -531,7 +671,7 @@ WHERE session_id=$1 AND unique_code=$2`, sessionID, uniqueCode, status, rawAddrs
 // challenges once a slot opens or a session resumes/reclaims leaked environments.
 func (d *DB) ClearBenchmarkQuotaErrors(ctx context.Context, sessionID int64) error {
 	_, err := d.ExecContext(ctx, `
-UPDATE benchmark_challenges SET last_error = ''
+UPDATE benchmark_challenges SET last_error = '', next_retry_at = NULL
 WHERE session_id = $1 AND last_error ILIKE '%agent_environment_limit%'`, sessionID)
 	return err
 }
@@ -540,7 +680,7 @@ WHERE session_id = $1 AND last_error ILIKE '%agent_environment_limit%'`, session
 // network error stamps so recovered sessions schedule affected challenges normally.
 func (d *DB) ClearBenchmarkTransientErrors(ctx context.Context, sessionID int64) error {
 	_, err := d.ExecContext(ctx, `
-UPDATE benchmark_challenges SET last_error = ''
+UPDATE benchmark_challenges SET last_error = '', next_retry_at = NULL
 WHERE session_id = $1
   AND last_error <> ''
   AND (

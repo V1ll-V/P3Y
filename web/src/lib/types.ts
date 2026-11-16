@@ -46,6 +46,7 @@ export interface Task {
   llm_failover_state?: "default" | "ready" | "chain_exhausted" | string;
   llm_failover_reason?: string;
   source_task_ids?: string[]; // directly related tasks inherited as read-only context
+  benchmark_session_id?: number; // present when created by a benchmark session
   archive_blocked_by_task_id?: string; // live direct dependent that must be archived first
   company_ids?: number[]; // associated company scopes; current company assets join the task at creation
   coverage_enabled?: boolean; // 资产覆盖度功能开关(创建时定,默认开)；false=不计算/不展示覆盖度
@@ -2004,8 +2005,11 @@ export interface BenchmarkChallenge {
   hint_content?: string;
   bound_task_id?: number;
   bound_task_status?: string;
+  history_task_ids?: number[];
   tokens?: BenchmarkTokenUsage;
   attempt_count: number;
+  next_retry_at?: string;
+  auto_retry_count?: number;
   meta: {
     has_container?: boolean;
     files?: Array<{ id: string; name: string; kind?: string; url?: string; size?: number }>;
