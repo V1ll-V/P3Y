@@ -456,7 +456,8 @@ func mapCTF2Challenge(item map[string]any, compID, stageID, pgID string) Challen
 	title := firstNonEmpty(anyString(item["title"]), anyString(item["name"]))
 	desc := anyString(item["description"])
 	cat := strings.TrimSpace(anyString(item["category"]))
-	diff := anyString(item["difficulty"])
+	diff := firstNonEmpty(anyString(item["difficulty"]), anyString(item["difficulty_name"]), anyString(item["difficulty_level"]))
+	lvl := anyInt(item["level"])
 	score := firstNonZero(anyInt(item["score"]), anyInt(item["total_score"]), anyInt(item["points"]))
 	cumScore := firstNonZero(anyInt(item["cumulative_score"]), anyInt(item["earned_points"]))
 	subType := strings.ToLower(anyString(item["submission_type"]))
@@ -549,6 +550,7 @@ func mapCTF2Challenge(item map[string]any, compID, stageID, pgID string) Challen
 		Description:         desc,
 		Category:            normCat,
 		Difficulty:          diff,
+		Level:               lvl,
 		SubmissionType:      subType,
 		TotalScore:          score,
 		CumulativeScore:     cumScore,

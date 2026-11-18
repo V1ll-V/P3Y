@@ -263,6 +263,23 @@ func (d *DB) UpdateBoardItemVerification(ctx context.Context, taskID, id int64, 
 	return err
 }
 
+// PatchBoardItemMeta merges metaPatch into a board item's meta_json without altering verified/check_cmd.
+func (d *DB) PatchBoardItemMeta(ctx context.Context, taskID, id int64, metaPatch map[string]any) error {
+	if d == nil || taskID <= 0 || id <= 0 || len(metaPatch) == 0 {
+		return nil
+	}
+	patchBytes, err := json.Marshal(metaPatch)
+	if err != nil {
+		return err
+	}
+	_, err = d.ExecContext(ctx, `
+		UPDATE board_items
+		SET meta_json=COALESCE(meta_json, '{}'::jsonb) || $3::jsonb
+		WHERE task_id=$1 AND id=$2
+	`, taskID, id, string(patchBytes))
+	return err
+}
+
 // RecordRewindAndDeadend increments rewind_count in the savepoint's meta_json and attaches a deadend child.
 func (d *DB) RecordRewindAndDeadend(ctx context.Context, taskID, savepointID int64, title, reason, detail string) (*BoardItem, int, error) {
 	sp, err := d.GetBoardItem(ctx, taskID, savepointID)

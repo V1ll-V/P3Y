@@ -430,7 +430,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		settle = &harness.Settlement{Prompt: ctfSettlePrompt, MaxTurns: 1, DisabledTools: ctfExecutionTools}
 	}
 	opts := agentcore.Options{
-		Provider:        p.prov,
+		Provider:        withRoleThinking(p.prov, "planner", "", false),
 		SystemPrompt:    system,
 		DynamicBoundary: boundary,
 		Tools:           tools,

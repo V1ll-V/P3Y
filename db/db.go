@@ -211,6 +211,11 @@ var builtinAgents = []builtinAgent{
 	{"auto", "Auto", "assistant", "平台操作助手：用工具管理任务(建/看/暂停/给提示)与资产，并可创建/修改 skill、自定义工具、MCP。", nil, false, nil},
 	// 渗透测试:内置「独立渗透」agent。经对话页驱动,一人从侦察到收尾走完整条渗透链,自己规划自己执行自己验证。默认开启交互式 shell。
 	{"pentest", "渗透测试", "assistant", "独立渗透 agent：一人从侦察→找攻击面→深入利用→验证→收尾走完整条链，自己规划、自己执行、自己对抗式验证。", nil, true, intp(0)},
+	// CTF / 攻坚子角色（仅用于按分工配置思维强度与默认模型；工具集由运行时按所属主角色装配）。
+	{"worker_recon", "前置侦察（Recon）", "worker", "CTF Pwn/RE 前置侦察阶段（phase=recon）：解包、保护检查与远程握手，快速采集 fact。", nil, false, nil},
+	{"helper", "旁路协查（Helper）", "worker", "主攻手通过 ask_helper 派生的短生命周期帮手：承担大量反编译、符号搜寻与脚手架脏活。", nil, false, nil},
+	{"critic", "反向证伪（Critic）", "assistant", "连续失败或停滞时触发的独立挑刺官：基于失败样本做反向证伪并建议最小对照实验。", nil, false, nil},
+	{"plateau_fork", "停滞分叉（Fork）", "worker", "同一存档点多次回滚停滞后由 plateau_fork 派生的并发假设分支执行者。", nil, false, nil},
 }
 
 // seedBuiltins inserts the fixed built-in agents and their variable catalog (idempotent).
@@ -251,6 +256,26 @@ ON CONFLICT (agent_id, var_name) DO UPDATE
 			return fmt.Errorf("seed interactive_shell defaults: %w", err)
 		}
 		_ = d.SetSetting("interactive_shell_default_v1", "true")
+	}
+	// Seed default per-role thinking intensity ONCE — respects later user edits in UI.
+	// Heavy mechanical roles (goals/worker_recon/helper) default to thinking disabled,
+	// planner defaults to low effort, plateau_fork defaults to medium effort, critic
+	// defaults to high effort, while worker/mainagent/auto/pentest stay empty (inherit profile).
+	if v, _, _ := d.GetSetting("agent_thinking_defaults_v1"); v != "true" {
+		defaults := []struct{ key, tt, re string }{
+			{"goals", "disabled", ""},
+			{"planner", "enabled", "low"},
+			{"worker_recon", "disabled", ""},
+			{"helper", "disabled", ""},
+			{"plateau_fork", "enabled", "medium"},
+			{"critic", "enabled", "high"},
+		}
+		for _, def := range defaults {
+			if _, err := d.Exec(`UPDATE agents SET thinking_type=$1, reasoning_effort=$2 WHERE key=$3 AND thinking_type='' AND reasoning_effort=''`, def.tt, def.re, def.key); err != nil {
+				return fmt.Errorf("seed agent thinking defaults (%s): %w", def.key, err)
+			}
+		}
+		_ = d.SetSetting("agent_thinking_defaults_v1", "true")
 	}
 	// Seed the built-in browser (Playwright) MCP once — DISABLED by default (用户
 	// 需要时自行启用), no proxy by default. The traffic-capture toggle injects/strips

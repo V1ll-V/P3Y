@@ -14,6 +14,7 @@ import (
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
+	"github.com/Autumn-27/norma/transcript"
 )
 
 type (
@@ -258,8 +259,9 @@ func (w *Worker) runCTFPlateauFork(ctx context.Context, as *db.AssetStore, ts *d
 			bCtx := WithRunInfo(forkCtx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts), IntentID: intentID})
 			bCtx = WithCTFProxy(bCtx, w.proxyAddr, w.proxyCACert)
 			bCtx = context.WithValue(bCtx, ctfForkSubKey{}, true)
+			bCtx = transcript.WithSessionID(bCtx, fmt.Sprintf("exp%d-fork-%s-i%d", explorationID(ts), spec.Name, intentID))
 			bCtx, base = ctfBase(bCtx, w.workDir, ts, taskID, intentID, base)
-			tools, def, cleanup := AugmentTools(bCtx, "fork", base)
+			tools, def, cleanup := AugmentTools(bCtx, "worker", base)
 			defer cleanup()
 			tools = stripForkBranchTools(tools)
 
@@ -282,7 +284,7 @@ func (w *Worker) runCTFPlateauFork(ctx context.Context, as *db.AssetStore, ts *d
 			}
 
 			opts := agentcore.Options{
-				Provider:        w.prov,
+				Provider:        withRoleThinking(w.prov, "plateau_fork", "worker", true),
 				SystemPrompt:    system,
 				DynamicBoundary: boundary,
 				Tools:           tools,

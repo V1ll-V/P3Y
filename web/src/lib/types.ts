@@ -1220,6 +1220,9 @@ export interface Agent {
   trigger_run_mode?: "serial" | "parallel"; // 串行排队 / 每次触发各自并发一个会话
   trigger_merge_mode?: "by_task" | "all" | "none"; // 仅 serial：同任务合并 / 全部合并 / 不合并
   trigger_max_parallel?: number; // 仅 parallel：每 agent 并发上限；0=不限
+  // 按分工覆盖思维开关与强度("" = 跟随所属 LLM 配置)
+  thinking_type?: string;
+  reasoning_effort?: string;
   // 绑定数量(仅列表接口返回)：可见 MCP / 可见 Skill / 绑定工具
   mcp_count?: number;
   skill_count?: number;

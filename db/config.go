@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -462,14 +463,16 @@ type Agent struct {
 	TriggerRunMode     string `json:"trigger_run_mode"`
 	TriggerMergeMode   string `json:"trigger_merge_mode"`
 	TriggerMaxParallel int    `json:"trigger_max_parallel"`
+	ThinkingType       string `json:"thinking_type"`
+	ReasoningEffort    string `json:"reasoning_effort"`
 }
 
-const agentCols = `id,key,name,COALESCE(description,''),role,builtin,enabled,COALESCE(max_turns,0),COALESCE(run_seconds,600),COALESCE(web_search,false),COALESCE(interactive_shell,false),COALESCE(wrapup_prompt,''),COALESCE(wrapup_max_turns,0),COALESCE(task_timeout_wrapup_prompt,''),COALESCE(task_timeout_wrapup_max_turns,0),COALESCE(trigger_run_mode,'serial'),COALESCE(trigger_merge_mode,'all'),COALESCE(trigger_max_parallel,5),llm_profile_id`
+const agentCols = `id,key,name,COALESCE(description,''),role,builtin,enabled,COALESCE(max_turns,0),COALESCE(run_seconds,600),COALESCE(web_search,false),COALESCE(interactive_shell,false),COALESCE(wrapup_prompt,''),COALESCE(wrapup_max_turns,0),COALESCE(task_timeout_wrapup_prompt,''),COALESCE(task_timeout_wrapup_max_turns,0),COALESCE(trigger_run_mode,'serial'),COALESCE(trigger_merge_mode,'all'),COALESCE(trigger_max_parallel,5),COALESCE(thinking_type,''),COALESCE(reasoning_effort,''),llm_profile_id`
 
 func scanAgent(sc interface{ Scan(...any) error }) (*Agent, error) {
 	var a Agent
 	var prof sql.NullInt64 // llm_profile_id 可空:未绑定时为 NULL
-	err := sc.Scan(&a.ID, &a.Key, &a.Name, &a.Description, &a.Role, &a.Builtin, &a.Enabled, &a.MaxTurns, &a.RunSecs, &a.WebSearch, &a.InteractiveShell, &a.WrapupPrompt, &a.WrapupMaxTurns, &a.TaskTimeoutWrapupPrompt, &a.TaskTimeoutWrapupMaxTurns, &a.TriggerRunMode, &a.TriggerMergeMode, &a.TriggerMaxParallel, &prof)
+	err := sc.Scan(&a.ID, &a.Key, &a.Name, &a.Description, &a.Role, &a.Builtin, &a.Enabled, &a.MaxTurns, &a.RunSecs, &a.WebSearch, &a.InteractiveShell, &a.WrapupPrompt, &a.WrapupMaxTurns, &a.TaskTimeoutWrapupPrompt, &a.TaskTimeoutWrapupMaxTurns, &a.TriggerRunMode, &a.TriggerMergeMode, &a.TriggerMaxParallel, &a.ThinkingType, &a.ReasoningEffort, &prof)
 	if err == nil && prof.Valid {
 		v := prof.Int64
 		a.LLMProfileID = &v
@@ -699,6 +702,31 @@ func (d *DB) SetAgentTriggerBehavior(key, runMode, mergeMode string, maxParallel
 	}
 	_, err := d.Exec(`UPDATE agents SET trigger_run_mode=$1, trigger_merge_mode=$2, trigger_max_parallel=$3 WHERE key=$4`,
 		runMode, mergeMode, maxParallel, key)
+	return err
+}
+
+// NormalizeThinkingConfig validates and normalizes per-agent thinking overrides.
+// Empty values mean "inherit from LLM profile".
+func NormalizeThinkingConfig(thinkingType, reasoningEffort string) (string, string) {
+	switch strings.ToLower(strings.TrimSpace(thinkingType)) {
+	case "enabled", "disabled":
+		thinkingType = strings.ToLower(strings.TrimSpace(thinkingType))
+	default:
+		thinkingType = ""
+	}
+	switch strings.ToLower(strings.TrimSpace(reasoningEffort)) {
+	case "low", "medium", "high", "xhigh", "max":
+		reasoningEffort = strings.ToLower(strings.TrimSpace(reasoningEffort))
+	default:
+		reasoningEffort = ""
+	}
+	return thinkingType, reasoningEffort
+}
+
+// SetAgentThinking updates an agent's per-role thinking_type and reasoning_effort overrides.
+func (d *DB) SetAgentThinking(key, thinkingType, reasoningEffort string) error {
+	tt, re := NormalizeThinkingConfig(thinkingType, reasoningEffort)
+	_, err := d.Exec(`UPDATE agents SET thinking_type=$1, reasoning_effort=$2 WHERE key=$3`, tt, re, key)
 	return err
 }
 

@@ -142,7 +142,7 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	}
 	system, boundary := deferredSystem(sysBody+inputs, def)
 	opts := agentcore.Options{
-		Provider:        m.prov,
+		Provider:        withRoleThinking(m.prov, "mainagent", "", false),
 		SystemPrompt:    system,
 		DynamicBoundary: boundary,
 		Tools:           tools,

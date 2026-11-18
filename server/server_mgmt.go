@@ -367,6 +367,9 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 		TriggerRunMode     *string `json:"trigger_run_mode"`
 		TriggerMergeMode   *string `json:"trigger_merge_mode"`
 		TriggerMaxParallel *int    `json:"trigger_max_parallel"`
+		// 按角色/分工覆盖思维开关与强度（""=跟随 LLM 配置）。
+		ThinkingType    *string `json:"thinking_type"`
+		ReasoningEffort *string `json:"reasoning_effort"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -437,6 +440,19 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 			maxPar = *req.TriggerMaxParallel
 		}
 		if err := pg.SetAgentTriggerBehavior(a.Key, runMode, mergeMode, maxPar); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.ThinkingType != nil || req.ReasoningEffort != nil {
+		tt, re := a.ThinkingType, a.ReasoningEffort
+		if req.ThinkingType != nil {
+			tt = *req.ThinkingType
+		}
+		if req.ReasoningEffort != nil {
+			re = *req.ReasoningEffort
+		}
+		if err := pg.SetAgentThinking(a.Key, tt, re); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}

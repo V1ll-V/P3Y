@@ -106,5 +106,36 @@ func ctfNeuroTools(s *ctf.Service, task, intent int64) []actool.CoreTool {
 			b, _ := json.Marshal(res)
 			return actool.Text(string(b)), nil
 		}),
+
+		writeTool("http_race_probe", "使用线程 Barrier 预建连并同时并发齐射 HTTP 请求（2~40 并发），按状态码/长度/正文哈希聚类统计并发窗口内的竞态（Race Condition / TOCTOU）异常。", obj(map[string]any{
+			"url":             str("目标 URL"),
+			"method":          str("HTTP 方法：GET | POST | PUT | PATCH | DELETE | HEAD，默认有 body 时 POST"),
+			"headers":         map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}, "description": "请求头键值对"},
+			"body":            str("请求体文本"),
+			"cookies":         map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}, "description": "Cookie 键值对"},
+			"pre_url":         str("可选前置准备/重置请求的 URL（在并发齐射前先单次请求）"),
+			"pre_method":      str("可选前置请求方法"),
+			"pre_body":        str("可选前置请求正文"),
+			"concurrency":     intp("并发齐射请求数（2~40，默认 20）"),
+			"timeout_seconds": intp("单请求超时秒数（默认 10，最大 30）"),
+		}, "url"), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+			if s == nil {
+				return actool.Errorf("http_race_probe 仅在 CTF 沙箱上下文可用"), nil
+			}
+			var spec ctf.HTTPRaceProbeSpec
+			if err := json.Unmarshal(in, &spec); err != nil {
+				return actool.Errorf(fmt.Sprintf("参数解析失败: %v", err)), nil
+			}
+			cmd, timeout, err := ctf.BuildHTTPRaceProbeCommand(spec)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			e, err := s.Execute(ctx, task, intent, cmd, timeout)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			b, _ := json.Marshal(e)
+			return actool.Text(string(b)), nil
+		}),
 	}
 }

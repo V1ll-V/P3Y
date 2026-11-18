@@ -587,6 +587,8 @@ type AgentDTO struct {
 	TriggerRunMode     string `json:"trigger_run_mode"`
 	TriggerMergeMode   string `json:"trigger_merge_mode"`
 	TriggerMaxParallel int    `json:"trigger_max_parallel"`
+	ThinkingType       string `json:"thinking_type"`
+	ReasoningEffort    string `json:"reasoning_effort"`
 	// binding counts (populated only by the list endpoint) — shown on agent cards.
 	McpCount   int `json:"mcp_count"`
 	SkillCount int `json:"skill_count"`
@@ -610,6 +612,8 @@ func agentDTO(a *db.Agent) AgentDTO {
 		TriggerRunMode:     a.TriggerRunMode,
 		TriggerMergeMode:   a.TriggerMergeMode,
 		TriggerMaxParallel: a.TriggerMaxParallel,
+		ThinkingType:       a.ThinkingType,
+		ReasoningEffort:    a.ReasoningEffort,
 	}
 }
 

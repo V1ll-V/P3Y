@@ -18,6 +18,41 @@ import (
 
 type taskIDContextKey struct{}
 type workerContextKey struct{}
+type thinkingContextKey struct{}
+
+// ThinkingOverride holds per-call or per-role overrides for thinking_type and
+// reasoning_effort injected via context so a single shared Provider / rate-limiter
+// can run different agents at different reasoning intensities.
+type ThinkingOverride struct {
+	ThinkingType    string
+	ReasoningEffort string
+}
+
+// WithThinkingOverride attaches per-call thinking overrides to ctx. Empty fields
+// leave the underlying profile / request configuration untouched.
+func WithThinkingOverride(ctx context.Context, thinkingType, reasoningEffort string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	tt := strings.TrimSpace(thinkingType)
+	re := strings.TrimSpace(reasoningEffort)
+	if tt == "" && re == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, thinkingContextKey{}, ThinkingOverride{
+		ThinkingType:    tt,
+		ReasoningEffort: re,
+	})
+}
+
+// ThinkingOverrideFrom returns any per-call thinking override carried on ctx.
+func ThinkingOverrideFrom(ctx context.Context) ThinkingOverride {
+	if ctx == nil {
+		return ThinkingOverride{}
+	}
+	ov, _ := ctx.Value(thinkingContextKey{}).(ThinkingOverride)
+	return ov
+}
 
 // WithTaskID attaches the owning task registry id to an LLM call. Session ids
 // are based on exploration ids, which are not interchangeable with task ids.
@@ -143,7 +178,7 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 	reqBody := ""
 	var capt *Capture
 	if recordBodies {
-		reqBody = r.serializeRequest(req)
+		reqBody = r.serializeRequest(ctx, req)
 		ctx, capt = NewCapture(ctx)
 	}
 
@@ -236,7 +271,7 @@ func (r *Recorder) Complete(ctx context.Context, req llm.CompletionRequest) (llm
 	reqBody := ""
 	var capt *Capture
 	if recordBodies {
-		reqBody = r.serializeRequest(req)
+		reqBody = r.serializeRequest(ctx, req)
 		ctx, capt = NewCapture(ctx)
 	}
 
@@ -352,21 +387,31 @@ func (r *Recorder) record(req llm.CompletionRequest, session, taskID, worker, re
 }
 
 // serializeRequest builds a JSON representation of the completion request.
-func (r *Recorder) serializeRequest(req llm.CompletionRequest) string {
+func (r *Recorder) serializeRequest(ctx context.Context, req llm.CompletionRequest) string {
 	m := map[string]any{
 		"system":     req.System,
 		"messages":   req.Messages,
 		"max_tokens": req.MaxTokens,
 	}
-	// 记录本次调用实际发出的思考参数。type 采用「有效值」：每请求覆盖 req.Thinking
-	// 优先于配置级 thinkingType(与 norma buildBody 的判定一致，如 compaction 摘要会
-	// 强制 disabled)；effort 无每请求覆盖，直接取配置值。两者皆空则不写 thinking 字段。
+	// 记录本次调用实际发出的思考参数：优先级为 req.Thinking > ctx ThinkingOverride >
+	// 配置级 thinkingType；effort 优先级为 ctx ThinkingOverride > 配置级 reasoningEffort
+	// （若有效思考开关为 disabled 且未显式覆盖 effort，则不误记配置级 effort）。
+	ov := ThinkingOverrideFrom(ctx)
 	effType := r.thinkingType
+	if ov.ThinkingType != "" {
+		effType = ov.ThinkingType
+	}
 	if req.Thinking != "" {
 		effType = req.Thinking
 	}
-	if effType != "" || r.reasoningEffort != "" {
-		m["thinking"] = map[string]string{"type": effType, "effort": r.reasoningEffort}
+	effEffort := r.reasoningEffort
+	if ov.ReasoningEffort != "" {
+		effEffort = ov.ReasoningEffort
+	} else if effType == "disabled" {
+		effEffort = ""
+	}
+	if effType != "" || effEffort != "" {
+		m["thinking"] = map[string]string{"type": effType, "effort": effEffort}
 	}
 	if len(req.Tools) > 0 {
 		// Store tool names only (full schemas are huge).

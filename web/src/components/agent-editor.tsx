@@ -31,6 +31,21 @@ import type { Agent, AgentDetail, AgentTrigger, MCPServer, PromptVar, PromptVers
 // Traffic tools are host tools gated by the global 流量捕获 switch: bindable, but
 // only usable when capture is on. Keep this list in sync with traffic.SeedToolMetas.
 const TRAFFIC_TOOL_KEYS = new Set(["traffic_search", "traffic_get"]);
+const SUB_ROLE_KEYS = new Set(["worker_recon", "helper", "critic", "plateau_fork"]);
+const FOLLOW_PROFILE = "__follow__";
+const AGENT_THINKING_TYPES = [
+  { value: FOLLOW_PROFILE, label: "跟随 LLM 配置（默认）" },
+  { value: "disabled", label: "关闭（disabled）" },
+  { value: "enabled", label: "开启（enabled）" },
+];
+const AGENT_EFFORT_LEVELS = [
+  { value: FOLLOW_PROFILE, label: "跟随 LLM 配置（默认）" },
+  { value: "low", label: "low" },
+  { value: "medium", label: "medium" },
+  { value: "high", label: "high" },
+  { value: "xhigh", label: "xhigh" },
+  { value: "max", label: "max" },
+];
 
 // AgentEditor is the tabbed editor for one agent, used inside the agents-page
 // drawer (and reused full-page for deep links). Tabs: 配置与提示词 / MCP / Skill /
@@ -57,6 +72,8 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
   const [llmProfiles, setLlmProfiles] = React.useState<NonNullable<AgentDetail["llm_profiles"]>>([]);
   const [webSearch, setWebSearch] = React.useState(false);
   const [interactiveShell, setInteractiveShell] = React.useState(false);
+  const [thinkingType, setThinkingType] = React.useState(FOLLOW_PROFILE);
+  const [reasoningEffort, setReasoningEffort] = React.useState(FOLLOW_PROFILE);
   const [wrapup, setWrapup] = React.useState("");
   const [wrapupDefault, setWrapupDefault] = React.useState("");
   const [wrapupTurns, setWrapupTurns] = React.useState("0");
@@ -95,6 +112,8 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
         setLlmProfiles(d.llm_profiles ?? []);
         setWebSearch(!!d.agent?.web_search);
         setInteractiveShell(!!d.agent?.interactive_shell);
+        setThinkingType(d.agent?.thinking_type ? d.agent.thinking_type : FOLLOW_PROFILE);
+        setReasoningEffort(d.agent?.reasoning_effort ? d.agent.reasoning_effort : FOLLOW_PROFILE);
         setWrapup(d.wrapup_prompt ?? "");
         setWrapupDefault(d.wrapup_default ?? "");
         setWrapupTurns(String(d.wrapup_max_turns ?? 0));
@@ -181,8 +200,12 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
     try {
       // 只提交本 agent 实际展示的字段，避免把未显示项(如 goals 的 max_turns)覆盖成默认。
       const patch: Parameters<typeof api.saveAgentConfig>[1] = {
-        llm_profile_id: llmProfileId === "" ? null : Number(llmProfileId),
+        thinking_type: thinkingType === FOLLOW_PROFILE ? "" : thinkingType,
+        reasoning_effort: reasoningEffort === FOLLOW_PROFILE ? "" : reasoningEffort,
       };
+      if (showLLM) {
+        patch.llm_profile_id = llmProfileId === "" ? null : Number(llmProfileId);
+      }
       if (showConfig) {
         patch.max_turns = Math.max(0, Math.floor(Number(maxTurns) || 0));
         patch.run_seconds = Math.max(0, Math.floor(Number(runSecs) || 0));
@@ -192,6 +215,7 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
       await api.saveAgentConfig(agentKey, patch);
       toast.success("已保存运行配置（立即生效）");
       reload();
+      onSaved?.();
     } catch (e) {
       toast.error("保存失败：" + (e as Error).message);
     }
@@ -254,112 +278,153 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
   if (loaded && !detail) {
     return <div className="text-muted-foreground p-6 text-center text-sm">未找到 Agent：{agentKey}</div>;
   }
-  // config is meaningless for the conversational main agent and the fixed-budget
-  // goals decomposer; every other agent (workers, custom assistants) honors it.
-  const showConfig = agentKey !== "mainagent" && agentKey !== "goals";
-  // web search applies to every conversational/executing agent except the one-shot
-  // goals decomposer; it's gated by the global master switch.
-  const showWebSearch = agentKey !== "goals";
-  // interactive shell (持久 PTY 会话工具族) 同样对除 goals 外的 agent 开放;无全局门控。
-  const showInteractiveShell = agentKey !== "goals";
-  // 每个 agent(含 goals/mainagent)都跑在某个 LLM 上,故「默认模型」绑定对所有 agent 开放。
-  const showLLM = true;
+  const isSubRole = SUB_ROLE_KEYS.has(agentKey);
+  // config is meaningless for the conversational main agent, goals decomposer, and CTF sub-roles;
+  // every other agent (workers, custom assistants) honors it.
+  const showConfig = !isSubRole && agentKey !== "mainagent" && agentKey !== "goals";
+  // web search applies to every conversational/executing agent except goals & CTF sub-roles.
+  const showWebSearch = !isSubRole && agentKey !== "goals";
+  // interactive shell 同样对除 goals 与 CTF 子角色外的 agent 开放。
+  const showInteractiveShell = !isSubRole && agentKey !== "goals";
+  // 主角色支持绑定固定模型；CTF 子角色复用主任务模型池与限流器，仅按分工独立调节思维强度。
+  const showLLM = !isSubRole;
   // triggers (P3) only attach to custom agents.
   const isCustom = !!detail && !detail.agent?.builtin;
 
   return (
     <Tabs defaultValue="prompt" className="flex min-h-0 flex-1 flex-col">
       <TabsList className="mx-4 mt-2 w-fit">
-        <TabsTrigger value="prompt">配置与提示词</TabsTrigger>
-        <TabsTrigger value="wrapup">收尾提示词</TabsTrigger>
-        <TabsTrigger value="mcp">MCP</TabsTrigger>
-        <TabsTrigger value="skill">Skill</TabsTrigger>
-        <TabsTrigger value="tools">Tools</TabsTrigger>
+        <TabsTrigger value="prompt">{isSubRole ? "思维强度配置" : "配置与提示词"}</TabsTrigger>
+        {!isSubRole && <TabsTrigger value="wrapup">收尾提示词</TabsTrigger>}
+        {!isSubRole && <TabsTrigger value="mcp">MCP</TabsTrigger>}
+        {!isSubRole && <TabsTrigger value="skill">Skill</TabsTrigger>}
+        {!isSubRole && <TabsTrigger value="tools">Tools</TabsTrigger>}
         {isCustom && <TabsTrigger value="triggers">触发</TabsTrigger>}
       </TabsList>
 
       {/* 配置 + 提示词 */}
       <TabsContent value="prompt" className="min-h-0 flex-1 overflow-y-auto px-4 pb-4">
         <div className="grid gap-4">
-          {(showLLM || showConfig || showWebSearch || showInteractiveShell) && (
-            <div className="grid gap-3 rounded-md border p-3">
-              {showLLM && (
-                <div className="grid gap-1.5">
-                  <Label htmlFor="llm-profile" className="text-xs">默认模型（LLM 配置）</Label>
-                  <div className="flex flex-wrap items-center gap-3">
-                    <Select value={llmProfileId || "__follow__"} onValueChange={(v) => setLlmProfileId(v === "__follow__" ? "" : v)}>
-                      <SelectTrigger id="llm-profile" className="h-8 w-72">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="__follow__">跟随任务 / 全局激活配置</SelectItem>
-                        {llmProfiles.map((p) => (
-                          <SelectItem key={p.id} value={String(p.id)}>
-                            {p.name}（{p.model}）{p.is_default ? " · 默认" : ""}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                    <span className="text-muted-foreground max-w-md text-xs">
-                      为该 Agent 绑定固定 LLM 配置（点「保存配置」生效）。优先级：Agent 绑定 &gt; 任务/会话指定 &gt; 全局激活。
-                    </span>
-                  </div>
-                </div>
-              )}
-              <div className="flex flex-wrap items-end gap-3">
-                {showConfig && (
-                  <>
-                    <div className="grid gap-1.5">
-                      <Label htmlFor="max-turns" className="text-xs">最大循环次数（0=不限）</Label>
-                      <Input id="max-turns" type="number" min={0} className="h-8 w-32"
-                        value={maxTurns} onChange={(e) => setMaxTurns(e.target.value)} />
-                    </div>
-                    <div className="grid gap-1.5">
-                      <Label htmlFor="run-seconds" className="text-xs">运行时长（秒，0=不限）</Label>
-                      <Input id="run-seconds" type="number" min={0} className="h-8 w-32"
-                        value={runSecs} onChange={(e) => setRunSecs(e.target.value)} />
-                    </div>
-                  </>
-                )}
-                <Button size="sm" variant="outline" onClick={saveConfig}>
-                  <SaveIcon /> 保存配置
-                </Button>
+          <div className="grid gap-3 rounded-md border p-3">
+            {isSubRole && (
+              <div className="bg-muted/40 text-muted-foreground rounded-md border px-3 py-2 text-xs leading-relaxed">
+                该项为 CTF 攻坚内部子角色，与主任务共用同一 LLM 配置池和限流器（工具集继承自 <span className="font-mono">worker</span> 或纯文本推理），可在此单独配置<b>思维开关</b>与<b>思考强度</b>，保存后下一轮调用立即生效。
               </div>
-              {showWebSearch && (
-                <div className="flex items-center gap-3 border-t pt-3">
-                  <Switch
-                    id="web-search"
-                    checked={webSearch}
-                    disabled={!webSearchGlobalOn}
-                    onCheckedChange={setWebSearch}
-                  />
-                  <div className="grid gap-0.5">
-                    <Label htmlFor="web-search" className="text-sm">网络搜索</Label>
-                    <span className="text-muted-foreground text-xs">
-                      {webSearchGlobalOn
-                        ? "为该 Agent 开启后（点上方保存生效），可用 web_search 联网检索"
-                        : "需先在「系统配置」开启网络搜索并配置后端，才能在此启用"}
-                    </span>
-                  </div>
+            )}
+            {showLLM && (
+              <div className="grid gap-1.5">
+                <Label htmlFor="llm-profile" className="text-xs">默认模型（LLM 配置）</Label>
+                <div className="flex flex-wrap items-center gap-3">
+                  <Select value={llmProfileId || "__follow__"} onValueChange={(v) => setLlmProfileId(v === "__follow__" ? "" : v)}>
+                    <SelectTrigger id="llm-profile" className="h-8 w-72">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__follow__">跟随任务 / 全局激活配置</SelectItem>
+                      {llmProfiles.map((p) => (
+                        <SelectItem key={p.id} value={String(p.id)}>
+                          {p.name}（{p.model}）{p.is_default ? " · 默认" : ""}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <span className="text-muted-foreground max-w-md text-xs">
+                    为该 Agent 绑定固定 LLM 配置（点「保存配置」生效）。优先级：Agent 绑定 &gt; 任务/会话指定 &gt; 全局激活。
+                  </span>
                 </div>
-              )}
-              {showInteractiveShell && (
-                <div className="flex items-center gap-3 border-t pt-3">
-                  <Switch
-                    id="interactive-shell"
-                    checked={interactiveShell}
-                    onCheckedChange={setInteractiveShell}
-                  />
-                  <div className="grid gap-0.5">
-                    <Label htmlFor="interactive-shell" className="text-sm">交互式 Shell</Label>
-                    <span className="text-muted-foreground text-xs">
-                      为该 Agent 开启后（点上方保存生效），可用持久 PTY 会话工具（shell_open/send/read/close/list）驱动 msfconsole/ssh/REPL 等交互程序
-                    </span>
-                  </div>
-                </div>
-              )}
+              </div>
+            )}
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="grid gap-1.5">
+                <Label htmlFor="agent-thinking-type" className="text-xs">思考开关（thinking.type）</Label>
+                <Select value={thinkingType} onValueChange={setThinkingType}>
+                  <SelectTrigger id="agent-thinking-type" className="h-8">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {AGENT_THINKING_TYPES.map((o) => (
+                      <SelectItem key={o.value} value={o.value}>
+                        {o.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="grid gap-1.5">
+                <Label htmlFor="agent-reasoning-effort" className="text-xs">思考强度（reasoning_effort）</Label>
+                <Select value={reasoningEffort} onValueChange={setReasoningEffort}>
+                  <SelectTrigger id="agent-reasoning-effort" className="h-8">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {AGENT_EFFORT_LEVELS.map((o) => (
+                      <SelectItem key={o.value} value={o.value}>
+                        {o.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
             </div>
-          )}
+            <p className="text-muted-foreground text-[11px]">
+              留为「跟随 LLM 配置」则完全沿用底层模型档案参数；开启/关闭思考或指定强度会在每次请求发出时按角色动态覆写，兼顾 Token 成本与关键步推理深度。
+            </p>
+            <div className="flex flex-wrap items-end gap-3">
+              {showConfig && (
+                <>
+                  <div className="grid gap-1.5">
+                    <Label htmlFor="max-turns" className="text-xs">最大循环次数（0=不限）</Label>
+                    <Input id="max-turns" type="number" min={0} className="h-8 w-32"
+                      value={maxTurns} onChange={(e) => setMaxTurns(e.target.value)} />
+                  </div>
+                  <div className="grid gap-1.5">
+                    <Label htmlFor="run-seconds" className="text-xs">运行时长（秒，0=不限）</Label>
+                    <Input id="run-seconds" type="number" min={0} className="h-8 w-32"
+                      value={runSecs} onChange={(e) => setRunSecs(e.target.value)} />
+                  </div>
+                </>
+              )}
+              <Button size="sm" variant="outline" onClick={saveConfig}>
+                <SaveIcon /> 保存配置
+              </Button>
+            </div>
+            {showWebSearch && (
+              <div className="flex items-center gap-3 border-t pt-3">
+                <Switch
+                  id="web-search"
+                  checked={webSearch}
+                  disabled={!webSearchGlobalOn}
+                  onCheckedChange={setWebSearch}
+                />
+                <div className="grid gap-0.5">
+                  <Label htmlFor="web-search" className="text-sm">网络搜索</Label>
+                  <span className="text-muted-foreground text-xs">
+                    {webSearchGlobalOn
+                      ? "为该 Agent 开启后（点上方保存生效），可用 web_search 联网检索"
+                      : "需先在「系统配置」开启网络搜索并配置后端，才能在此启用"}
+                  </span>
+                </div>
+              </div>
+            )}
+            {showInteractiveShell && (
+              <div className="flex items-center gap-3 border-t pt-3">
+                <Switch
+                  id="interactive-shell"
+                  checked={interactiveShell}
+                  onCheckedChange={setInteractiveShell}
+                />
+                <div className="grid gap-0.5">
+                  <Label htmlFor="interactive-shell" className="text-sm">交互式 Shell</Label>
+                  <span className="text-muted-foreground text-xs">
+                    为该 Agent 开启后（点上方保存生效），可用持久 PTY 会话工具（shell_open/send/read/close/list）驱动 msfconsole/ssh/REPL 等交互程序
+                  </span>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {!isSubRole && (
+            <>
 
           <div className="grid gap-2">
             <Label className="text-muted-foreground text-xs">变量（点击插入占位符，渲染时由运行时数据替换）</Label>
@@ -496,11 +561,15 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
               <DiffView oldText={diffVer?.template_text ?? ""} newText={versions[0]?.template_text ?? ""} />
             </DialogContent>
           </Dialog>
+            </>
+          )}
         </div>
       </TabsContent>
 
-      {/* 收尾提示词 */}
-      <TabsContent value="wrapup" className="min-h-0 flex-1 overflow-y-auto px-4 pb-4">
+      {!isSubRole && (
+        <>
+          {/* 收尾提示词 */}
+          <TabsContent value="wrapup" className="min-h-0 flex-1 overflow-y-auto px-4 pb-4">
         <div className="grid gap-3">
           <p className="text-muted-foreground text-xs leading-relaxed">
             当此 Agent 因<b>超时</b>或<b>步数耗尽</b>被终止时，系统会注入这段「收尾提示词」跑一轮收尾：
@@ -662,6 +731,8 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
           {tools.length === 0 && <span className="text-muted-foreground text-xs">（暂无工具）</span>}
         </div>
       </TabsContent>
+        </>
+      )}
 
       {/* 触发(P3, 仅自定义 agent) */}
       {isCustom && (

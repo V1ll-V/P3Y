@@ -11,6 +11,7 @@ import (
 	"p3y/db"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
+	"github.com/Autumn-27/norma/transcript"
 )
 
 const ctfCriticSystem = `【思考与输出语言规范】请全程使用简体中文进行简短犀利的反向证伪分析（专有术语与路径除外）。
@@ -48,13 +49,17 @@ type ctfCriticHooks struct {
 }
 
 func newCTFCriticHooks(inner harness.HookRunner, prov llm.Provider, pg *db.DB, taskID, intentID int64, emit func(db.Activity)) *ctfCriticHooks {
+	roleProv := withRoleThinking(prov, "critic", "", true)
 	advisor := CriticAdvisor(func(ctx context.Context, dossier string) (string, error) {
-		if prov == nil {
+		if roleProv == nil {
 			return "", fmt.Errorf("no provider")
 		}
 		cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 		defer cancel()
-		msg, _, _, err := prov.Complete(cctx, llm.CompletionRequest{
+		if transcript.SessionIDFrom(cctx) == "" && taskID > 0 {
+			cctx = transcript.WithSessionID(cctx, fmt.Sprintf("task%d-critic-i%d", taskID, intentID))
+		}
+		msg, _, _, err := roleProv.Complete(cctx, llm.CompletionRequest{
 			System:    []string{ctfCriticSystem},
 			MaxTokens: 700,
 			Messages: []llm.Message{
@@ -80,7 +85,7 @@ func newCTFCriticHooks(inner harness.HookRunner, prov llm.Provider, pg *db.DB, t
 
 func isCTFCriticMonitoredTool(name string) bool {
 	switch name {
-	case "Bash", "ctf_python", "ctf_gdb", "http_send", "ctf_http", "http_fuzz_diff",
+	case "Bash", "ctf_python", "ctf_gdb", "http_send", "ctf_http", "http_fuzz_diff", "http_race_probe",
 		"py_repl", "ctf_probe_target", "ctf_session_send", "board_mark_savepoint":
 		return true
 	default:

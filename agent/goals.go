@@ -136,7 +136,7 @@ func DecomposeGoalsWithProvider(ctx context.Context, prov llm.Provider, dataDir,
 		}
 	}
 	captureRun(ctx, agentcore.Options{
-		Provider:               prov,
+		Provider:               withRoleThinking(prov, "goals", "", false),
 		SystemPrompt:           []string{sys},
 		Tools:                  tools,
 		PermissionMode:         acperm.ModeBypass,

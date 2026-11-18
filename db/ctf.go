@@ -282,6 +282,9 @@ func (d *DB) DecideCTFCandidate(ctx context.Context, taskID, id, expectedRevisio
 		}
 		return err
 	})
+	if err == nil && state == "accepted" {
+		_ = d.MarkTaskTipsSolved(ctx, taskID)
+	}
 	return out, err
 }
 

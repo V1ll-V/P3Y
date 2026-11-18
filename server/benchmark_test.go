@@ -1345,3 +1345,55 @@ func TestBenchmarkEarlyStagnantHintAndHighScorePriority(t *testing.T) {
 		t.Fatalf("unexpected priority queue order: %+v", []string{q[0].UniqueCode, q[1].UniqueCode, q[2].UniqueCode})
 	}
 }
+
+func TestPickChallengeQueueDifficultyOrdering(t *testing.T) {
+	// 1. Challenges without difficulty tags (empty / auto / none, Level=0) keep original ID order without sorting.
+	unlabeled := pickChallengeQueue([]*db.BenchmarkChallenge{
+		{ID: 10, UniqueCode: "first-no-tag", Difficulty: "", Level: 0, TotalScore: 800},
+		{ID: 20, UniqueCode: "second-auto", Difficulty: "auto", Level: 0, TotalScore: 100},
+		{ID: 30, UniqueCode: "third-none", Difficulty: "none", Level: 0, TotalScore: 500},
+	}, nil)
+	if len(unlabeled) != 3 || unlabeled[0].UniqueCode != "first-no-tag" || unlabeled[1].UniqueCode != "second-auto" || unlabeled[2].UniqueCode != "third-none" {
+		t.Fatalf("unlabeled challenges must preserve natural ID order without sorting, got %+v", []string{unlabeled[0].UniqueCode, unlabeled[1].UniqueCode, unlabeled[2].UniqueCode})
+	}
+
+	// 2. Challenges with text/composite/CJK/level difficulty labels run easiest -> hardest regardless of Level=0 or TotalScore.
+	labeled := pickChallengeQueue([]*db.BenchmarkChallenge{
+		{ID: 1, UniqueCode: "c-insane", Difficulty: "Insane", TotalScore: 1000},
+		{ID: 2, UniqueCode: "c-hard", Difficulty: "困难(Web)", TotalScore: 900},
+		{ID: 3, UniqueCode: "c-mid-hard", Difficulty: "medium-hard", TotalScore: 700},
+		{ID: 4, UniqueCode: "c-medium", Difficulty: "中等", TotalScore: 500},
+		{ID: 5, UniqueCode: "c-easy", Difficulty: "Easy", TotalScore: 300},
+		{ID: 6, UniqueCode: "c-checkin", Difficulty: "Check-in", TotalScore: 100},
+	}, nil)
+	wantLabeled := []string{"c-checkin", "c-easy", "c-medium", "c-mid-hard", "c-hard", "c-insane"}
+	for idx, want := range wantLabeled {
+		if labeled[idx].UniqueCode != want {
+			var gotCodes []string
+			for _, ch := range labeled {
+				gotCodes = append(gotCodes, ch.UniqueCode)
+			}
+			t.Fatalf("unexpected labeled order: want %v, got %v", wantLabeled, gotCodes)
+		}
+	}
+
+	// 3. Mixed batch: easy/medium run before unlabeled (which keep relative ID order), hardest pushed last.
+	mixed := pickChallengeQueue([]*db.BenchmarkChallenge{
+		{ID: 1, UniqueCode: "m-hard", Difficulty: "Hard"},
+		{ID: 2, UniqueCode: "m-nolabel-a", Difficulty: ""},
+		{ID: 3, UniqueCode: "m-easy", Difficulty: "easy"},
+		{ID: 4, UniqueCode: "m-nolabel-b", Difficulty: "auto"},
+		{ID: 5, UniqueCode: "m-lv2", Difficulty: "Lv.2"},
+		{ID: 6, UniqueCode: "m-lvl3", Difficulty: "", Level: 3},
+	}, nil)
+	wantMixed := []string{"m-easy", "m-lv2", "m-lvl3", "m-nolabel-a", "m-nolabel-b", "m-hard"}
+	for idx, want := range wantMixed {
+		if mixed[idx].UniqueCode != want {
+			var gotCodes []string
+			for _, ch := range mixed {
+				gotCodes = append(gotCodes, ch.UniqueCode)
+			}
+			t.Fatalf("unexpected mixed difficulty order: want %v, got %v", wantMixed, gotCodes)
+		}
+	}
+}

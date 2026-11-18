@@ -41,6 +41,18 @@ import { AgentEditor } from "@/components/agent-editor";
 import { api } from "@/lib/api";
 import type { Agent } from "@/lib/types";
 
+const SUB_ROLE_KEYS = new Set(["worker_recon", "helper", "critic", "plateau_fork"]);
+
+function thinkingBadgeText(agent: Agent): string {
+  const tt = agent.thinking_type || "";
+  const re = agent.reasoning_effort || "";
+  if (tt === "disabled" && !re) return "思考: 关闭";
+  if (re && tt === "enabled") return `思考: ${re}`;
+  if (re) return `强度: ${re}`;
+  if (tt === "enabled") return "思考: 开启";
+  return "思考: 跟随";
+}
+
 // AgentGridCard is one clickable tile opening the agent's editor drawer. Custom
 // (non-builtin) agents get a delete button.
 function AgentGridCard({
@@ -52,6 +64,7 @@ function AgentGridCard({
   onOpen: () => void;
   onDeleted: () => void;
 }) {
+  const isSubRole = SUB_ROLE_KEYS.has(agent.key);
   async function del() {
     try {
       await api.deleteAgent(agent.key);
@@ -70,7 +83,7 @@ function AgentGridCard({
           <span className="text-muted-foreground font-mono text-xs">{agent.key}</span>
           {agent.builtin ? (
             <Badge variant="secondary" className="px-1.5 py-0 text-[10px]">
-              内置
+              {isSubRole ? "内置 · 子角色" : "内置"}
             </Badge>
           ) : (
             <Badge variant="outline" className="px-1.5 py-0 text-[10px]">
@@ -87,9 +100,14 @@ function AgentGridCard({
           {agent.description || "（无描述）"}
         </p>
         <div className="text-muted-foreground flex flex-wrap gap-1.5 text-[10px]">
-          <span className="rounded border px-1.5 py-0.5">MCP {agent.mcp_count ?? 0}</span>
-          <span className="rounded border px-1.5 py-0.5">Skill {agent.skill_count ?? 0}</span>
-          <span className="rounded border px-1.5 py-0.5">工具 {agent.tool_count ?? 0}</span>
+          <span className="rounded border px-1.5 py-0.5">{thinkingBadgeText(agent)}</span>
+          {!isSubRole && (
+            <>
+              <span className="rounded border px-1.5 py-0.5">MCP {agent.mcp_count ?? 0}</span>
+              <span className="rounded border px-1.5 py-0.5">Skill {agent.skill_count ?? 0}</span>
+              <span className="rounded border px-1.5 py-0.5">工具 {agent.tool_count ?? 0}</span>
+            </>
+          )}
         </div>
       </button>
       {!agent.builtin && (

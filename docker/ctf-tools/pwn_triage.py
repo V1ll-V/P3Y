@@ -96,6 +96,50 @@ def find_glibc_match(libc_meta, arch):
     return None
 
 
+def run_boundary_probes(bin_path):
+    """Run fast (<2s total) deterministic boundary probes on a local ELF to surface immediate crashes or format-string leaks."""
+    if not bin_path or not os.path.isfile(bin_path):
+        return {"tested": 0, "hits": []}
+    probes = [
+        ("overflow_512", b"A" * 512 + b"\n"),
+        ("fmt_probe", b"%p.%p.%p.%p.%p.%p\n"),
+        ("neg_one", b"-1\n"),
+        ("menu_fuzz", b"1\n" + b"A" * 256 + b"\n-1\n"),
+    ]
+    hits = []
+    tested = 0
+    for name, payload in probes:
+        tested += 1
+        try:
+            p = subprocess.run([bin_path], input=payload, capture_output=True, timeout=0.45)
+            rc = p.returncode
+            out = (p.stdout or b"").decode("utf-8", errors="replace")
+            err = (p.stderr or b"").decode("utf-8", errors="replace")
+            combined = out + "\n" + err
+            sig_note = ""
+            if rc < 0:
+                sig_note = f"signal={-rc}"
+            elif "stack smashing detected" in combined:
+                sig_note = "stack_smashing"
+            elif "Segmentation fault" in combined:
+                sig_note = "segfault"
+            fmt_leaks = re.findall(r"0x[0-9a-fA-F]{6,16}", out) if name == "fmt_probe" else []
+            if sig_note or fmt_leaks:
+                item = {"probe": name, "returncode": rc}
+                if sig_note:
+                    item["signal"] = sig_note
+                if fmt_leaks:
+                    item["fmt_leaks"] = fmt_leaks[:6]
+                if combined.strip():
+                    item["excerpt"] = combined.strip()[:200]
+                hits.append(item)
+        except subprocess.TimeoutExpired:
+            continue
+        except Exception:
+            break
+    return {"tested": tested, "hits": hits}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("path")
@@ -223,6 +267,16 @@ def main():
             res["next_steps"].append("已命中本地 /opt/ctf/glibc 缓存，传入 patch=true 或用 patchelf 直接绑定本地 ld。")
         else:
             res["next_steps"].append("本地缓存未收录精确 BuildID；如需匹配调试符号再按需下载对应 libc6 包，或确认系统当前 glibc 小版本是否 ABI 兼容。")
+
+    probe_target = res["patched_binary"] or res["work_copy"]
+    if res["arch"] in ("amd64", "i386") and probe_target:
+        bp = run_boundary_probes(probe_target)
+        res["boundary_probes"] = bp
+        for h in bp.get("hits", []):
+            if h.get("signal"):
+                res["next_steps"].append(f"边界探针 {h['probe']} 触发异常退出（{h['signal']}），建议优先检查该输入路径。")
+            if h.get("fmt_leaks"):
+                res["next_steps"].append(f"边界探针 fmt_probe 回显疑似地址泄露（{', '.join(h['fmt_leaks'][:3])}），疑似存在格式化字符串漏洞。")
 
     print(json.dumps(res, ensure_ascii=False, indent=2))
 

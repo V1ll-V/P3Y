@@ -173,6 +173,9 @@ func ctfBoardTools(s *ctf.Service, pg *db.DB, task, intent int64) []actool.CoreT
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
+			if rw := ctfRewindFromContext(ctx); rw != nil {
+				rw.MarkSavepointPending(item.ID)
+			}
 			b, _ := json.Marshal(item)
 			return actool.Text(string(b)), nil
 		}),
@@ -204,13 +207,19 @@ func ctfBoardTools(s *ctf.Service, pg *db.DB, task, intent int64) []actool.CoreT
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
+			convRewound := false
+			if rw := ctfRewindFromContext(ctx); rw != nil {
+				rw.RequestRewind(spID, sp.Title, strVal(a, "deadend_title"), strVal(a, "deadend_reason"), rwCount)
+				convRewound = true
+			}
 			resp := map[string]any{
-				"rewound":          rwRes.Rewound,
-				"snapshot_id":      sp.SnapshotID,
-				"savepoint_id":     spID,
-				"rewind_count":     rwCount,
-				"plateau_detected": rwCount >= 2,
-				"deadend_record":   deadend,
+				"rewound":              rwRes.Rewound,
+				"conversation_rewound": convRewound,
+				"snapshot_id":          sp.SnapshotID,
+				"savepoint_id":         spID,
+				"rewind_count":         rwCount,
+				"plateau_detected":     rwCount >= 2,
+				"deadend_record":       deadend,
 			}
 			if rwCount >= 2 {
 				resp["recommendation"] = "已在同一存档点回滚多次进入停滞期，请考虑调用 plateau_fork 基于该 Savepoint 并发验证 2~3 条互不依赖的假设分支。"
@@ -320,7 +329,7 @@ func ctfBoardTools(s *ctf.Service, pg *db.DB, task, intent int64) []actool.CoreT
 				return actool.Errorf(err.Error()), nil
 			}
 			for _, c := range cards {
-				_ = pg.IncrementTipHit(ctx, c.ID)
+				_ = pg.RecordTaskTipHit(ctx, task, c.ID)
 			}
 			b, _ := json.Marshal(cards)
 			return actool.Text(string(b)), nil

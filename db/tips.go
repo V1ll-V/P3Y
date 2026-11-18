@@ -20,6 +20,7 @@ type TipCard struct {
 	PatternCode  string    `json:"pattern_code,omitempty"`
 	SourceTaskID *int64    `json:"source_task_id,omitempty"`
 	HitCount     int64     `json:"hit_count"`
+	SolveCount   int64     `json:"solve_count"`
 	CreatedAt    time.Time `json:"created_at"`
 }
 
@@ -60,11 +61,11 @@ func (d *DB) CreateTipCard(ctx context.Context, card TipCard) (*TipCard, error) 
 	var outTagsRaw string
 	var outSrc sql.NullInt64
 	err := d.QueryRowContext(ctx, `
-		INSERT INTO tips_cards (category, tags_json, title, pitfall, pattern_code, source_task_id, hit_count)
-		VALUES ($1, $2::jsonb, $3, $4, $5, $6, $7)
-		RETURNING id, category, tags_json::text, title, pitfall, pattern_code, source_task_id, hit_count, created_at
-	`, cat, string(tagsRaw), card.Title, strings.TrimSpace(card.Pitfall), strings.TrimSpace(card.PatternCode), srcTask, card.HitCount).
-		Scan(&out.ID, &out.Category, &outTagsRaw, &out.Title, &out.Pitfall, &out.PatternCode, &outSrc, &out.HitCount, &out.CreatedAt)
+		INSERT INTO tips_cards (category, tags_json, title, pitfall, pattern_code, source_task_id, hit_count, solve_count)
+		VALUES ($1, $2::jsonb, $3, $4, $5, $6, $7, $8)
+		RETURNING id, category, tags_json::text, title, pitfall, pattern_code, source_task_id, hit_count, solve_count, created_at
+	`, cat, string(tagsRaw), card.Title, strings.TrimSpace(card.Pitfall), strings.TrimSpace(card.PatternCode), srcTask, card.HitCount, card.SolveCount).
+		Scan(&out.ID, &out.Category, &outTagsRaw, &out.Title, &out.Pitfall, &out.PatternCode, &outSrc, &out.HitCount, &out.SolveCount, &out.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -86,16 +87,16 @@ func (d *DB) ListTips(ctx context.Context, category string, limit int) ([]TipCar
 	}
 	cat := strings.ToLower(strings.TrimSpace(category))
 	query := `
-		SELECT id, category, tags_json::text, title, pitfall, pattern_code, source_task_id, hit_count, created_at
+		SELECT id, category, tags_json::text, title, pitfall, pattern_code, source_task_id, hit_count, solve_count, created_at
 		FROM tips_cards`
 	var args []any
 	if cat != "" && cat != "all" && cat != "auto" {
 		query += ` WHERE category IN ($1, 'auto')`
 		args = append(args, cat)
-		query += ` ORDER BY hit_count DESC, id DESC LIMIT $2`
+		query += ` ORDER BY solve_count DESC, hit_count DESC, id DESC LIMIT $2`
 		args = append(args, limit)
 	} else {
-		query += ` ORDER BY hit_count DESC, id DESC LIMIT $1`
+		query += ` ORDER BY solve_count DESC, hit_count DESC, id DESC LIMIT $1`
 		args = append(args, limit)
 	}
 	rows, err := d.QueryContext(ctx, query, args...)
@@ -108,7 +109,7 @@ func (d *DB) ListTips(ctx context.Context, category string, limit int) ([]TipCar
 		var c TipCard
 		var tagsRaw string
 		var src sql.NullInt64
-		if err := rows.Scan(&c.ID, &c.Category, &tagsRaw, &c.Title, &c.Pitfall, &c.PatternCode, &src, &c.HitCount, &c.CreatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.Category, &tagsRaw, &c.Title, &c.Pitfall, &c.PatternCode, &src, &c.HitCount, &c.SolveCount, &c.CreatedAt); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(tagsRaw), &c.Tags)
@@ -121,7 +122,7 @@ func (d *DB) ListTips(ctx context.Context, category string, limit int) ([]TipCar
 	return out, rows.Err()
 }
 
-// SearchTips retrieves up to limit relevant tip cards scored by category match + tag overlap + hit_count.
+// SearchTips retrieves up to limit relevant tip cards scored by category/tag relevance plus Bayesian solve rate.
 func (d *DB) SearchTips(ctx context.Context, category string, tags []string, limit int) ([]TipCard, error) {
 	if d == nil {
 		return nil, nil
@@ -138,13 +139,13 @@ func (d *DB) SearchTips(ctx context.Context, category string, tags []string, lim
 
 	type scored struct {
 		card  TipCard
-		score int
+		score float64
 	}
 	ranked := make([]scored, 0, len(all))
 	for _, c := range all {
-		score := 0
+		relScore := 0.0
 		if wantCat != "" && wantCat != "auto" && c.Category == wantCat {
-			score += 3
+			relScore += 3.0
 		}
 		hay := strings.ToLower(c.Title + " " + c.Pitfall)
 		cardTagSet := make(map[string]bool, len(c.Tags))
@@ -153,18 +154,28 @@ func (d *DB) SearchTips(ctx context.Context, category string, tags []string, lim
 		}
 		for _, wt := range wantTags {
 			if cardTagSet[wt] {
-				score += 5
+				relScore += 5.0
 			} else if strings.Contains(hay, wt) {
-				score += 2
+				relScore += 2.0
 			}
 		}
-		if len(wantTags) == 0 || score > 0 {
-			ranked = append(ranked, scored{card: c, score: score})
+		if len(wantTags) > 0 && relScore == 0 {
+			continue
 		}
+		// Bayesian smoothed win-rate prior plus self-cleaning penalty for cards recalled repeatedly without solving.
+		winRate := float64(c.SolveCount+1) / float64(c.HitCount+3)
+		score := relScore + winRate*4.0
+		if c.HitCount >= 5 && c.SolveCount == 0 {
+			score -= 6.0
+		}
+		ranked = append(ranked, scored{card: c, score: score})
 	}
 	sort.SliceStable(ranked, func(i, j int) bool {
 		if ranked[i].score != ranked[j].score {
 			return ranked[i].score > ranked[j].score
+		}
+		if ranked[i].card.SolveCount != ranked[j].card.SolveCount {
+			return ranked[i].card.SolveCount > ranked[j].card.SolveCount
 		}
 		if ranked[i].card.HitCount != ranked[j].card.HitCount {
 			return ranked[i].card.HitCount > ranked[j].card.HitCount
@@ -187,6 +198,47 @@ func (d *DB) IncrementTipHit(ctx context.Context, id int64) error {
 		return nil
 	}
 	_, err := d.ExecContext(ctx, `UPDATE tips_cards SET hit_count = hit_count + 1 WHERE id=$1`, id)
+	return err
+}
+
+// RecordTaskTipHit records at most one hit per (taskID, tipID) and bumps hit_count once per task.
+func (d *DB) RecordTaskTipHit(ctx context.Context, taskID, tipID int64) error {
+	if d == nil || tipID <= 0 {
+		return nil
+	}
+	if taskID <= 0 {
+		return d.IncrementTipHit(ctx, tipID)
+	}
+	_, err := d.ExecContext(ctx, `
+		WITH ins AS (
+			INSERT INTO task_tip_hits (task_id, tip_id)
+			VALUES ($1, $2)
+			ON CONFLICT (task_id, tip_id) DO NOTHING
+			RETURNING tip_id
+		)
+		UPDATE tips_cards
+		SET hit_count = hit_count + 1
+		WHERE id IN (SELECT tip_id FROM ins)
+	`, taskID, tipID)
+	return err
+}
+
+// MarkTaskTipsSolved credits solve_count once per recalled tip card when taskID solves.
+func (d *DB) MarkTaskTipsSolved(ctx context.Context, taskID int64) error {
+	if d == nil || taskID <= 0 {
+		return nil
+	}
+	_, err := d.ExecContext(ctx, `
+		WITH newly_solved AS (
+			UPDATE task_tip_hits
+			SET solved = TRUE
+			WHERE task_id = $1 AND solved = FALSE
+			RETURNING tip_id
+		)
+		UPDATE tips_cards
+		SET solve_count = solve_count + 1
+		WHERE id IN (SELECT tip_id FROM newly_solved)
+	`, taskID)
 	return err
 }
 

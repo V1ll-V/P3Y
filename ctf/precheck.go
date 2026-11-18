@@ -420,7 +420,7 @@ func (s *Service) RunPrecheck(ctx context.Context, taskID int64, force bool) (*P
 	inferred := inferCategory(taskRow.ChallengeType, files, tags, targets)
 	tips, _ := s.DB.SearchTips(ctx, inferred, tags, 5)
 	for _, tip := range tips {
-		_ = s.DB.IncrementTipHit(ctx, tip.ID)
+		_ = s.DB.RecordTaskTipHit(ctx, taskID, tip.ID)
 	}
 
 	var sumParts []string

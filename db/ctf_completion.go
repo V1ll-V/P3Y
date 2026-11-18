@@ -137,6 +137,9 @@ func (d *DB) CompleteCTFExploitProof(ctx context.Context, taskID int64, executio
 		_, err = tx.ExecContext(ctx, `UPDATE tasks SET status='done',completed_at=now(),paused=false,queued=false,queued_at=NULL,queue_mode='',run_epoch=run_epoch+1,closing_reason='',closing_run_epoch=0,closing_since=NULL,closing_basis='' WHERE id=$1`, taskID)
 		return err
 	})
+	if err == nil {
+		_ = d.MarkTaskTipsSolved(ctx, taskID)
+	}
 	return out, err
 }
 

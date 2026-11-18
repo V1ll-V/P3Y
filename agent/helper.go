@@ -12,6 +12,7 @@ import (
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
+	"github.com/Autumn-27/norma/transcript"
 )
 
 type (
@@ -145,8 +146,9 @@ func (w *Worker) runCTFHelper(ctx context.Context, as *db.AssetStore, ts *db.Exp
 	subCtx := WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts), IntentID: intentID})
 	subCtx = WithCTFProxy(subCtx, w.proxyAddr, w.proxyCACert)
 	subCtx = context.WithValue(subCtx, ctfHelperSubKey{}, true)
+	subCtx = transcript.WithSessionID(subCtx, fmt.Sprintf("exp%d-helper-i%d", explorationID(ts), intentID))
 	subCtx, base = ctfBase(subCtx, w.workDir, ts, taskID, intentID, base)
-	tools, def, cleanup := AugmentTools(subCtx, "helper", base)
+	tools, def, cleanup := AugmentTools(subCtx, "worker", base)
 	defer cleanup()
 	tools = stripHelperTools(tools)
 
@@ -174,7 +176,7 @@ func (w *Worker) runCTFHelper(ctx context.Context, as *db.AssetStore, ts *db.Exp
 	}
 
 	opts := agentcore.Options{
-		Provider:              w.prov,
+		Provider:              withRoleThinking(w.prov, "helper", "worker", true),
 		SystemPrompt:          system,
 		DynamicBoundary:       boundary,
 		Tools:                 tools,

@@ -86,7 +86,7 @@ func ctfToolPackOf(name string) string {
 	switch name {
 	case "ctf_binary_info", "ctf_pwn_triage", "ctf_gdb", "ctf_decompile", "ctf_radare2", "diff_local_remote":
 		return ctfPackBinary
-	case "ctf_http", "http_send", "http_fuzz_diff":
+	case "ctf_http", "http_send", "http_fuzz_diff", "http_race_probe":
 		return ctfPackWeb
 	case "ctf_pcap_analyze":
 		return ctfPackCryptoMisc
@@ -173,7 +173,7 @@ func stripCTFPlannerBase(base []actool.CoreTool) []actool.CoreTool {
 		}
 		switch name {
 		case "Bash", "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "LS", "http_send",
-			"http_fuzz_diff", "diff_local_remote", "py_repl",
+			"http_fuzz_diff", "http_race_probe", "diff_local_remote", "py_repl",
 			"ask_helper", "plateau_fork",
 			"board_mark_savepoint", "board_rewind", "board_save_kit",
 			"report_finding", "update_finding_report":
@@ -197,7 +197,114 @@ func ctfBaseForPlanner(ctx context.Context, ts *db.ExplorationStore, base []acto
 	return context.WithValue(ctx, ctfRunKey{}, true), stripCTFPlannerBase(base)
 }
 
-var ctfExecutionTools = []string{"Bash", "Write", "Edit", "Grep", "Glob", "ctf_http", "http_send", "http_fuzz_diff", "diff_local_remote", "py_repl", "ask_helper", "plateau_fork", "ctf_binary_info", "ctf_pwn_triage", "ctf_gdb", "ctf_python", "ctf_decompile", "ctf_radare2", "Read", "LS", "ctf_tools", "ctf_unlock_toolpack", "ctf_run_background", "ctf_job_status", "ctf_job_stop", "ctf_probe_target", "ctf_session_start", "ctf_session_send", "ctf_session_read", "ctf_session_close", "ctf_pcap_analyze", "board_mark_savepoint", "board_rewind", "board_save_kit"}
+var ctfExecutionTools = []string{"Bash", "Write", "Edit", "Grep", "Glob", "ctf_http", "http_send", "http_fuzz_diff", "http_race_probe", "diff_local_remote", "py_repl", "ask_helper", "plateau_fork", "ctf_binary_info", "ctf_pwn_triage", "ctf_gdb", "ctf_python", "ctf_decompile", "ctf_radare2", "Read", "LS", "ctf_tools", "ctf_unlock_toolpack", "ctf_run_background", "ctf_job_status", "ctf_job_stop", "ctf_probe_target", "ctf_session_start", "ctf_session_send", "ctf_session_read", "ctf_session_close", "ctf_pcap_analyze", "board_mark_savepoint", "board_rewind", "board_save_kit"}
+
+func buildCTFGDBScript(userCommands string) string {
+	const gdbTailPy = `python
+import gdb, json
+try:
+    inf = gdb.selected_inferior()
+    frame = gdb.selected_frame()
+    if inf and inf.pid > 0 and frame and frame.is_valid():
+        arch = frame.architecture().name()
+        is64 = "64" in arch
+        word = 8 if is64 else 4
+        reg_names = ["rip","rsp","rbp","rax","rbx","rcx","rdx","rsi","rdi"] if is64 else ["eip","esp","ebp","eax","ebx","ecx","edx","esi","edi"]
+        regs = {}
+        for rn in reg_names:
+            try:
+                regs[rn] = hex(int(frame.read_register(rn)) & ((1 << (word * 8)) - 1))
+            except Exception:
+                pass
+        sp_val = int(frame.read_register("rsp" if is64 else "esp")) & ((1 << (word * 8)) - 1)
+        pc_val = int(frame.read_register("rip" if is64 else "eip")) & ((1 << (word * 8)) - 1)
+        align_info = ""
+        if is64:
+            rem = sp_val & 0xf
+            align_info = "16B_ALIGNED" if rem == 0 else f"MISALIGNED(+0x{rem:x} -> MOVAPS risk, consider ret gadget)"
+        maps = []
+        try:
+            with open(f"/proc/{inf.pid}/maps", "r") as mf:
+                for line in mf:
+                    parts = line.split(None, 5)
+                    if len(parts) >= 2:
+                        lo_s, hi_s = parts[0].split("-", 1)
+                        tag = parts[5].strip() if len(parts) > 5 else "[anon]"
+                        maps.append((int(lo_s, 16), int(hi_s, 16), tag))
+        except Exception:
+            pass
+        def tag_addr(val):
+            for lo, hi, tag in maps:
+                if lo <= val < hi:
+                    if "libc" in tag:
+                        return f"{tag.split('/')[-1]}+0x{val-lo:x}"
+                    if tag.startswith("["):
+                        return tag
+                    return f"{tag.split('/')[-1]}+0x{val-lo:x}"
+            return ""
+        stack_top = []
+        for idx in range(8):
+            addr = sp_val + idx * word
+            try:
+                raw = inf.read_memory(addr, word)
+                val = int.from_bytes(bytes(raw), "little")
+                lbl = tag_addr(val)
+                stack_top.append(f"+0x{idx*word:02x}: {hex(val)}" + (f" ({lbl})" if lbl else ""))
+            except Exception:
+                break
+        disasm = []
+        try:
+            for insn in frame.architecture().disassemble(pc_val, count=5):
+                disasm.append(f"{hex(insn['addr'])}: {insn['asm']}")
+        except Exception:
+            pass
+        bt = []
+        fcur = frame
+        for _ in range(5):
+            if fcur is None or not fcur.is_valid():
+                break
+            bt.append(f"#{fcur.level()} {hex(fcur.pc())} {fcur.name() or '?'}")
+            fcur = fcur.older()
+        print("\n[P3Y_GDB_STATE] " + json.dumps({
+            "arch": arch,
+            "pc": hex(pc_val),
+            "sp": hex(sp_val),
+            "stack_alignment": align_info,
+            "regs": regs,
+            "stack_top": stack_top,
+            "disasm_pc": disasm,
+            "backtrace": bt,
+        }, ensure_ascii=False))
+except Exception:
+    pass
+end`
+	lines := strings.Split(strings.ReplaceAll(userCommands, "\r\n", "\n"), "\n")
+	var trailing []string
+	for len(lines) > 0 {
+		last := strings.TrimSpace(lines[len(lines)-1])
+		if last == "" || last == "quit" || last == "q" {
+			if last != "" {
+				trailing = append([]string{last}, trailing...)
+			}
+			lines = lines[:len(lines)-1]
+			continue
+		}
+		break
+	}
+	var b strings.Builder
+	b.WriteString("set pagination off\nset confirm off\n")
+	if body := strings.Join(lines, "\n"); strings.TrimSpace(body) != "" {
+		b.WriteString(body)
+		b.WriteString("\n")
+	}
+	b.WriteString(gdbTailPy)
+	b.WriteString("\n")
+	for _, t := range trailing {
+		b.WriteString(t)
+		b.WriteString("\n")
+	}
+	return b.String()
+}
 
 func ctfCatalogTools() []actool.CoreTool {
 	out := []actool.CoreTool{}
@@ -324,9 +431,9 @@ func ctfToolsWithUnlock(s *ctf.Service, task, intent int64, verifyMode string, u
 				args, quote(ctf.PwnTriageScript), args)
 			return cmd, 90, nil
 		}),
-		commandTool("ctf_gdb", "以 GDB batch 运行实际调试脚本，可设断点、运行、查看寄存器/栈/反汇编。保留 .gdb 脚本及输出。", obj(map[string]any{"path": str("样本路径，原始附件先复制到 /work 并 chmod +x"), "commands": str("多行 GDB 命令"), "timeout_seconds": intp("最多 300 秒")}, "path", "commands"), func(a map[string]json.RawMessage) (string, int, error) {
+		commandTool("ctf_gdb", "以 GDB batch 运行实际调试脚本，可设断点、运行、查看寄存器/栈/反汇编；停止于断点/崩溃时自动附加结构化寄存器、16B 栈对齐校验、栈顶与反汇编摘要面板。保留 .gdb 脚本及输出。", obj(map[string]any{"path": str("样本路径，原始附件先复制到 /work 并 chmod +x"), "commands": str("多行 GDB 命令"), "timeout_seconds": intp("最多 300 秒")}, "path", "commands"), func(a map[string]json.RawMessage) (string, int, error) {
 			p, err := file(a)
-			script := "set pagination off\nset confirm off\n" + text(a, "commands") + "\n"
+			script := buildCTFGDBScript(text(a, "commands"))
 			return "printf %s " + quote(base64.StdEncoding.EncodeToString([]byte(script))) + " | base64 -d > debug.gdb\ngdb -q -nx -batch -x debug.gdb -- " + quote(p), num(a, "timeout_seconds", 120), err
 		}),
 		commandTool("ctf_python", "运行并留存实际 Python 求解脚本。pwn 使用 pwntools/ROP；reverse 使用 angr 10（from angr import claripy）、Z3、Unicorn、Keystone。", obj(map[string]any{"script": str("Python 源码"), "profile": str("pwn 或 reverse"), "filename": str("脚本文件名，默认 solve.py"), "timeout_seconds": intp("最多 300 秒")}, "script"), func(a map[string]json.RawMessage) (string, int, error) {
@@ -851,7 +958,7 @@ print("\n".join(out))`
 			pack := strings.ToLower(strings.TrimSpace(text(a, "pack")))
 			packTools := map[string][]string{
 				ctfPackBinary:     {"ctf_binary_info", "ctf_pwn_triage", "ctf_gdb", "ctf_decompile", "ctf_radare2", "diff_local_remote"},
-				ctfPackWeb:        {"ctf_http", "http_send", "http_fuzz_diff"},
+				ctfPackWeb:        {"ctf_http", "http_send", "http_fuzz_diff", "http_race_probe"},
 				ctfPackCryptoMisc: {"ctf_pcap_analyze"},
 			}
 			var unlockNames []string

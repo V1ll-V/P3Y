@@ -10,8 +10,10 @@ package agent
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"iter"
 	"log"
 	"net/http"
 	"net/url"
@@ -345,6 +347,9 @@ func (t quotaAwareTransport) RoundTrip(req *http.Request) (*http.Response, error
 			req.Header.Set(t.sessionHeaderKey, sid)
 		}
 	}
+	if ov := llmrec.ThinkingOverrideFrom(req.Context()); ov.ThinkingType != "" || ov.ReasoningEffort != "" {
+		applyWireThinkingOverride(req, ov)
+	}
 	// When LLM recording is on, the Recorder puts a Capture on the context so the
 	// raw wire bodies can be persisted. This is the only layer that still sees
 	// them: norma builds the request body internally and decodes the SSE response
@@ -498,4 +503,157 @@ func TestConnection(ctx context.Context, c Config) (time.Duration, string, error
 		return lat, "", fmt.Errorf("模型无回复内容（请求已通，但未返回任何文本）")
 	}
 	return lat, reply, nil
+}
+
+// ThinkingOverride, if set, returns per-agent thinking_type and reasoning_effort
+// overrides (wired by server to the DB agents table). Empty returns inherit the
+// underlying LLM profile configuration.
+var ThinkingOverride func(agentKey string) (thinkingType, reasoningEffort string)
+
+func resolveAgentThinking(agentKey, fallbackKey string) (string, string) {
+	if ThinkingOverride == nil {
+		return "", ""
+	}
+	tt, re := ThinkingOverride(agentKey)
+	if fallbackKey != "" && fallbackKey != agentKey && (tt == "" || (re == "" && tt != "disabled")) {
+		ftt, fre := ThinkingOverride(fallbackKey)
+		if tt == "" {
+			tt = ftt
+		}
+		if re == "" && tt != "disabled" {
+			re = fre
+		}
+	}
+	return strings.TrimSpace(tt), strings.TrimSpace(re)
+}
+
+type roleThinkingProvider struct {
+	inner       llm.Provider
+	agentKey    string
+	fallbackKey string
+	tagWorker   bool
+}
+
+// withRoleThinking wraps inner so every LLM call dynamically resolves the role's
+// configured thinking_type / reasoning_effort (and optional llmrec worker lane)
+// while sharing the single underlying provider and rate limiter.
+func withRoleThinking(inner llm.Provider, agentKey, fallbackKey string, tagWorker bool) llm.Provider {
+	if inner == nil {
+		return nil
+	}
+	return &roleThinkingProvider{
+		inner:       inner,
+		agentKey:    agentKey,
+		fallbackKey: fallbackKey,
+		tagWorker:   tagWorker,
+	}
+}
+
+func (p *roleThinkingProvider) apply(ctx context.Context, req llm.CompletionRequest) (context.Context, llm.CompletionRequest) {
+	if p.tagWorker && p.agentKey != "" {
+		ctx = llmrec.WithWorker(ctx, p.agentKey)
+	}
+	tt, re := resolveAgentThinking(p.agentKey, p.fallbackKey)
+	// Explicit per-request Thinking (e.g. compaction/verifier "disabled") always wins.
+	if req.Thinking != "" {
+		if req.Thinking == "disabled" {
+			ctx = llmrec.WithThinkingOverride(ctx, "disabled", "")
+		} else {
+			ctx = llmrec.WithThinkingOverride(ctx, req.Thinking, re)
+		}
+		return ctx, req
+	}
+	if tt != "" {
+		req.Thinking = tt
+	}
+	if tt == "disabled" && re == "" {
+		ctx = llmrec.WithThinkingOverride(ctx, "disabled", "")
+	} else if tt != "" || re != "" {
+		ctx = llmrec.WithThinkingOverride(ctx, tt, re)
+	}
+	return ctx, req
+}
+
+func (p *roleThinkingProvider) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
+	ctx, req = p.apply(ctx, req)
+	return p.inner.Stream(ctx, req)
+}
+
+func (p *roleThinkingProvider) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+	ctx, req = p.apply(ctx, req)
+	return p.inner.Complete(ctx, req)
+}
+
+func applyWireThinkingOverride(req *http.Request, ov llmrec.ThinkingOverride) {
+	if req == nil || (ov.ThinkingType == "" && ov.ReasoningEffort == "") {
+		return
+	}
+	raw := requestBodySnapshot(req)
+	if raw == "" && req.Body != nil {
+		b, err := io.ReadAll(req.Body)
+		_ = req.Body.Close()
+		if err != nil {
+			return
+		}
+		raw = string(b)
+	}
+	if raw == "" {
+		return
+	}
+	var body map[string]any
+	if err := json.Unmarshal([]byte(raw), &body); err != nil || body == nil {
+		// Restore original body if GetBody was absent.
+		req.Body = io.NopCloser(strings.NewReader(raw))
+		return
+	}
+	path := ""
+	if req.URL != nil {
+		path = req.URL.Path
+	}
+	switch {
+	case strings.HasSuffix(path, "/responses"):
+		if ov.ReasoningEffort != "" {
+			r, _ := body["reasoning"].(map[string]any)
+			if r == nil {
+				r = map[string]any{}
+			}
+			r["effort"] = ov.ReasoningEffort
+			body["reasoning"] = r
+		} else if ov.ThinkingType == "disabled" {
+			delete(body, "reasoning")
+		}
+	case strings.HasSuffix(path, "/messages"):
+		if ov.ThinkingType != "" {
+			body["thinking"] = map[string]any{"type": ov.ThinkingType}
+		}
+		if ov.ReasoningEffort != "" {
+			oc, _ := body["output_config"].(map[string]any)
+			if oc == nil {
+				oc = map[string]any{}
+			}
+			oc["effort"] = ov.ReasoningEffort
+			body["output_config"] = oc
+		} else if ov.ThinkingType == "disabled" {
+			delete(body, "output_config")
+		}
+	default:
+		if ov.ThinkingType != "" {
+			body["thinking"] = map[string]any{"type": ov.ThinkingType}
+		}
+		if ov.ReasoningEffort != "" {
+			body["reasoning_effort"] = ov.ReasoningEffort
+		} else if ov.ThinkingType == "disabled" {
+			delete(body, "reasoning_effort")
+		}
+	}
+	updated, err := json.Marshal(body)
+	if err != nil {
+		req.Body = io.NopCloser(strings.NewReader(raw))
+		return
+	}
+	req.Body = io.NopCloser(bytes.NewReader(updated))
+	req.ContentLength = int64(len(updated))
+	req.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(updated)), nil
+	}
 }

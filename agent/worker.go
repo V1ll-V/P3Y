@@ -13,6 +13,7 @@ import (
 	"p3y/db"
 	"p3y/intercept"
 	"github.com/Autumn-27/norma/agentcore"
+	"github.com/Autumn-27/norma/compaction"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/permission"
@@ -478,8 +479,12 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	if ctfMode {
 		settle = &harness.Settlement{Prompt: ctfSettlePrompt, MaxTurns: 1, DisabledTools: ctfExecutionTools}
 	}
+	workerProv := withRoleThinking(w.prov, "worker", "", false)
+	if ctfMode && phase == "recon" {
+		workerProv = withRoleThinking(w.prov, "worker_recon", "worker", true)
+	}
 	opts := agentcore.Options{
-		Provider:        w.prov,
+		Provider:        workerProv,
 		SystemPrompt:    system,
 		DynamicBoundary: boundary,
 		Tools:           tools,
@@ -551,6 +556,21 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// 实验功能:开启后由 noa 接管上下文压缩(归档集中在 <workDir>/noa/<SessionID> 下,持久)。
 	noaSession := WorkerSessionID(ts.ID(), intent.ID)
 	enableNoa(&opts, w.noaEnabledFn, w.workDir, noaSession, noaWarn(noaSession))
+	if ctfMode && !isCTFHelperContext(ctx) && !isCTFForkBranchContext(ctx) {
+		baseCompactor := opts.Compactor
+		if baseCompactor == nil && opts.Compaction != nil {
+			baseCompactor = compaction.New(*opts.Compaction, compaction.ProviderSummarizer(workerProv, opts.MaxTokens, opts.NonStreaming))
+			opts.Compaction = nil
+		}
+		var rwPG *db.DB
+		if ts != nil {
+			rwPG = ts.Database()
+		}
+		rwCtrl := newCTFRewindController(baseCompactor, filepath.Join(w.workDir, "transcripts", "savepoints"), opts.SessionID, rwPG, taskID, emitWrap)
+		opts.Compactor = wrapCompactorWithRewind(rwCtrl)
+		opts.Hooks = ctfRewindHooks{inner: opts.Hooks, ctrl: rwCtrl}
+		ctx = withCTFRewindController(ctx, rwCtrl)
+	}
 	ctx = attachSideCapture(ctx, &opts)
 	s := agentcore.NewSession(opts)
 	defer s.Close() // release the session's background-task manager (temp dir + processes)

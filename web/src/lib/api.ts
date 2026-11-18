@@ -1180,6 +1180,8 @@ export const api = {
       trigger_run_mode?: "serial" | "parallel";
       trigger_merge_mode?: "by_task" | "all" | "none";
       trigger_max_parallel?: number;
+      thinking_type?: string;
+      reasoning_effort?: string;
     },
   ) => put<{ ok: boolean }>(`/agents/${key}/config`, patch),
   agentPromptVersions: (key: string) =>

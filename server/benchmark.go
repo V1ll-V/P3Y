@@ -1165,15 +1165,97 @@ func challengeFactCount(m *Manager, boundTaskID *int64) int {
 	return total
 }
 
+type difficultyTier struct {
+	rank     int
+	keywords []string
+}
+
+var benchmarkDifficultyTiers = []difficultyTier{
+	// Match composite modifiers before single base difficulty words.
+	{rank: 150, keywords: []string{"very easy", "veryeasy", "super easy", "极简"}},
+	{rank: 250, keywords: []string{"easy-medium", "medium-easy", "easy medium", "medium easy", "较易"}},
+	{rank: 350, keywords: []string{"medium-hard", "hard-medium", "medium hard", "hard medium"}},
+	{rank: 500, keywords: []string{"very hard", "veryhard", "insane", "expert", "extreme", "hell", "master", "nightmare", "brutal", "lunatic", "地狱", "极难", "专家", "魔鬼", "超难"}},
+	{rank: 100, keywords: []string{"checkin", "check-in", "welcome", "baby", "trivial", "warmup", "warm-up", "warm up", "intro", "introductory", "beginner", "newbie", "rookie", "piece of cake", "签到", "热身", "入门", "新手"}},
+	{rank: 200, keywords: []string{"easy", "simple", "basic", "elementary", "junior", "low", "简单", "容易", "初级", "低"}},
+	{rank: 300, keywords: []string{"medium", "normal", "moderate", "intermediate", "standard", "average", "regular", "mid", "med", "中等", "中级", "普通", "中"}},
+	{rank: 400, keywords: []string{"hard", "difficult", "challenging", "advanced", "tough", "senior", "high", "困难", "较难", "高级", "高"}},
+}
+
+func challengeDifficultyRank(ch *db.BenchmarkChallenge) (bool, int) {
+	if ch == nil {
+		return false, 0
+	}
+	raw := strings.ToLower(strings.TrimSpace(ch.Difficulty))
+	switch raw {
+	case "", "auto", "unknown", "none", "null", "n/a", "na", "-", "--", "unset", "未标记", "未知", "自动":
+		if ch.Level > 0 {
+			return true, ch.Level * 100
+		}
+		return false, 0
+	}
+
+	spaced := strings.NewReplacer("-", " ", "_", " ", ":", " ", "/", " ").Replace(raw)
+	tokens := strings.FieldsFunc(raw, func(r rune) bool {
+		switch r {
+		case ' ', '\t', '-', '_', '/', ':', '|', '(', ')', '[', ']', ',', '，', '：':
+			return true
+		}
+		return false
+	})
+	matchKeyword := func(kw string) bool {
+		if raw == kw || spaced == kw {
+			return true
+		}
+		for _, tok := range tokens {
+			if tok == kw {
+				return true
+			}
+		}
+		// Multi-character CJK labels frequently appear inside compound tags (e.g. "困难(Web)").
+		return len([]rune(kw)) >= 2 && kw[0] >= 0x80 && strings.Contains(raw, kw)
+	}
+	for _, tier := range benchmarkDifficultyTiers {
+		for _, kw := range tier.keywords {
+			if matchKeyword(kw) {
+				return true, tier.rank
+			}
+		}
+	}
+
+	if stars := strings.Count(raw, "★") + strings.Count(raw, "⭐"); stars > 0 {
+		return true, stars * 100
+	}
+
+	// Accept numeric or prefixed levels ("1", "2", "lv2", "lv.3", "level 4", "2星").
+	numStr := strings.TrimSpace(spaced)
+	for _, prefix := range []string{"level ", "level", "tier ", "tier", "lv.", "lv ", "lv", "l", "d"} {
+		if strings.HasPrefix(numStr, prefix) {
+			numStr = strings.TrimSpace(strings.TrimPrefix(numStr, prefix))
+			break
+		}
+	}
+	numStr = strings.TrimRight(numStr, "星级")
+	if n, err := strconv.Atoi(strings.TrimSpace(numStr)); err == nil && n > 0 {
+		return true, n * 100
+	}
+
+	if ch.Level > 0 {
+		return true, ch.Level * 100
+	}
+	return false, 0
+}
+
 func pickChallengeQueue(unsolved []*db.BenchmarkChallenge, m *Manager) []*db.BenchmarkChallenge {
 	now := time.Now()
 	idle := make([]*db.BenchmarkChallenge, 0, len(unsolved))
 	highValueHarvest := make(map[string]bool, len(unsolved))
+	hasAnyDifficulty := false
 	for _, ch := range unsolved {
 		if isNoFlagBenchmarkChallenge(ch) {
 			continue
 		}
-		if ch.BoundTaskID != nil {
+		if ch.BoundTaskID != nil && m != nil {
 			if t, ok := m.Task(strconv.FormatInt(*ch.BoundTaskID, 10)); ok && !isTerminalStatus(t.lifecycleSnapshot().Status) {
 				continue
 			}
@@ -1187,6 +1269,9 @@ func pickChallengeQueue(unsolved []*db.BenchmarkChallenge, m *Manager) []*db.Ben
 		if ch.AttemptCount == 1 && ch.AutoRetryCount <= 1 && ch.TotalScore >= 700 && challengeFactCount(m, ch.BoundTaskID) >= 4 {
 			highValueHarvest[ch.UniqueCode] = true
 		}
+		if ok, _ := challengeDifficultyRank(ch); ok {
+			hasAnyDifficulty = true
+		}
 		idle = append(idle, ch)
 	}
 	bucket := func(ch *db.BenchmarkChallenge) int {
@@ -1198,6 +1283,7 @@ func pickChallengeQueue(unsolved []*db.BenchmarkChallenge, m *Manager) []*db.Ben
 		}
 		return 2
 	}
+	const unknownDifficultyRank = 350
 	sort.SliceStable(idle, func(i, j int) bool {
 		bi, bj := bucket(idle[i]), bucket(idle[j])
 		if bi != bj {
@@ -1215,11 +1301,27 @@ func pickChallengeQueue(unsolved []*db.BenchmarkChallenge, m *Manager) []*db.Ben
 		if idle[i].AutoRetryCount != idle[j].AutoRetryCount {
 			return idle[i].AutoRetryCount < idle[j].AutoRetryCount
 		}
+		if hasAnyDifficulty {
+			hasI, rankI := challengeDifficultyRank(idle[i])
+			hasJ, rankJ := challengeDifficultyRank(idle[j])
+			if !hasI {
+				rankI = unknownDifficultyRank
+			}
+			if !hasJ {
+				rankJ = unknownDifficultyRank
+			}
+			if rankI != rankJ {
+				return rankI < rankJ
+			}
+			if hasI && hasJ && idle[i].Level != idle[j].Level && (idle[i].Level > 0 || idle[j].Level > 0) {
+				if idle[i].Level > 0 && idle[j].Level > 0 {
+					return idle[i].Level < idle[j].Level
+				}
+				return idle[i].Level > 0
+			}
+		}
 		if bi == 2 && idle[i].TotalScore != idle[j].TotalScore {
 			return idle[i].TotalScore > idle[j].TotalScore
-		}
-		if idle[i].Level != idle[j].Level {
-			return idle[i].Level < idle[j].Level
 		}
 		return idle[i].ID < idle[j].ID
 	})
@@ -1711,6 +1813,7 @@ func (bm *BenchmarkManager) submitToPlatform(ctx context.Context, sess *db.Bench
 	}
 
 	if res.Correct {
+		_ = bm.s.m.pg.MarkTaskTipsSolved(ctx, taskID)
 		_ = bm.s.m.pg.AppendBenchmarkEvent(ctx, sess.ID, ch.UniqueCode, "flag_accepted",
 			fmt.Sprintf("答案通过平台验证（+%d 分，完成=%v）", res.Awarded, completed), res)
 		noteText := benchmark.RedactSensitive(fmt.Sprintf("Solved %s (%s), awarded %d score.", ch.UniqueCode, ch.Category, res.Awarded))

@@ -337,3 +337,190 @@ print(json.dumps({
 	totalTimeout := min(max(spec.TimeoutSeconds*2+10, 25), 140)
 	return cmd, totalTimeout, nil
 }
+
+// HTTPRaceProbeSpec configures a synchronized barrier burst test for Web race conditions / TOCTOU.
+type HTTPRaceProbeSpec struct {
+	URL            string            `json:"url"`
+	Method         string            `json:"method,omitempty"`
+	Headers        map[string]string `json:"headers,omitempty"`
+	Body           string            `json:"body,omitempty"`
+	Cookies        map[string]string `json:"cookies,omitempty"`
+	PreURL         string            `json:"pre_url,omitempty"`
+	PreMethod      string            `json:"pre_method,omitempty"`
+	PreBody        string            `json:"pre_body,omitempty"`
+	Concurrency    int               `json:"concurrency,omitempty"`
+	TimeoutSeconds int               `json:"timeout_seconds,omitempty"`
+}
+
+// BuildHTTPRaceProbeCommand builds a sandbox Python script that pre-connects N worker
+// sockets, aligns them on a threading.Barrier, and fires simultaneous HTTP requests
+// to detect race condition / TOCTOU anomalies.
+func BuildHTTPRaceProbeCommand(spec HTTPRaceProbeSpec) (string, int, error) {
+	u, err := url.Parse(strings.TrimSpace(spec.URL))
+	if err != nil || u.Hostname() == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return "", 0, fmt.Errorf("url 必须是有效的 http/https 地址")
+	}
+	if strings.TrimSpace(spec.PreURL) != "" {
+		pu, perr := url.Parse(strings.TrimSpace(spec.PreURL))
+		if perr != nil || pu.Hostname() == "" || (pu.Scheme != "http" && pu.Scheme != "https") {
+			return "", 0, fmt.Errorf("pre_url 必须是有效的 http/https 地址")
+		}
+	}
+	method := strings.ToUpper(strings.TrimSpace(spec.Method))
+	if method == "" {
+		if spec.Body != "" {
+			method = "POST"
+		} else {
+			method = "GET"
+		}
+	}
+	switch method {
+	case "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD":
+	default:
+		return "", 0, fmt.Errorf("不支持的 HTTP 方法 %q", method)
+	}
+	spec.Method = method
+	if spec.Concurrency <= 0 {
+		spec.Concurrency = 20
+	}
+	if spec.Concurrency < 2 {
+		spec.Concurrency = 2
+	}
+	if spec.Concurrency > 40 {
+		spec.Concurrency = 40
+	}
+	if spec.TimeoutSeconds <= 0 {
+		spec.TimeoutSeconds = 10
+	}
+	if spec.TimeoutSeconds > 30 {
+		spec.TimeoutSeconds = 30
+	}
+	cfgBytes, err := json.Marshal(spec)
+	if err != nil {
+		return "", 0, err
+	}
+	script := `import base64, hashlib, http.client, json, os, ssl, sys, threading, time, urllib.parse, urllib.request
+
+cfg = json.loads(base64.b64decode(sys.argv[1]).decode('utf-8'))
+ssl_ctx = None
+ca_file = os.environ.get('SSL_CERT_FILE') or os.environ.get('REQUESTS_CA_BUNDLE')
+if ca_file and os.path.exists(ca_file):
+    ssl_ctx = ssl.create_default_context(cafile=ca_file)
+elif os.environ.get('HTTPS_PROXY') or os.environ.get('HTTP_PROXY'):
+    ssl_ctx = ssl.create_default_context()
+
+def build_headers():
+    h = dict(cfg.get('headers') or {})
+    if cfg.get('cookies'):
+        ck = '; '.join(f"{k}={v}" for k, v in cfg['cookies'].items())
+        h['Cookie'] = (h.get('Cookie') + '; ' if h.get('Cookie') else '') + ck
+    return h
+
+if cfg.get('pre_url'):
+    pm = (cfg.get('pre_method') or ('POST' if cfg.get('pre_body') else 'GET')).upper()
+    pdata = (cfg.get('pre_body') or '').encode('utf-8') if cfg.get('pre_body') else None
+    preq = urllib.request.Request(cfg['pre_url'], data=pdata, headers=build_headers(), method=pm)
+    try:
+        with urllib.request.urlopen(preq, timeout=cfg['timeout_seconds'], context=ssl_ctx) as _:
+            pass
+    except Exception:
+        pass
+
+u = urllib.parse.urlsplit(cfg['url'])
+path = u.path or '/'
+if u.query:
+    path += '?' + u.query
+proxy_url = os.environ.get('HTTPS_PROXY' if u.scheme == 'https' else 'HTTP_PROXY') or os.environ.get('https_proxy' if u.scheme == 'https' else 'http_proxy')
+n = cfg['concurrency']
+barrier = threading.Barrier(n, timeout=cfg['timeout_seconds'])
+headers = build_headers()
+body_bytes = (cfg.get('body') or '').encode('utf-8') if cfg.get('body') else None
+if body_bytes is not None and not any(k.lower() == 'content-type' for k in headers):
+    headers['Content-Type'] = 'application/x-www-form-urlencoded'
+
+results = [None] * n
+
+def make_conn():
+    host = u.hostname
+    port = u.port or (443 if u.scheme == 'https' else 80)
+    if proxy_url:
+        pu = urllib.parse.urlsplit(proxy_url)
+        ph, pp = pu.hostname, pu.port or 80
+        if u.scheme == 'https':
+            c = http.client.HTTPSConnection(ph, pp, timeout=cfg['timeout_seconds'], context=ssl_ctx)
+            c.set_tunnel(host, port)
+            return c, path
+        c = http.client.HTTPConnection(ph, pp, timeout=cfg['timeout_seconds'])
+        return c, cfg['url']
+    if u.scheme == 'https':
+        return http.client.HTTPSConnection(host, port, timeout=cfg['timeout_seconds'], context=ssl_ctx), path
+    return http.client.HTTPConnection(host, port, timeout=cfg['timeout_seconds']), path
+
+def worker(idx):
+    conn = None
+    status = 0
+    raw = b''
+    err_str = ''
+    t0 = 0.0
+    try:
+        conn, req_target = make_conn()
+        conn.connect()
+        barrier.wait()
+        t0 = time.monotonic()
+        conn.request(cfg['method'], req_target, body=body_bytes, headers=headers)
+        resp = conn.getresponse()
+        status = resp.status
+        raw = resp.read(65536)
+    except Exception as e:
+        err_str = str(e)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    elapsed_ms = int((time.monotonic() - t0) * 1000) if t0 else 0
+    sha = hashlib.sha256(raw).hexdigest()[:12]
+    results[idx] = {
+        'status': status,
+        'length': len(raw),
+        'sha256': sha,
+        'elapsed_ms': elapsed_ms,
+        'error': err_str,
+        'excerpt': raw.decode('utf-8', 'replace')[:320],
+    }
+
+threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+
+clusters = {}
+elapsed_list = []
+for r in results:
+    sig = (r['status'], r['length'], r['sha256'], r['error'])
+    if sig not in clusters:
+        clusters[sig] = {'status': r['status'], 'length': r['length'], 'sha256': r['sha256'], 'error': r['error'], 'count': 0, 'excerpt': r['excerpt']}
+    clusters[sig]['count'] += 1
+    if r['elapsed_ms'] > 0:
+        elapsed_list.append(r['elapsed_ms'])
+
+cluster_list = sorted(clusters.values(), key=lambda c: -c['count'])
+non_err = [c for c in cluster_list if not c['error'] and c['status'] > 0]
+out = {
+    'concurrency': n,
+    'distinct_clusters': len(cluster_list),
+    'race_anomaly': len(non_err) > 1,
+    'elapsed_min_ms': min(elapsed_list) if elapsed_list else 0,
+    'elapsed_max_ms': max(elapsed_list) if elapsed_list else 0,
+    'clusters': cluster_list[:8],
+}
+print(json.dumps(out, ensure_ascii=False))
+`
+	b64Script := base64.StdEncoding.EncodeToString([]byte(script))
+	b64Cfg := base64.StdEncoding.EncodeToString(cfgBytes)
+	cmd := fmt.Sprintf("python3 -c \"import base64; exec(base64.b64decode('%s').decode())\" %s", b64Script, b64Cfg)
+	totalTimeout := min(max(spec.TimeoutSeconds*2+10, 25), 90)
+	return cmd, totalTimeout, nil
+}

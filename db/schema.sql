@@ -831,6 +831,8 @@ CREATE TABLE IF NOT EXISTS agents (
     trigger_run_mode     TEXT    NOT NULL DEFAULT 'serial'  CHECK (trigger_run_mode IN ('serial','parallel')),
     trigger_merge_mode   TEXT    NOT NULL DEFAULT 'all' CHECK (trigger_merge_mode IN ('by_task','all','none')),
     trigger_max_parallel INTEGER NOT NULL DEFAULT 5,
+    thinking_type        TEXT    NOT NULL DEFAULT '',
+    reasoning_effort     TEXT    NOT NULL DEFAULT '',
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT agents_role_ck CHECK (role IN ('goals','main','planner','worker','assistant'))
@@ -839,6 +841,8 @@ CREATE TABLE IF NOT EXISTS agents (
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS trigger_run_mode     TEXT    NOT NULL DEFAULT 'serial';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS trigger_merge_mode   TEXT    NOT NULL DEFAULT 'all';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS trigger_max_parallel INTEGER NOT NULL DEFAULT 5;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS thinking_type        TEXT    NOT NULL DEFAULT '';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS reasoning_effort     TEXT    NOT NULL DEFAULT '';
 -- per-agent LLM 绑定(agent 级默认模型):列自初版即在上方 CREATE 中,此 ALTER 仅为极旧库兜底(幂等)。
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS llm_profile_id BIGINT REFERENCES llm_profiles(id) ON DELETE SET NULL;
 -- run_seconds 单次 run 墙钟默认 600→1200:只改列默认(影响将来新插入的行),不动旧库存量行。
@@ -1730,9 +1734,18 @@ CREATE TABLE IF NOT EXISTS tips_cards (
     pattern_code   TEXT NOT NULL DEFAULT '',
     source_task_id BIGINT,
     hit_count      BIGINT NOT NULL DEFAULT 0,
+    solve_count    BIGINT NOT NULL DEFAULT 0,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE tips_cards ADD COLUMN IF NOT EXISTS solve_count BIGINT NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_tips_cards_category ON tips_cards(category, hit_count DESC, id DESC);
+CREATE TABLE IF NOT EXISTS task_tip_hits (
+    task_id    BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    tip_id     BIGINT NOT NULL REFERENCES tips_cards(id) ON DELETE CASCADE,
+    solved     BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (task_id, tip_id)
+);
 
 -- ============================================================
 --  Stage 5 — 自主攻防 (Attack-Defense: ad_weapons / ad_events)
