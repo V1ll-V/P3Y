@@ -299,6 +299,9 @@ func (c *TSecBenchClient) doJSON(ctx context.Context, method, path string, reqBo
 	if code == "" && resp.StatusCode == http.StatusUnprocessableEntity {
 		code = "validation_error"
 	}
+	if strings.Contains(strings.ToLower(msg), "max active challenge instances") {
+		code = "agent_environment_limit"
+	}
 	return resp.StatusCode, &StructuredError{
 		HTTPStatus: resp.StatusCode,
 		Code:       code,

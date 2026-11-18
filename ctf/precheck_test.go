@@ -167,3 +167,59 @@ func TestVerifyCheckOracle(t *testing.T) {
 		t.Fatalf("expected VerifyCheck fail with exit 2, got %+v err=%v", resFail, err)
 	}
 }
+
+func TestRunPrecheckExtractsWebTextTagsAndBackfillsTips(t *testing.T) {
+	dsn, _, err := db.DSN()
+	if err != nil {
+		t.Skip("test database required")
+	}
+	pg, err := db.Open(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pg.Close()
+
+	// Seed twice to verify idempotency and backfill of all 11 built-in cards.
+	if err := pg.SeedDefaultTips(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := pg.SeedDefaultTips(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	cards, err := pg.ListTips(t.Context(), "web", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundNext := false
+	for _, c := range cards {
+		if strings.Contains(c.Title, "Next.js Middleware") {
+			foundNext = true
+			break
+		}
+	}
+	if !foundNext {
+		t.Fatalf("expected Next.js Middleware tip card to be backfilled, got %d web cards", len(cards))
+	}
+
+	task, err := pg.CreateTaskWithOptions("web-nextjs", "Target https://10.0.128.5:3000 Next.js app with middleware auth and SSRF endpoint", db.TaskCreateOptions{Mode: "ctf", ChallengeType: "web"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pg.DeleteTask(task.ID)
+
+	svc := New(t.TempDir(), pg)
+	res, err := svc.RunPrecheck(t.Context(), task.ID, true)
+	if err != nil {
+		t.Fatalf("RunPrecheck: %v", err)
+	}
+	tagMap := map[string]bool{}
+	for _, tg := range res.Tags {
+		tagMap[tg] = true
+	}
+	if !tagMap["nextjs"] || !tagMap["ssrf"] {
+		t.Fatalf("expected text-extracted tags nextjs & ssrf on attachmentless Web task, got %v", res.Tags)
+	}
+	if len(res.MatchedTips) == 0 || !strings.Contains(res.MatchedTips[0].Title, "Next.js Middleware") {
+		t.Fatalf("expected top matched tip card to be Next.js Middleware, got %+v", res.MatchedTips)
+	}
+}

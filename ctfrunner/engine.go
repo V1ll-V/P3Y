@@ -120,6 +120,7 @@ type SessionContainerOptions struct {
 	Task          string
 	InputHash     string
 	VPNHash       string
+	WorkVolume    string
 	HostWorkDir   string
 	HostInputsDir string
 	ExtraEnv      map[string]string
@@ -148,6 +149,10 @@ func (e *Engine) EnsureSessionWithOptions(ctx context.Context, opts SessionConta
 	name, task, inputHash, vpnHash := opts.Name, opts.Task, opts.InputHash, opts.VPNHash
 	hostWork := strings.TrimSpace(opts.HostWorkDir)
 	hostInputs := strings.TrimSpace(opts.HostInputsDir)
+	workVol := strings.TrimSpace(opts.WorkVolume)
+	if hostWork != "" {
+		workVol = ""
+	}
 	envList, envHash := mergeToolEnvironment(opts.ExtraEnv)
 
 	netMode, wgID, err := e.resolveSessionNetwork(ctx, task, vpnHash)
@@ -162,6 +167,7 @@ func (e *Engine) EnsureSessionWithOptions(ctx context.Context, opts SessionConta
 		if c.Config.Labels["p3y.box.vpn"] != vpnHash ||
 			c.Config.Labels["p3y.box.wg_id"] != wgID ||
 			c.Config.Labels["p3y.box.work_mount"] != hostWork ||
+			c.Config.Labels["p3y.box.work_vol"] != workVol ||
 			c.Config.Labels["p3y.box.inputs_mount"] != hostInputs ||
 			c.Config.Labels["p3y.box.env_hash"] != envHash {
 			if err = e.removeContainerOnly(ctx, name); err != nil {
@@ -182,8 +188,14 @@ func (e *Engine) EnsureSessionWithOptions(ctx context.Context, opts SessionConta
 	if hostWork != "" {
 		mounts = append(mounts, map[string]any{"Type": "bind", "Source": hostWork, "Target": "/work"})
 	} else {
-		volume := name + "-work"
-		if err = e.json(ctx, "POST", "/volumes/create", map[string]any{"Name": volume, "Labels": map[string]string{"p3y.box.managed": "true", "p3y.box.task": task}}, nil); err != nil {
+		volume := workVol
+		volLabels := map[string]string{"p3y.box.managed": "true", "p3y.box.task": task}
+		if volume != "" {
+			volLabels["p3y.box.shared_work"] = "true"
+		} else {
+			volume = name + "-work"
+		}
+		if err = e.json(ctx, "POST", "/volumes/create", map[string]any{"Name": volume, "Labels": volLabels}, nil); err != nil {
 			return "", err
 		}
 		mounts = append(mounts, map[string]any{"Type": "volume", "Source": volume, "Target": "/work"})
@@ -198,6 +210,9 @@ func (e *Engine) EnsureSessionWithOptions(ctx context.Context, opts SessionConta
 	}
 	if hostWork != "" {
 		labels["p3y.box.work_mount"] = hostWork
+	}
+	if workVol != "" {
+		labels["p3y.box.work_vol"] = workVol
 	}
 	if hostInputs != "" {
 		labels["p3y.box.inputs_mount"] = hostInputs

@@ -109,6 +109,7 @@ func ctfCategoryPrompt(challenge string, files []artifacts.Artifact) string {
 核心思路：优先轻量请求与源码审计，避免盲目重型扫描；针对性构造 exploit 脚本。
 1. 轻量化请求优先：
    - 优先使用 ctf_http / http_send 工具测试目标 HTTP 响应头、Cookie、页面内容及回显（启用抓包时流量自动入库，可用 traffic_search/traffic_get 检索），严禁无针对性盲目发起重型目录爆破；遇复杂 JS 渲染/多步浏览器交互可通过 Skill 加载 playwright-cli。
+   - **单脚本枚举上限与早停**：编写参数/路径/类/Gadget/口令测试脚本时，单批次不得超过 150 个载荷；前 50~100 次返回完全相同的状态码与响应体特征时必须立即 break 并更换漏洞假设，严禁单脚本发上千次盲测。
 2. 源码审计与敏感泄露：
    - 检查源码泄露：.git/、.svn/、.DS_Store、备份文件（.index.php.swp、www.zip）。
    - PHP 特性审计：extract() 变量覆盖、弱类型比较（== vs ===）、md5 0e 绕过、PHP 伪协议（php://filter/read=convert.base64-encode/resource=...）、反序列化 POP 链构造。

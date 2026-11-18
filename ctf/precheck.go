@@ -80,6 +80,46 @@ func extractTargets(texts ...string) []string {
 	return out
 }
 
+func extractTextTags(texts ...string) []string {
+	joined := strings.ToLower(strings.Join(texts, "\n"))
+	rules := []struct {
+		tag     string
+		needles []string
+	}{
+		{"nextjs", []string{"nextjs", "next.js", "_next", "x-middleware-subrequest"}},
+		{"middleware", []string{"middleware", "中间件"}},
+		{"ssrf", []string{"ssrf", "server-side request", "服务端请求伪造"}},
+		{"react", []string{"react", "flight", "next.js", "rsc"}},
+		{"nodejs", []string{"node.js", "nodejs", "express", "nextjs"}},
+		{"nginx", []string{"nginx", "x-accel-redirect"}},
+		{"php", []string{"php", "php_serialize", ".php"}},
+		{"session", []string{"session", "phpsessid", "cookie"}},
+		{"unserialize", []string{"unserialize", "反序列化", "php_serialize"}},
+		{"lfi", []string{"lfi", "php://filter", "include(", "文件包含"}},
+		{"postgres", []string{"postgres", "postgresql", "pg_read_file", "dblink"}},
+		{"dblink", []string{"dblink"}},
+		{"sql", []string{"sql", "sqli", "注入", "postgres", "mysql", "sqlite"}},
+		{"waf", []string{"waf", "防火墙", "拦截"}},
+		{"python", []string{"python", "bottle", "flask", "jinja", "werkzeug"}},
+		{"bottle", []string{"bottle"}},
+		{"jinja2", []string{"jinja", "flask"}},
+		{"ssti", []string{"ssti", "模板注入", "template injection", "bottle", "jinja"}},
+		{"captcha", []string{"captcha", "验证码"}},
+		{"pow", []string{"proof of work", "工作量证明", "pow"}},
+		{"race_condition", []string{"race condition", "race_condition", "竞态", "并发", "双花"}},
+	}
+	var out []string
+	for _, r := range rules {
+		for _, nd := range r.needles {
+			if strings.Contains(joined, nd) {
+				out = append(out, r.tag)
+				break
+			}
+		}
+	}
+	return out
+}
+
 func inspectArtifactFile(a artifacts.Artifact, diskPath string) PrecheckFile {
 	pf := PrecheckFile{
 		ID:          a.ID,
@@ -367,6 +407,9 @@ func (s *Service) RunPrecheck(ctx context.Context, taskID int64, force bool) (*P
 	}
 	if taskRow.ChallengeType != "" && taskRow.ChallengeType != "auto" {
 		tagSet[strings.ToLower(taskRow.ChallengeType)] = true
+	}
+	for _, tg := range extractTextTags(taskRow.Description, taskRow.Goal) {
+		tagSet[tg] = true
 	}
 	tags := make([]string, 0, len(tagSet))
 	for t := range tagSet {

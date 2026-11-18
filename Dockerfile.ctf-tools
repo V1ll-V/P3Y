@@ -50,6 +50,21 @@ RUN chmod +x /opt/ctf/scripts/probe_target.py /opt/ctf/scripts/pcap_analyze.py /
     && ln -s /opt/ctf/scripts/pwn_triage.py /usr/local/bin/ctf-pwn-triage \
     && python3 /tmp/build_glibc_pool.py \
     && rm -f /tmp/build_glibc_pool.py
+# 离线 OCR（Captcha / PoW 自动化）与 PHP Filter Chain 利用链生成工具。置于末尾以复用基础层缓存。
+RUN (sed -i 's/mirrors.aliyun.com/mirrors.tuna.tsinghua.edu.cn/g; s/deb.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true) \
+    && apt-get -o Acquire::http::Timeout=300 -o Acquire::Retries=8 update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y -o Acquire::http::Timeout=300 -o Acquire::Retries=8 --fix-missing --no-install-recommends \
+    tesseract-ocr tesseract-ocr-eng libgl1 libglib2.0-0 && rm -rf /var/lib/apt/lists/*
+RUN /opt/ctf/pwn/bin/pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    ddddocr pytesseract opencv-python-headless pillow \
+    && /opt/ctf/pwn/bin/pip check \
+    && /opt/ctf/pwn/bin/pip freeze > /opt/ctf/pwn-lock.txt
+COPY docker/ctf-tools/php_filter_chain_generator.py /opt/tools/php_filter_chain_generator/php_filter_chain_generator.py
+RUN chmod +x /opt/tools/php_filter_chain_generator/php_filter_chain_generator.py \
+    && ln -sf /opt/tools/php_filter_chain_generator/php_filter_chain_generator.py /usr/local/bin/php_filter_chain_generator \
+    && /opt/ctf/pwn/bin/python3 -c "import ddddocr, cv2, pytesseract; d = ddddocr.DdddOcr(show_ad=False); assert hasattr(d, 'classification')" \
+    && /opt/ctf/pwn/bin/python3 /usr/local/bin/php_filter_chain_generator --chain '<?php echo 1; ?>' >/dev/null \
+    && chmod -R a+rX /opt/ctf/pwn /opt/tools/php_filter_chain_generator
 ENV PATH="/opt/ctf/pwn/bin:${PATH}" HOME=/work XDG_CACHE_HOME=/work/.cache XDG_CONFIG_HOME=/work/.config JAVA_TOOL_OPTIONS="-Duser.home=/work" PYTHONPYCACHEPREFIX=/tmp/pycache PWNLIB_NOTERM=1 TERM=dumb
 RUN useradd --uid 1000 --create-home ctf && mkdir -p /work && chown 1000:1000 /work
 USER 1000:1000

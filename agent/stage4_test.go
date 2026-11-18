@@ -165,6 +165,43 @@ func TestStage4Critic3FailureHook(t *testing.T) {
 	}
 }
 
+func TestStage4CriticSoftFailureAndStagnation(t *testing.T) {
+	advisorCalls := 0
+	hooks := newCTFCriticHooks(nil, nil, nil, 0, 0, nil)
+	hooks.advisor = func(_ context.Context, _ string) (string, error) {
+		advisorCalls++
+		return "不要继续死等 502 或吞错空转。", nil
+	}
+
+	// Soft failure inside exit=0 stdout must trigger after 3 occurrences.
+	softFail := []byte(`{"exit_code":0,"stdout_excerpt":"HTTP/1.1 502 Bad Gateway"}`)
+	hooks.PostToolUse(t.Context(), "Bash", []byte(`{"command":"curl -s target"}`), softFail, false)
+	hooks.PostToolUse(t.Context(), "Bash", []byte(`{"command":"curl -s target"}`), softFail, false)
+	hooks.PostToolUse(t.Context(), "Bash", []byte(`{"command":"curl -s target"}`), softFail, false)
+	if advisorCalls != 1 {
+		t.Fatalf("expected soft 502 failures to trigger critic, got advisorCalls=%d", advisorCalls)
+	}
+	if _, msg, _ := hooks.PreToolUse(t.Context(), "Bash", []byte(`{}`)); !strings.Contains(msg, "Critic 反向证伪提醒 #1") {
+		t.Fatalf("expected PreToolUse critique after soft failures, got %q", msg)
+	}
+
+	// 9 clean calls + record_fact resets stagnation counter; 10 calls without fact triggers critic #2.
+	okRes := []byte(`{"exit_code":0,"stdout_excerpt":"200 OK empty"}`)
+	for i := 0; i < 9; i++ {
+		hooks.PostToolUse(t.Context(), "ctf_http", []byte(`{}`), okRes, false)
+	}
+	hooks.PostToolUse(t.Context(), "record_fact", []byte(`{}`), []byte(`{"ok":true}`), false)
+	if advisorCalls != 1 {
+		t.Fatalf("expected no stagnation trigger before threshold after record_fact, got %d", advisorCalls)
+	}
+	for i := 0; i < 10; i++ {
+		hooks.PostToolUse(t.Context(), "ctf_http", []byte(`{}`), okRes, false)
+	}
+	if advisorCalls != 2 {
+		t.Fatalf("expected 10 monitored calls without fact/board progress to trigger critic #2, got %d", advisorCalls)
+	}
+}
+
 func TestStage4AskHelperBoundedAndScoped(t *testing.T) {
 	dsn, _, err := db.DSN()
 	if err != nil {
@@ -381,5 +418,56 @@ func TestStage4PlateauForkParallelBranchesAndRewindTrigger(t *testing.T) {
 	execMu.Unlock()
 	if !strings.Contains(cmds, "/work/.forks/") || !strings.Contains(cmds, "/winner") {
 		t.Fatalf("expected fork workdir & promotion commands, got:\n%s", cmds)
+	}
+}
+
+func TestCTFVPNStatusHookAndIsolatedHTTPPaths(t *testing.T) {
+	dsn, _, err := db.DSN()
+	if err != nil {
+		t.Skip("test database required")
+	}
+	pg, err := db.Open(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pg.Close()
+
+	task, err := pg.CreateTaskWithOptions("vpn-oob-test", "http://10.0.128.10:8000", db.TaskCreateOptions{Mode: "ctf", ChallengeType: "web"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pg.DeleteTask(task.ID)
+
+	ovpnCfg := "client\ndev tun\nproto udp\nremote 1.2.3.4 1194\n<ca>\nCA\n</ca>\n<cert>\nCERT\n</cert>\n<key>\nKEY\n</key>\n"
+	if err := pg.SetTaskCTFVPN(t.Context(), task.ID, ovpnCfg, strings.Repeat("a", 64), "client.ovpn"); err != nil {
+		t.Fatal(err)
+	}
+
+	oldHook := CTFVPNStatusHook
+	defer func() { CTFVPNStatusHook = oldHook }()
+	CTFVPNStatusHook = func(_ context.Context, tid int64, _ string) (string, string, string) {
+		if tid == task.ID {
+			return "tun0", "10.254.1.48/24", "1.2.3.4:1194"
+		}
+		return "", "", ""
+	}
+
+	ts := pg.Exploration(task.ExplorationID)
+	rendered, err := taskInputContext(t.TempDir(), ts, task.ID, 1)
+	if err != nil {
+		t.Fatalf("taskInputContext: %v", err)
+	}
+	if !strings.Contains(rendered, "10.254.1.48") || !strings.Contains(rendered, "0.0.0.0:<端口>") || strings.Contains(rendered, "ctfy-callback") {
+		t.Fatalf("expected real tun0 IP 10.254.1.48 & 0.0.0.0 callback hint without ctfy-callback, got:\n%s", rendered)
+	}
+
+	cmd, _, err := ctfHTTPCommand(map[string]json.RawMessage{
+		"url": json.RawMessage(`"http://10.0.128.10:8000/"`),
+	})
+	if err != nil {
+		t.Fatalf("ctfHTTPCommand: %v", err)
+	}
+	if !strings.Contains(cmd, "/tmp/.ctf-http/cookies") || !strings.Contains(cmd, "/tmp/.ctf-http/response-body.txt") {
+		t.Fatalf("expected ctf_http transient files under /tmp/.ctf-http, got:\n%s", cmd)
 	}
 }

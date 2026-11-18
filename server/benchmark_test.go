@@ -1177,3 +1177,171 @@ func TestBenchmarkTimeoutSettingsAutoRetryAndMemoryInheritance(t *testing.T) {
 		t.Fatalf("expected goal to mention inherited prior exploration memory, got %q", newTask.Goal)
 	}
 }
+
+type mock409LimitProvider struct {
+	mockDetailFirstProvider
+	startCalls int
+}
+
+func (m *mock409LimitProvider) StartEnvironment(_ context.Context, id string) (*benchmark.EnvState, error) {
+	m.startCalls++
+	return nil, &benchmark.StructuredError{
+		HTTPStatus: 409,
+		Code:       "invalid_state",
+		Message:    "max active challenge instances reached (3), please close an existing challenge",
+	}
+}
+
+func TestBenchmarkTSecBench409InstanceLimitNoRetryBurn(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) - skipping", err)
+	}
+	defer m.Close()
+
+	td := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := New(ctx, m, td, td, td)
+
+	sess, err := s.m.pg.CreateBenchmarkSession(t.Context(), db.BenchmarkSessionCreate{
+		Name:          "tsecbench-409-cap-test",
+		Provider:      "tsecbench",
+		BaseURL:       "https://tsecbench.example",
+		MaxConcurrent: 5,
+		HintPolicy:    "never",
+	})
+	if err != nil {
+		t.Fatalf("CreateBenchmarkSession: %v", err)
+	}
+	t.Cleanup(func() {
+		cancel()
+		_ = s.m.pg.DeleteBenchmarkSession(context.Background(), sess.ID)
+	})
+
+	if err := s.m.pg.SyncBenchmarkChallenges(t.Context(), sess.ID, []db.BenchmarkChallengeUpsert{
+		{
+			UniqueCode:      "ch-a",
+			Title:           "ch-a",
+			Description:     "Web A",
+			Category:        "web",
+			SubmissionType:  "flag",
+			TotalScore:      100,
+			FlagCount:       1,
+			ContainerStatus: "stopped",
+			Meta:            json.RawMessage(`{"has_container":true}`),
+		},
+		{
+			UniqueCode:      "ch-b",
+			Title:           "ch-b",
+			Description:     "Web B",
+			Category:        "web",
+			SubmissionType:  "flag",
+			TotalScore:      100,
+			FlagCount:       1,
+			ContainerStatus: "stopped",
+			Meta:            json.RawMessage(`{"has_container":true}`),
+		},
+	}); err != nil {
+		t.Fatalf("SyncBenchmarkChallenges: %v", err)
+	}
+	_ = s.m.pg.UpdateBenchmarkSessionStatus(t.Context(), sess.ID, "running", "")
+
+	prov := &mock409LimitProvider{}
+	rt := &benchSessionRuntime{
+		sessionID:   sess.ID,
+		prov:        prov,
+		lastEnvPoll: map[string]time.Time{},
+		taskStartAt: map[string]time.Time{},
+	}
+	if err := s.bench.tickSession(t.Context(), sess.ID, rt, 5); err != nil {
+		t.Fatalf("tickSession: %v", err)
+	}
+	if rt.platformEnvCap != 3 {
+		t.Fatalf("expected runtime platformEnvCap=3 learned from 409 message, got %d", rt.platformEnvCap)
+	}
+	if prov.startCalls != 1 {
+		t.Fatalf("expected tickSession to stop launching after first 409 quota limit, got %d calls", prov.startCalls)
+	}
+	chA, _ := s.m.pg.GetBenchmarkChallenge(t.Context(), sess.ID, "ch-a")
+	chB, _ := s.m.pg.GetBenchmarkChallenge(t.Context(), sess.ID, "ch-b")
+	if chA.AutoRetryCount != 0 || chA.LastError != "" || chB.AutoRetryCount != 0 || chB.LastError != "" {
+		t.Fatalf("409 instance limit must not burn auto_retry_count or stamp last_error: A=%+v B=%+v", chA, chB)
+	}
+}
+
+type mockStagnantHintProvider struct {
+	mockDetailFirstProvider
+	hintCalls int
+}
+
+func (m *mockStagnantHintProvider) GetHint(_ context.Context, _ string) (string, error) {
+	m.hintCalls++
+	return "try PHP filter chain", nil
+}
+
+func TestBenchmarkEarlyStagnantHintAndHighScorePriority(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) - skipping", err)
+	}
+	defer m.Close()
+
+	s := &Server{m: m}
+	s.registerBenchmarkHooks()
+
+	// Create bound task with 1 exhausted intent and 4 facts so both stagnation and high-score priority trigger.
+	bt, err := m.CreateTaskWithOptions("[high] test", "goal", db.TaskCreateOptions{Mode: "ctf", ChallengeType: "web"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.DeleteTask(bt.ID, DeleteTaskOptions{})
+	btID, _ := strconv.ParseInt(bt.ID, 10, 64)
+	if _, err := bt.Store.AddNode("intent", map[string]any{"title": "dead path"}, 0, "exhausted", "planner", nil); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4; i++ {
+		if _, err := bt.Store.AddNode("fact", map[string]any{"summary": fmt.Sprintf("fact %d", i)}, 0, "confirmed", "worker", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sess := &db.BenchmarkSession{
+		ID:                  9901,
+		HintPolicy:          "stagnant_only",
+		PerChallengeTimeout: 3000, // 50m; earlyWindow = 10m
+	}
+	chHigh := &db.BenchmarkChallenge{
+		ID:          1,
+		SessionID:   sess.ID,
+		UniqueCode:  "high",
+		TotalScore:  1000,
+		BoundTaskID: &btID,
+		HintUsed:    false,
+	}
+	prov := &mockStagnantHintProvider{}
+	rt := &benchSessionRuntime{
+		sessionID:   sess.ID,
+		prov:        prov,
+		lastEnvPoll: map[string]time.Time{},
+		taskStartAt: map[string]time.Time{"high": time.Now().Add(-11 * time.Minute)},
+	}
+	_ = s.bench.checkChallengeTimeoutAndHint(t.Context(), rt, sess, chHigh, true)
+	if prov.hintCalls != 1 {
+		t.Fatalf("expected early GetHint trigger at 11m with exhausted intent, got %d calls", prov.hintCalls)
+	}
+
+	// Verify pickChallengeQueue prioritizes high-score partial-progress round-2 retry ahead of untouched/low-score items.
+	past := time.Now().Add(-1 * time.Second)
+	if err := m.SetTaskStatus(bt.ID, "timeout"); err != nil {
+		t.Fatal(err)
+	}
+	q := pickChallengeQueue([]*db.BenchmarkChallenge{
+		{ID: 1, UniqueCode: "untouched", TotalScore: 200, Level: 1, AttemptCount: 0},
+		{ID: 2, UniqueCode: "low-retry", TotalScore: 200, Level: 1, AttemptCount: 1, AutoRetryCount: 1, NextRetryAt: &past},
+		{ID: 3, UniqueCode: "high-partial", TotalScore: 950, Level: 3, AttemptCount: 1, AutoRetryCount: 1, BoundTaskID: &btID, NextRetryAt: &past},
+	}, m)
+	if len(q) != 3 || q[0].UniqueCode != "high-partial" || q[1].UniqueCode != "untouched" || q[2].UniqueCode != "low-retry" {
+		t.Fatalf("unexpected priority queue order: %+v", []string{q[0].UniqueCode, q[1].UniqueCode, q[2].UniqueCode})
+	}
+}

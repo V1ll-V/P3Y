@@ -25,6 +25,7 @@ type SessionSpec struct {
 	IntentID      int64             `json:"intent_id"`
 	InputHash     string            `json:"input_hash"`
 	VPNHash       string            `json:"vpn_hash,omitempty"`
+	WorkVolume    string            `json:"work_volume,omitempty"`
 	HostWorkDir   string            `json:"host_work_dir,omitempty"`
 	HostInputsDir string            `json:"host_inputs_dir,omitempty"`
 	Env           map[string]string `json:"env,omitempty"`
@@ -34,10 +35,13 @@ type Session struct {
 	ContainerID string      `json:"container_id"`
 	Name        string      `json:"name"`
 	InputsReady bool        `json:"inputs_ready"`
+	WorkSeeded  bool        `json:"work_seeded,omitempty"`
 	ImageID     string      `json:"image_id"`
 	Image       string      `json:"image"`
 	UpdatedAt   time.Time   `json:"updated_at"`
 }
+
+var workVolumePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$`)
 
 func (s SessionSpec) Key() string {
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%d/%d/%s", s.TaskID, s.IntentID, s.InputHash)))
@@ -45,6 +49,9 @@ func (s SessionSpec) Key() string {
 }
 func (s SessionSpec) Valid() bool {
 	_, err := hex.DecodeString(s.InputHash)
+	if wv := strings.TrimSpace(s.WorkVolume); wv != "" && !workVolumePattern.MatchString(wv) {
+		return false
+	}
 	return s.TaskID > 0 && s.IntentID >= 0 && len(s.InputHash) == 64 && err == nil
 }
 
@@ -96,6 +103,37 @@ func (s *Server) load(key string) (*Session, error) {
 	}
 	return &v, nil
 }
+func (s *Server) workSeedMarkerPath(workVol, hostWorkDir string) string {
+	if s == nil || s.StateDir == "" || strings.TrimSpace(hostWorkDir) != "" {
+		return ""
+	}
+	vol := strings.TrimSpace(workVol)
+	if vol == "" || !workVolumePattern.MatchString(vol) {
+		return ""
+	}
+	return filepath.Join(s.StateDir, "vol-"+vol+".seeded")
+}
+
+func (s *Server) isWorkVolumeSeeded(workVol, hostWorkDir string) bool {
+	p := s.workSeedMarkerPath(workVol, hostWorkDir)
+	if p == "" {
+		return false
+	}
+	_, err := os.Stat(p)
+	return err == nil
+}
+
+func (s *Server) markWorkVolumeSeeded(workVol, hostWorkDir string) bool {
+	p := s.workSeedMarkerPath(workVol, hostWorkDir)
+	if p == "" {
+		return false
+	}
+	if err := os.MkdirAll(s.StateDir, 0700); err != nil {
+		return false
+	}
+	return os.WriteFile(p, []byte("1\n"), 0600) == nil
+}
+
 func reply(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -142,6 +180,7 @@ func (s *Server) Handler() http.Handler {
 			Task:          fmt.Sprint(spec.TaskID),
 			InputHash:     spec.InputHash,
 			VPNHash:       strings.TrimSpace(spec.VPNHash),
+			WorkVolume:    strings.TrimSpace(spec.WorkVolume),
 			HostWorkDir:   spec.HostWorkDir,
 			HostInputsDir: spec.HostInputsDir,
 			ExtraEnv:      spec.Env,
@@ -153,6 +192,7 @@ func (s *Server) Handler() http.Handler {
 		if v.ContainerID != id {
 			v.InputsReady = false
 		}
+		v.WorkSeeded = s.isWorkVolumeSeeded(spec.WorkVolume, spec.HostWorkDir)
 		v.ContainerID = id
 		container, inspectErr := s.Engine.Container(r.Context(), id)
 		if inspectErr != nil {
@@ -297,6 +337,8 @@ func (s *Server) putFiles(w http.ResponseWriter, r *http.Request, inputs bool) {
 	}
 	if inputs {
 		v.InputsReady = true
+	} else if s.markWorkVolumeSeeded(v.Spec.WorkVolume, v.Spec.HostWorkDir) {
+		v.WorkSeeded = true
 	}
 	if err = s.save(v); err != nil {
 		fail(w, err)

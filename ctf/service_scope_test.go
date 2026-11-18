@@ -1,11 +1,16 @@
 package ctf
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
+	"p3y/ctfrunner"
 	"p3y/db"
 )
 
@@ -87,5 +92,102 @@ func TestResolveScopeSharedVsIsolated(t *testing.T) {
 	wsi2, wwd2, _, wsh2 := svc.resolveScope(t.Context(), webTask.ID, 202)
 	if wsh1 || wsh2 || wsi1 != 201 || wsi2 != 202 || wwd1 == wwd2 {
 		t.Fatalf("expected isolated Web scope across intents: (%d,%s,%v) vs (%d,%s,%v)", wsi1, wwd1, wsh1, wsi2, wwd2, wsh2)
+	}
+}
+
+func TestSharedWorkVolumeAcrossIntentsAndSourceTaskRetries(t *testing.T) {
+	dsn, _, err := db.DSN()
+	if err != nil {
+		t.Skip("test database required")
+	}
+	pg, err := db.Open(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pg.Close()
+
+	srcTask, err := pg.CreateTaskWithOptions("web-root", "goal", db.TaskCreateOptions{Mode: "ctf", ChallengeType: "web"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pg.DeleteTask(srcTask.ID)
+
+	retryTask, err := pg.CreateTaskWithOptions("web-retry", "goal", db.TaskCreateOptions{
+		Mode:          "ctf",
+		ChallengeType: "web",
+		SourceTaskIDs: []int64{srcTask.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pg.DeleteTask(retryTask.ID)
+
+	var (
+		mu       sync.Mutex
+		specs    []ctfrunner.SessionSpec
+		putWorks int
+	)
+	seeded := false
+	runnerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/sessions":
+			var spec ctfrunner.SessionSpec
+			_ = json.NewDecoder(r.Body).Decode(&spec)
+			mu.Lock()
+			specs = append(specs, spec)
+			wasSeeded := seeded
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(ctfrunner.Session{
+				Spec:        spec,
+				ContainerID: "cid-shared",
+				Name:        "p3y-box-" + spec.Key(),
+				InputsReady: true,
+				WorkSeeded:  wasSeeded,
+			})
+		case r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/work"):
+			mu.Lock()
+			putWorks++
+			seeded = true
+			mu.Unlock()
+			w.Write([]byte(`{"ok":true}`))
+		default:
+			w.WriteHeader(200)
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer runnerSrv.Close()
+
+	svc := New(t.TempDir(), pg)
+	svc.BindMount = false
+	svc.Runner = &ctfrunner.Client{URL: runnerSrv.URL, Token: strings.Repeat("k", 24)}
+
+	if _, _, _, _, err := svc.prepareSession(t.Context(), srcTask.ID, 101); err != nil {
+		t.Fatalf("prepareSession srcTask intent 101: %v", err)
+	}
+	if _, _, _, _, err := svc.prepareSession(t.Context(), srcTask.ID, 102); err != nil {
+		t.Fatalf("prepareSession srcTask intent 102: %v", err)
+	}
+	if _, _, _, _, err := svc.prepareSession(t.Context(), retryTask.ID, 201); err != nil {
+		t.Fatalf("prepareSession retryTask intent 201: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(specs) != 3 {
+		t.Fatalf("expected 3 specs, got %d", len(specs))
+	}
+	for i, sp := range specs {
+		wantVol := "p3y-box-task-work-" + strings.TrimSpace(strings.Split(sp.WorkVolume, "p3y-box-task-work-")[1])
+		_ = wantVol
+		if !strings.HasSuffix(sp.WorkVolume, "-"+strings.TrimLeft(sp.WorkVolume[len("p3y-box-task-work-"):], "")) || !strings.Contains(sp.WorkVolume, "p3y-box-task-work-") {
+			t.Fatalf("unexpected WorkVolume on call %d: %q", i, sp.WorkVolume)
+		}
+	}
+	if specs[0].WorkVolume != specs[1].WorkVolume || specs[1].WorkVolume != specs[2].WorkVolume {
+		t.Fatalf("expected identical shared WorkVolume across intents & retry task, got %q, %q, %q", specs[0].WorkVolume, specs[1].WorkVolume, specs[2].WorkVolume)
+	}
+	if putWorks != 1 {
+		t.Fatalf("expected PUT /work only once before WorkSeeded=true, got %d", putWorks)
 	}
 }

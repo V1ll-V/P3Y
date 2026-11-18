@@ -23,16 +23,18 @@ import (
 )
 
 type benchSessionRuntime struct {
-	sessionID     int64
-	prov          benchmark.Provider
-	cfg           benchmark.SessionConfig
-	cancel        context.CancelFunc
-	cooldownUntil time.Time
-	lastReclaimAt time.Time
-	extraTools    []actool.CoreTool
-	toolsLoaded   bool
-	lastEnvPoll   map[string]time.Time
-	taskStartAt   map[string]time.Time
+	sessionID        int64
+	prov             benchmark.Provider
+	cfg              benchmark.SessionConfig
+	cancel           context.CancelFunc
+	cooldownUntil    time.Time
+	lastReclaimAt    time.Time
+	lastEnvWaitLogAt time.Time
+	platformEnvCap   int
+	extraTools       []actool.CoreTool
+	toolsLoaded      bool
+	lastEnvPoll      map[string]time.Time
+	taskStartAt      map[string]time.Time
 }
 
 // BenchmarkManager orchestrates unattended zero-touch multi-platform benchmark
@@ -709,7 +711,10 @@ func (bm *BenchmarkManager) tickSession(ctx context.Context, sessionID int64, rt
 	if effectiveSlots <= 0 {
 		effectiveSlots = 1
 	}
-	if time.Now().Before(rt.cooldownUntil) {
+	if rt != nil && rt.platformEnvCap > 0 && rt.platformEnvCap < effectiveSlots {
+		effectiveSlots = rt.platformEnvCap
+	}
+	if rt != nil && time.Now().Before(rt.cooldownUntil) {
 		return nil
 	}
 
@@ -853,15 +858,23 @@ func (bm *BenchmarkManager) tickSession(ctx context.Context, sessionID int64, rt
 				if se.Code == "ENDED" || se.Code == "EXPIRED" {
 					return err
 				}
-				if strings.EqualFold(se.Code, "agent_environment_limit") {
+				if strings.EqualFold(se.Code, "agent_environment_limit") ||
+					strings.Contains(strings.ToLower(se.Message), "max active challenge instances") {
 					// Platform container quota is currently full: do NOT stamp all queued
-					// container challenges red; block further container launches this tick
-					// and probe/reclaim any leaked container from earlier runs.
+					// container challenges red or spend auto_retry_count; learn reported cap,
+					// block further container launches this tick, and reclaim leaked envs.
+					if capN := parseEnvCapFromMessage(se.Message); capN > 0 {
+						rt.platformEnvCap = capN
+						if capN < effectiveSlots {
+							effectiveSlots = capN
+						}
+					}
 					activeContainers = effectiveSlots
 					reclaimed := bm.reclaimOrphanedEnvironments(ctx, rt, sess, challenges)
-					if reclaimed == 0 {
+					if reclaimed == 0 && time.Since(rt.lastEnvWaitLogAt) >= 60*time.Second {
+						rt.lastEnvWaitLogAt = time.Now()
 						_ = bm.s.m.pg.AppendBenchmarkEvent(ctx, sessionID, ch.UniqueCode, "env_limit_wait",
-							"平台并发容器配额已满，等待空位或回收残留容器后再调度需要靶机的题目", nil)
+							fmt.Sprintf("平台并发容器配额已满（上限 %d），等待空位或回收残留容器后再调度需要靶机的题目", effectiveSlots), nil)
 					}
 					continue
 				}
@@ -1001,16 +1014,20 @@ func (bm *BenchmarkManager) checkChallengeTimeoutAndHint(ctx context.Context, rt
 
 	elapsed := time.Since(started)
 	timeout := time.Duration(sess.PerChallengeTimeout) * time.Second
-	if sess.HintPolicy == "stagnant_only" && !ch.HintUsed && timeout > 0 && elapsed > timeout/2 {
-		if hint, err := rt.prov.GetHint(ctx, ch.UniqueCode); err == nil && strings.TrimSpace(hint) != "" {
-			_ = bm.s.m.pg.SaveBenchmarkChallengeHint(ctx, sess.ID, ch.UniqueCode, hint)
-			_ = bm.s.m.pg.AppendBenchmarkEvent(ctx, sess.ID, ch.UniqueCode, "hint_fetched", "停滞自动获取题目 Hint", map[string]any{"hint": hint})
-			if t, ok := bm.s.m.Task(strconv.FormatInt(*ch.BoundTaskID, 10)); ok {
-				_, _ = t.Store.AddNode("fact", map[string]any{
-					"summary": "【平台 Hint 提示】" + hint,
-					"subtype": "benchmark_hint",
-				}, 0, "confirmed", "benchmark", nil)
-				t.Notify()
+	if sess.HintPolicy == "stagnant_only" && !ch.HintUsed && timeout > 0 {
+		earlyWindow := min(10*time.Minute, timeout/4)
+		shouldFetch := elapsed >= timeout/2 || (earlyWindow > 0 && elapsed >= earlyWindow && bm.isChallengeStagnant(ctx, *ch.BoundTaskID))
+		if shouldFetch {
+			if hint, err := rt.prov.GetHint(ctx, ch.UniqueCode); err == nil && strings.TrimSpace(hint) != "" {
+				_ = bm.s.m.pg.SaveBenchmarkChallengeHint(ctx, sess.ID, ch.UniqueCode, hint)
+				_ = bm.s.m.pg.AppendBenchmarkEvent(ctx, sess.ID, ch.UniqueCode, "hint_fetched", "停滞自动获取题目 Hint", map[string]any{"hint": hint, "elapsed_sec": int(elapsed.Seconds())})
+				if t, ok := bm.s.m.Task(strconv.FormatInt(*ch.BoundTaskID, 10)); ok {
+					_, _ = t.Store.AddNode("fact", map[string]any{
+						"summary": "【平台 Hint 提示】" + hint,
+						"subtype": "benchmark_hint",
+					}, 0, "confirmed", "benchmark", nil)
+					t.Notify()
+				}
 			}
 		}
 	}
@@ -1027,6 +1044,22 @@ func (bm *BenchmarkManager) checkChallengeTimeoutAndHint(ctx context.Context, rt
 		return true
 	}
 	return false
+}
+
+func parseEnvCapFromMessage(msg string) int {
+	i := strings.Index(msg, "(")
+	if i < 0 {
+		return 0
+	}
+	j := strings.Index(msg[i+1:], ")")
+	if j <= 0 {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(msg[i+1 : i+1+j]))
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
 }
 
 func challengeHasContainer(provider string, ch *db.BenchmarkChallenge) bool {
@@ -1097,9 +1130,45 @@ func isTransientPlatformUnavailableError(err error) (time.Duration, string) {
 	return 0, ""
 }
 
+func (bm *BenchmarkManager) isChallengeStagnant(ctx context.Context, taskID int64) bool {
+	if bm == nil || bm.s == nil || bm.s.m == nil || taskID <= 0 {
+		return false
+	}
+	t, ok := bm.s.m.Task(strconv.FormatInt(taskID, 10))
+	if !ok || t == nil || t.Store == nil {
+		return false
+	}
+	if _, total, err := t.Store.NodesPage(db.NodeFilter{Kinds: []string{"intent"}, States: []string{"exhausted"}}, 1, 1); err == nil && total > 0 {
+		return true
+	}
+	if bm.s.m.pg != nil && t.ExpID > 0 {
+		var hasCritic bool
+		if err := bm.s.m.pg.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM activity WHERE exploration_id=$1 AND kind='critic')`, t.ExpID).Scan(&hasCritic); err == nil && hasCritic {
+			return true
+		}
+	}
+	return false
+}
+
+func challengeFactCount(m *Manager, boundTaskID *int64) int {
+	if m == nil || boundTaskID == nil || *boundTaskID <= 0 {
+		return 0
+	}
+	t, ok := m.Task(strconv.FormatInt(*boundTaskID, 10))
+	if !ok || t == nil || t.Store == nil {
+		return 0
+	}
+	_, total, err := t.Store.NodesPage(db.NodeFilter{Kinds: []string{"fact"}}, 1, 1)
+	if err != nil {
+		return 0
+	}
+	return total
+}
+
 func pickChallengeQueue(unsolved []*db.BenchmarkChallenge, m *Manager) []*db.BenchmarkChallenge {
 	now := time.Now()
 	idle := make([]*db.BenchmarkChallenge, 0, len(unsolved))
+	highValueHarvest := make(map[string]bool, len(unsolved))
 	for _, ch := range unsolved {
 		if isNoFlagBenchmarkChallenge(ch) {
 			continue
@@ -1115,14 +1184,39 @@ func pickChallengeQueue(unsolved []*db.BenchmarkChallenge, m *Manager) []*db.Ben
 		if ch.AutoRetryCount >= maxBenchmarkAutoRetries && (ch.LastError != "" || ch.BoundTaskID != nil) {
 			continue
 		}
+		if ch.AttemptCount == 1 && ch.AutoRetryCount <= 1 && ch.TotalScore >= 700 && challengeFactCount(m, ch.BoundTaskID) >= 4 {
+			highValueHarvest[ch.UniqueCode] = true
+		}
 		idle = append(idle, ch)
 	}
+	bucket := func(ch *db.BenchmarkChallenge) int {
+		if highValueHarvest[ch.UniqueCode] {
+			return 0
+		}
+		if ch.AttemptCount == 0 {
+			return 1
+		}
+		return 2
+	}
 	sort.SliceStable(idle, func(i, j int) bool {
+		bi, bj := bucket(idle[i]), bucket(idle[j])
+		if bi != bj {
+			return bi < bj
+		}
+		if bi == 0 {
+			if idle[i].TotalScore != idle[j].TotalScore {
+				return idle[i].TotalScore > idle[j].TotalScore
+			}
+			return idle[i].ID < idle[j].ID
+		}
 		if idle[i].AttemptCount != idle[j].AttemptCount {
 			return idle[i].AttemptCount < idle[j].AttemptCount
 		}
 		if idle[i].AutoRetryCount != idle[j].AutoRetryCount {
 			return idle[i].AutoRetryCount < idle[j].AutoRetryCount
+		}
+		if bi == 2 && idle[i].TotalScore != idle[j].TotalScore {
+			return idle[i].TotalScore > idle[j].TotalScore
 		}
 		if idle[i].Level != idle[j].Level {
 			return idle[i].Level < idle[j].Level
@@ -1362,7 +1456,7 @@ func buildBenchmarkChallengeGoal(ch *db.BenchmarkChallenge, env *benchmark.EnvSt
 		for _, pid := range prevTaskIDs {
 			idStrs = append(idStrs, fmt.Sprintf("#%d", pid))
 		}
-		fmt.Fprintf(&b, "\n【前序探索记忆继承（来自任务 %s）】\n本题此前因超时或异常中断后重新调度，系统已自动将前序任务的探索黑板（已确认事实 fact、线索 finding、冷摘要与终态意图总结）以只读源任务形式继承到当前探索态势中。\n请先查阅前序任务的已有探索发现，直接沿有效线索推进或避开已知无效方向；若本轮重新启动了靶机容器，一切网络探测与漏洞利用请以本轮最新【靶机访问地址】为准。\n", strings.Join(idStrs, ", "))
+		fmt.Fprintf(&b, "\n【前序探索记忆继承（来自任务 %s）】\n本题此前因超时或异常中断后重新调度，系统已自动将前序任务的探索黑板（已确认事实 fact、线索 finding、冷摘要与终态意图总结）以只读源任务形式继承到当前探索态势中。\n请先查阅前序任务的已有探索发现，严禁从头重跑已证实失败的字典穷举、无效脚本或本地高耗时暴力破解，直接围绕前序突破口或平台 Hint 推进；若本轮重新启动了靶机容器，一切网络探测与漏洞利用请以本轮最新【靶机访问地址】为准。\n", strings.Join(idStrs, ", "))
 	}
 	if ch.SubmissionType == "choice" {
 		b.WriteString("\n请结合题目描述与附件完成分析，并通过 `benchmark_submit_choice` 提交正确选项 ID 数组。")

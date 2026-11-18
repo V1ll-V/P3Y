@@ -31,16 +31,18 @@ type criticFailureSample struct {
 type CriticAdvisor func(ctx context.Context, dossier string) (string, error)
 
 type ctfCriticHooks struct {
-	inner     harness.HookRunner
-	pg        *db.DB
-	taskID    int64
-	intentID  int64
-	threshold int
-	advisor   CriticAdvisor
-	emit      func(db.Activity)
+	inner             harness.HookRunner
+	pg                *db.DB
+	taskID            int64
+	intentID          int64
+	threshold         int
+	stagnantThreshold int
+	advisor           CriticAdvisor
+	emit              func(db.Activity)
 
 	mu              sync.Mutex
 	failures        []criticFailureSample
+	stagnantSamples []criticFailureSample
 	pendingCritique string
 	critiqueCount   int
 }
@@ -65,13 +67,14 @@ func newCTFCriticHooks(inner harness.HookRunner, prov llm.Provider, pg *db.DB, t
 		return strings.TrimSpace(msg.Text()), nil
 	})
 	return &ctfCriticHooks{
-		inner:     inner,
-		pg:        pg,
-		taskID:    taskID,
-		intentID:  intentID,
-		threshold: 3,
-		advisor:   advisor,
-		emit:      emit,
+		inner:             inner,
+		pg:                pg,
+		taskID:            taskID,
+		intentID:          intentID,
+		threshold:         3,
+		stagnantThreshold: 10,
+		advisor:           advisor,
+		emit:              emit,
 	}
 }
 
@@ -135,6 +138,11 @@ func containsCTFFailureSignature(s string) bool {
 		"EOFError",
 		"BrokenPipeError",
 		"ConnectionRefusedError",
+		"502 Bad Gateway",
+		"Connection refused",
+		"Failed to establish a new connection",
+		"Operation timed out",
+		"Connection timed out",
 	} {
 		if strings.Contains(s, marker) {
 			return true
@@ -171,39 +179,59 @@ func (h *ctfCriticHooks) PostToolUse(ctx context.Context, name string, input, re
 	if h.inner != nil {
 		h.inner.PostToolUse(ctx, name, input, result, isErr)
 	}
-	if (name == "board_rewind" || name == "plateau_fork") && !isErr {
+	if (name == "record_fact" || name == "board_record" || name == "board_mark_savepoint" ||
+		name == "board_rewind" || name == "plateau_fork") && !isErr {
 		h.mu.Lock()
-		h.failures = nil
-		h.pendingCritique = ""
+		h.stagnantSamples = nil
+		if name == "board_rewind" || name == "plateau_fork" {
+			h.failures = nil
+			h.pendingCritique = ""
+		}
 		h.mu.Unlock()
 		return
 	}
 	if !isCTFCriticMonitoredTool(name) {
 		return
 	}
-	failed, reason := classifyCTFToolFailure(name, result, isErr)
-	if !failed {
-		h.mu.Lock()
-		h.failures = nil
-		h.mu.Unlock()
-		return
-	}
-
-	h.mu.Lock()
-	h.failures = append(h.failures, criticFailureSample{
+	sample := criticFailureSample{
 		Tool:   name,
 		Input:  truncOutput(strings.TrimSpace(string(input)), 260),
-		Output: reason,
-	})
-	if len(h.failures) < h.threshold {
-		h.mu.Unlock()
-		return
+		Output: truncOutput(strings.TrimSpace(string(result)), 260),
 	}
-	snapshot := append([]criticFailureSample(nil), h.failures...)
-	h.failures = nil
-	h.critiqueCount++
+	failed, reason := classifyCTFToolFailure(name, result, isErr)
+
+	var (
+		snapshot   []criticFailureSample
+		reasonKind string
+	)
+	h.mu.Lock()
+	h.stagnantSamples = append(h.stagnantSamples, sample)
+	if !failed {
+		h.failures = nil
+		if h.stagnantThreshold > 0 && len(h.stagnantSamples) >= h.stagnantThreshold {
+			start := max(0, len(h.stagnantSamples)-4)
+			snapshot = append([]criticFailureSample(nil), h.stagnantSamples[start:]...)
+			h.stagnantSamples = nil
+			h.critiqueCount++
+			reasonKind = "停滞无新线索产出"
+		}
+	} else {
+		sample.Output = reason
+		h.failures = append(h.failures, sample)
+		if len(h.failures) >= h.threshold {
+			snapshot = append([]criticFailureSample(nil), h.failures...)
+			h.failures = nil
+			h.stagnantSamples = nil
+			h.critiqueCount++
+			reasonKind = "失败"
+		}
+	}
 	roundNum := h.critiqueCount
 	h.mu.Unlock()
+
+	if len(snapshot) == 0 {
+		return
+	}
 
 	dossier := h.buildDossier(ctx, snapshot)
 	critiqueText := ""
@@ -213,9 +241,9 @@ func (h *ctfCriticHooks) PostToolUse(ctx context.Context, name string, input, re
 		}
 	}
 	if critiqueText == "" {
-		critiqueText = fmt.Sprintf("连续 %d 次执行失败：请暂停微调参数，先假设当前核心前置判断有误（如偏移/libc/编码/靶标路径），优先调用 diff_local_remote、http_fuzz_diff 或 board_rewind 验证。", len(snapshot))
+		critiqueText = fmt.Sprintf("连续执行出现%s：请暂停盲目微调或脚本循环试探，先假设当前核心前置判断有误（如路径/参数/偏移/编码/上游故障），优先调用 diff_local_remote、http_fuzz_diff、board_rewind 或记录关键结论后结束当前意图换向。", reasonKind)
 	}
-	formatted := fmt.Sprintf("【Critic 反向证伪提醒 #%d（连续 %d 次失败触发；本次盲目重试已拦截）】\n%s\n\n请先根据上述证伪结论核查前提、使用对照工具（diff_local_remote / http_fuzz_diff / py_repl）或调用 board_rewind / plateau_fork 调整路线。", roundNum, len(snapshot), critiqueText)
+	formatted := fmt.Sprintf("【Critic 反向证伪提醒 #%d（%s触发；本次重复执行已拦截）】\n%s\n\n请先根据上述证伪结论核查前提、使用对照工具（diff_local_remote / http_fuzz_diff / py_repl）或调用 board_rewind / plateau_fork 调整路线；若确认外部服务不可用或无路可走请立即 record_fact 并结束当前意图。", roundNum, reasonKind, critiqueText)
 
 	h.mu.Lock()
 	h.pendingCritique = formatted
@@ -225,7 +253,7 @@ func (h *ctfCriticHooks) PostToolUse(ctx context.Context, name string, input, re
 		h.emit(db.Activity{
 			Worker:  "critic",
 			Kind:    "critic",
-			Summary: fmt.Sprintf("Critic 触发第 %d 次反向证伪（连续 %d 次失败）", roundNum, len(snapshot)),
+			Summary: fmt.Sprintf("Critic 触发第 %d 次反向证伪（%s）", roundNum, reasonKind),
 			Detail:  truncOutput(critiqueText, 800),
 		})
 	}

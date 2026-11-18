@@ -20,6 +20,21 @@ RUN chmod +x /opt/ctf/scripts/probe_target.py /opt/ctf/scripts/pwn_triage.py \
     && python3 /tmp/build_glibc_pool.py \
     && rm -f /tmp/build_glibc_pool.py
 
+RUN (sed -i 's/mirrors.aliyun.com/mirrors.tuna.tsinghua.edu.cn/g; s/deb.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true) \
+    && apt-get -o Acquire::http::Timeout=300 -o Acquire::Retries=8 update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y -o Acquire::http::Timeout=300 -o Acquire::Retries=8 --fix-missing --no-install-recommends \
+    tesseract-ocr tesseract-ocr-eng libgl1 libglib2.0-0 && rm -rf /var/lib/apt/lists/*
+RUN /opt/ctf/pwn/bin/pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    ddddocr pytesseract opencv-python-headless pillow \
+    && /opt/ctf/pwn/bin/pip check \
+    && /opt/ctf/pwn/bin/pip freeze > /opt/ctf/pwn-lock.txt
+COPY docker/ctf-tools/php_filter_chain_generator.py /opt/tools/php_filter_chain_generator/php_filter_chain_generator.py
+RUN chmod +x /opt/tools/php_filter_chain_generator/php_filter_chain_generator.py \
+    && ln -sf /opt/tools/php_filter_chain_generator/php_filter_chain_generator.py /usr/local/bin/php_filter_chain_generator \
+    && /opt/ctf/pwn/bin/python3 -c "import ddddocr, cv2, pytesseract; d = ddddocr.DdddOcr(show_ad=False); assert hasattr(d, 'classification')" \
+    && /opt/ctf/pwn/bin/python3 /usr/local/bin/php_filter_chain_generator --chain '<?php echo 1; ?>' >/dev/null \
+    && chmod -R a+rX /opt/ctf/pwn /opt/tools/php_filter_chain_generator
+
 USER 1000:1000
 WORKDIR /work
 CMD ["sleep", "infinity"]

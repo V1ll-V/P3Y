@@ -583,7 +583,7 @@ func (e *Engine) removeContainerOnly(ctx context.Context, idOrName string) error
 
 func (e *Engine) removeVolume(ctx context.Context, name string) error {
 	err := e.json(ctx, "DELETE", "/volumes/"+url.PathEscape(name)+"?force=1", nil, nil)
-	if err != nil && strings.Contains(err.Error(), ": 404 ") {
+	if err != nil && (strings.Contains(err.Error(), ": 404 ") || strings.Contains(err.Error(), ": 409 ")) {
 		return nil
 	}
 	return err

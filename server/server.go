@@ -230,6 +230,17 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 			log.Printf("[tips] seed defaults failed: %v", err)
 		}
 		s.seedOrchestrationTools() // P2 跨任务编排工具 seed 进 tools 表(可按 agent 绑定)
+		agent.CTFVPNStatusHook = func(pCtx context.Context, taskID int64, vpnHash string) (string, string, string) {
+			svc := s.ctfService()
+			if svc == nil || svc.Runner == nil || !svc.Runner.Configured() || taskID <= 0 {
+				return "", "", ""
+			}
+			st, probeErr := svc.Runner.ProbeTaskVPN(pCtx, taskID, vpnHash)
+			if probeErr != nil {
+				return "", "", ""
+			}
+			return st.Interface, st.TunnelIP, st.Endpoint
+		}
 		go s.evidenceStore().RunGC(s.ctx)
 		s.seedPythonInterpreter()     // 自定义脚本工具:开机检测 python 解释器入库(仅空时)
 		go newScheduler(s).Run(s.ctx) // P3 触发器调度(定时/finding/目标事件),仅自定义 agent

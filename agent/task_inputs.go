@@ -16,6 +16,10 @@ import (
 	"p3y/db"
 )
 
+// CTFVPNStatusHook optionally probes the live VPN sidecar to resolve the
+// runtime tunnel interface/IP (needed for OpenVPN where config omits Address).
+var CTFVPNStatusHook func(ctx context.Context, taskID int64, vpnHash string) (iface, tunnelIP, endpoint string)
+
 // Constructed on every run, outside compactable conversation history. Binary
 // contents and attachment names remain untrusted task material.
 func taskInputContext(root string, ts *db.ExplorationStore, taskID, intentID int64) (string, error) {
@@ -115,21 +119,42 @@ func taskInputContextForRole(root string, ts *db.ExplorationStore, taskID, inten
 				if prof.Kind == ctfrunner.VPNKindOpenVPN {
 					kindLabel = "OpenVPN"
 				}
-				addrLabel := prof.Address
+				liveIface := ""
+				liveIP := ""
+				if CTFVPNStatusHook != nil {
+					pCtx, pCancel := context.WithTimeout(context.Background(), 3*time.Second)
+					liveIface, liveIP, _ = CTFVPNStatusHook(pCtx, taskID, vpnHash)
+					pCancel()
+				}
+				tunnelIP := strings.TrimSpace(strings.Split(strings.TrimSpace(liveIP), "/")[0])
+				if tunnelIP == "" {
+					tunnelIP = strings.TrimSpace(strings.Split(strings.TrimSpace(prof.Address), "/")[0])
+				}
+				ifaceLabel := strings.TrimSpace(liveIface)
+				if ifaceLabel == "" {
+					if prof.Kind == ctfrunner.VPNKindOpenVPN {
+						ifaceLabel = "tun0"
+					} else {
+						ifaceLabel = "wg0"
+					}
+				}
+				addrLabel := strings.TrimSpace(liveIP)
 				if addrLabel == "" {
-					addrLabel = "tun/tap (服务端分配)"
+					addrLabel = prof.Address
+				}
+				if addrLabel == "" {
+					addrLabel = ifaceLabel + " (运行时动态分配，可在容器内执行 ip -4 addr show " + ifaceLabel + " 获取)"
 				}
 				routesLabel := strings.Join(prof.AllowedIPs, ", ")
 				if routesLabel == "" {
 					routesLabel = "服务端下发"
 				}
-				tunnelIP := strings.Split(prof.Address, "/")[0]
-				callbackHint := "请在容器内监听端口并结合题目约束回连"
+				callbackHint := fmt.Sprintf("【OOB / SSRF / 反弹 Shell 回连铁律】当前容器与 VPN 共享网络命名空间；如需让靶机回连（如 SSRF 窃取内部请求头、XXE、反连 Shell），必须在容器内监听 `0.0.0.0:<端口>`，先执行 `ip -4 addr show %s` 获取隧道 IP，再让靶机访问 `http://<隧道IP>:<端口>`。严禁使用 eth0 的 `10.220.x.x` 内网地址（靶机无法路由）。", ifaceLabel)
 				if tunnelIP != "" {
-					callbackHint = fmt.Sprintf("请在容器内监听端口并让目标连接 `ctfy-callback:<端口>`（或 %s:<端口>）", tunnelIP)
+					callbackHint = fmt.Sprintf("【OOB / SSRF / 反弹 Shell 回连铁律】当前容器与 VPN 共享网络命名空间，真实赛题内网回连 IP 为 `%s`（网卡 `%s`，可用 `ip -4 addr show %s` 核实）。需要让靶机 SSRF/RCE/XXE 回连本机以窃取认证头或回传数据时，必须在容器内监听 `0.0.0.0:<端口>` 并让靶机访问 `http://%s:<端口>`！严禁使用 eth0 的 `10.220.x.x` 地址（靶机无法路由）。", tunnelIP, ifaceLabel, ifaceLabel, tunnelIP)
 				}
-				fmt.Fprintf(&b, "\n【赛题专属 %s VPN 已连接】配置文件=%s | 隧道IP=%s | DNS=%s | 内部路由=%s\n说明：本任务的工具容器（ctf_http、ctf_probe_target、ctf_python、ctf_bash、ctf_session_start 等）已接入该赛题独立隔离 %s 隧道网络，可直接解析并访问赛题内网域名与目标端口（无需宿主机代理）。若题目支持带外回连或反弹 Shell，%s。严禁试图读取或修改 VPN 私钥/证书/隧道网卡。\n",
-					kindLabel, vpnFilename, addrLabel, strings.Join(prof.DNS, ", "), routesLabel, kindLabel, callbackHint)
+				fmt.Fprintf(&b, "\n【赛题专属 %s VPN 已连接】配置文件=%s | 网卡=%s | 隧道IP=%s | DNS=%s | 内部路由=%s\n说明：本任务的工具容器（ctf_http、ctf_probe_target、ctf_python、ctf_bash、ctf_session_start 等）已接入该赛题独立隔离 %s 隧道网络，可直接解析并访问赛题内网域名与目标端口（无需宿主机代理）。%s 严禁试图读取或修改 VPN 私钥/证书/隧道网卡。\n",
+					kindLabel, vpnFilename, ifaceLabel, addrLabel, strings.Join(prof.DNS, ", "), routesLabel, kindLabel, callbackHint)
 			}
 		}
 		b.WriteString("\n")

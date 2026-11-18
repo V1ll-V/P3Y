@@ -15,6 +15,8 @@ func (s *Service) sessionSpec(ctx context.Context, task, sessionIntent int64, m 
 	spec := ctfrunner.SessionSpec{TaskID: task, IntentID: sessionIntent, InputHash: Hash(m)}
 	if s.bindMountEnabled() && localWork != "" {
 		spec.HostWorkDir = s.hostBindPath(localWork)
+	} else if task > 0 {
+		spec.WorkVolume = s.sharedWorkVolume(ctx, task)
 	}
 	if env := s.containerProxyEnv(); len(env) > 0 {
 		spec.Env = env
@@ -28,6 +30,36 @@ func (s *Service) sessionSpec(ctx context.Context, task, sessionIntent int64, m 
 	}
 	spec.VPNHash = strings.TrimSpace(vpnHash)
 	return spec, nil
+}
+
+// sharedWorkVolume resolves the root ancestor task ID across SourceTaskIDs retries
+// so all intents within a task and all retried tasks of the same challenge share
+// one persistent Docker /work volume.
+func (s *Service) sharedWorkVolume(ctx context.Context, task int64) string {
+	rootID := task
+	if s != nil && s.DB != nil && task > 0 {
+		seen := map[int64]bool{task: true}
+		cur := task
+		for depth := 0; depth < 8; depth++ {
+			t, err := s.DB.GetTask(cur)
+			if err != nil || t == nil || len(t.SourceTaskIDs) == 0 {
+				break
+			}
+			next := int64(0)
+			for _, sid := range t.SourceTaskIDs {
+				if sid > 0 && !seen[sid] && (next == 0 || sid < next) {
+					next = sid
+				}
+			}
+			if next == 0 {
+				break
+			}
+			seen[next] = true
+			rootID = next
+			cur = next
+		}
+	}
+	return fmt.Sprintf("p3y-box-task-work-%d", rootID)
 }
 
 func (s *Service) containerProxyEnv() map[string]string {

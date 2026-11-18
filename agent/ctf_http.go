@@ -95,7 +95,7 @@ func ctfHTTPCommand(args map[string]json.RawMessage) (string, int, error) {
 		parts = append(parts, "--location")
 	}
 	if in.Cookies == nil || *in.Cookies {
-		parts = append(parts, "--cookie", ".ctf-http-cookies", "--cookie-jar", ".ctf-http-cookies")
+		parts = append(parts, "--cookie", "/tmp/.ctf-http/cookies", "--cookie-jar", "/tmp/.ctf-http/cookies")
 	}
 	keys := make([]string, 0, len(in.Headers))
 	for k, v := range in.Headers {
@@ -111,14 +111,16 @@ func ctfHTTPCommand(args map[string]json.RawMessage) (string, int, error) {
 	if in.Body != "" || in.Form != nil {
 		parts = append(parts, "--data-raw", quote(in.Body))
 	}
-	bodyPath := "http/response-body.txt"
+	bodyPath := "/tmp/.ctf-http/response-body.txt"
 	if in.Method == "HEAD" {
 		bodyPath = "/dev/null"
 	}
-	parts = append(parts, "--dump-header", "http/response-headers.txt", "--output", bodyPath, "--write-out", quote("HTTP status: %{http_code}\nEffective URL: %{url_effective}\n"), "--url", quote(u.String()))
+	parts = append(parts, "--dump-header", "/tmp/.ctf-http/response-headers.txt", "--output", bodyPath, "--write-out", quote("HTTP status: %{http_code}\nEffective URL: %{url_effective}\n"), "--url", quote(u.String()))
 	// Clear old responses before curl so a failed connection cannot replay an
 	// earlier body/Flag as evidence for a new execution. Preserve curl's exit code.
-	command := "mkdir -p http || exit 1\n: > http/response-headers.txt || exit 1\n: > http/response-body.txt || exit 1\n: > http/response-meta.txt || exit 1\n" + strings.Join(parts, " ") + " > http/response-meta.txt\nctf_http_exit=$?\ncat http/response-headers.txt\nprintf '\\n'\ncat http/response-body.txt\nprintf '\\n'\ncat http/response-meta.txt\nexit \"$ctf_http_exit\""
+	// Store transient HTTP state in container-private /tmp/.ctf-http so parallel
+	// Web workers sharing a /work volume do not overwrite each other's cookies.
+	command := "mkdir -p /tmp/.ctf-http || exit 1\n: > /tmp/.ctf-http/response-headers.txt || exit 1\n: > /tmp/.ctf-http/response-body.txt || exit 1\n: > /tmp/.ctf-http/response-meta.txt || exit 1\n" + strings.Join(parts, " ") + " > /tmp/.ctf-http/response-meta.txt\nctf_http_exit=$?\ncat /tmp/.ctf-http/response-headers.txt\nprintf '\\n'\ncat /tmp/.ctf-http/response-body.txt\nprintf '\\n'\ncat /tmp/.ctf-http/response-meta.txt\nexit \"$ctf_http_exit\""
 	if len(command) > 240<<10 {
 		return "", 0, fmt.Errorf("请求编码后超过执行器命令大小限制")
 	}

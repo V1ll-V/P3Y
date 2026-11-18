@@ -175,7 +175,7 @@ func (s *Service) prepareSession(ctx context.Context, task, intent int64) (strin
 			return "", session, m, "", err
 		}
 	}
-	if !s.bindMountEnabled() {
+	if !s.bindMountEnabled() && !session.WorkSeeded {
 		if err = s.uploadWork(ctx, key, work); err != nil {
 			return "", session, m, "", err
 		}
