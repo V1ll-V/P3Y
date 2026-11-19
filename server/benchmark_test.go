@@ -1309,7 +1309,7 @@ func TestBenchmarkEarlyStagnantHintAndHighScorePriority(t *testing.T) {
 	sess := &db.BenchmarkSession{
 		ID:                  9901,
 		HintPolicy:          "stagnant_only",
-		PerChallengeTimeout: 3000, // 50m; earlyWindow = 10m
+		PerChallengeTimeout: 3000, // 50m; earlyWindow = 20m
 	}
 	chHigh := &db.BenchmarkChallenge{
 		ID:          1,
@@ -1324,11 +1324,16 @@ func TestBenchmarkEarlyStagnantHintAndHighScorePriority(t *testing.T) {
 		sessionID:   sess.ID,
 		prov:        prov,
 		lastEnvPoll: map[string]time.Time{},
-		taskStartAt: map[string]time.Time{"high": time.Now().Add(-11 * time.Minute)},
+		taskStartAt: map[string]time.Time{"high": time.Now().Add(-15 * time.Minute)},
 	}
 	_ = s.bench.checkChallengeTimeoutAndHint(t.Context(), rt, sess, chHigh, true)
+	if prov.hintCalls != 0 {
+		t.Fatalf("expected no GetHint trigger before 20m earlyWindow, got %d calls", prov.hintCalls)
+	}
+	rt.taskStartAt["high"] = time.Now().Add(-21 * time.Minute)
+	_ = s.bench.checkChallengeTimeoutAndHint(t.Context(), rt, sess, chHigh, true)
 	if prov.hintCalls != 1 {
-		t.Fatalf("expected early GetHint trigger at 11m with exhausted intent, got %d calls", prov.hintCalls)
+		t.Fatalf("expected early GetHint trigger at 21m with exhausted intent, got %d calls", prov.hintCalls)
 	}
 
 	// Verify pickChallengeQueue prioritizes high-score partial-progress round-2 retry ahead of untouched/low-score items.

@@ -1175,7 +1175,7 @@ func (bm *BenchmarkManager) checkChallengeTimeoutAndHint(ctx context.Context, rt
 	elapsed := time.Since(started)
 	timeout := time.Duration(sess.PerChallengeTimeout) * time.Second
 	if sess.HintPolicy == "stagnant_only" && !ch.HintUsed && timeout > 0 {
-		earlyWindow := min(10*time.Minute, timeout/4)
+		earlyWindow := min(20*time.Minute, timeout/2)
 		shouldFetch := elapsed >= timeout/2 || (earlyWindow > 0 && elapsed >= earlyWindow && bm.isChallengeStagnant(ctx, *ch.BoundTaskID))
 		if shouldFetch {
 			bm.mu.Lock()
