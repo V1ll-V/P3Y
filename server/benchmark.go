@@ -83,14 +83,52 @@ func (s *Server) registerBenchmarkRoutes(mux *http.ServeMux) {
 }
 
 const (
-	maxBenchmarkAutoRetries       = 3
-	defaultHostedBenchAutoRetries = 5
-	defaultHostedBenchTimeoutSec  = 5400
+	maxBenchmarkAutoRetries          = 3
+	defaultHostedBenchAutoRetries    = 5
+	defaultHostedBenchTimeoutSec     = 5400
+	defaultHostedFirstPassTimeoutSec = 600 // 托管模式首轮快筛预算（10 分钟），快速扫完简单题后再进入二轮完整预算攻坚
 )
 
 func isHostedBenchmarkMode() bool {
 	return strings.TrimSpace(os.Getenv("P3Y_HOSTED_MODE")) == "1" ||
 		strings.TrimSpace(os.Getenv("P3Y_BENCH_EXIT_ON_DONE")) == "1"
+}
+
+// benchmarkFirstPassTimeoutSec returns the fast first-pass screening timeout (in seconds)
+// for Attempt 1 of single-flag challenges. Hosted mode defaults to 600s (10 min); set
+// P3Y_BENCH_FIRST_PASS_TIMEOUT=0 to disable first-pass screening and use full budget immediately.
+func benchmarkFirstPassTimeoutSec() int {
+	if raw := strings.TrimSpace(os.Getenv("P3Y_BENCH_FIRST_PASS_TIMEOUT")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			if n <= 0 {
+				return 0
+			}
+			return n
+		}
+	}
+	if isHostedBenchmarkMode() {
+		return defaultHostedFirstPassTimeoutSec
+	}
+	return 0
+}
+
+// effectiveChallengeTimeout returns the scheduler rotation budget for ch's current attempt
+// and reports whether ch is running in a fast first-pass screening window. Multi-flag
+// challenges (FlagCount > 1) and partially solved challenges (CorrectFlagCount > 0) are
+// exempt from first-pass cutoff so live pivoting sessions are never interrupted early.
+func effectiveChallengeTimeout(sess *db.BenchmarkSession, ch *db.BenchmarkChallenge) (time.Duration, bool) {
+	if sess == nil || sess.PerChallengeTimeout <= 0 {
+		return 0, false
+	}
+	full := time.Duration(sess.PerChallengeTimeout) * time.Second
+	if ch == nil {
+		return full, false
+	}
+	fpSec := benchmarkFirstPassTimeoutSec()
+	if fpSec > 0 && fpSec < sess.PerChallengeTimeout && ch.AttemptCount <= 1 && ch.FlagCount <= 1 && ch.CorrectFlagCount == 0 {
+		return time.Duration(fpSec) * time.Second, true
+	}
+	return full, false
 }
 
 // benchmarkMaxAutoRetries returns the max auto-retry rounds per challenge
@@ -1173,8 +1211,8 @@ func (bm *BenchmarkManager) checkChallengeTimeoutAndHint(ctx context.Context, rt
 	bm.mu.Unlock()
 
 	elapsed := time.Since(started)
-	timeout := time.Duration(sess.PerChallengeTimeout) * time.Second
-	if sess.HintPolicy == "stagnant_only" && !ch.HintUsed && timeout > 0 {
+	timeout, isFirstPass := effectiveChallengeTimeout(sess, ch)
+	if sess.HintPolicy == "stagnant_only" && !isFirstPass && !ch.HintUsed && timeout > 0 {
 		earlyWindow := min(20*time.Minute, timeout/2)
 		shouldFetch := elapsed >= timeout/2 || (earlyWindow > 0 && elapsed >= earlyWindow && bm.isChallengeStagnant(ctx, *ch.BoundTaskID))
 		if shouldFetch {
@@ -1223,14 +1261,21 @@ func (bm *BenchmarkManager) checkChallengeTimeoutAndHint(ctx context.Context, rt
 	}
 	if timeout > 0 && elapsed > timeout && hasWaiting {
 		taskID := strconv.FormatInt(*ch.BoundTaskID, 10)
-		bm.stopBoundTask(taskID, "timeout", errors.New("单题预算超时，让出并发槽位"))
+		stopReason := "单题预算超时，让出并发槽位"
+		evtMsg := fmt.Sprintf("题目 %s 超过单题时间预算（%ds），已释放槽位调度后续题目", ch.UniqueCode, int(timeout.Seconds()))
+		retryReason := fmt.Sprintf("单题预算超时（%ds）", int(timeout.Seconds()))
+		if isFirstPass {
+			stopReason = "首轮快筛预算到期，让出槽位优先筛查其余新题"
+			evtMsg = fmt.Sprintf("题目 %s 首轮快筛到期（%ds），已保留探索记忆并释放槽位，后续将使用完整预算（%ds）深度攻坚", ch.UniqueCode, int(timeout.Seconds()), sess.PerChallengeTimeout)
+			retryReason = fmt.Sprintf("首轮快筛到期（%ds，转二轮完整预算 %ds）", int(timeout.Seconds()), sess.PerChallengeTimeout)
+		}
+		bm.stopBoundTask(taskID, "timeout", errors.New(stopReason))
 		if ch.ContainerStatus == "available" || ch.ContainerStatus == "pending" {
 			_ = rt.prov.CloseEnvironment(ctx, ch.UniqueCode)
 			_ = bm.s.m.pg.UpdateBenchmarkChallengeEnv(ctx, sess.ID, ch.UniqueCode, "stopped", nil, nil, "")
 		}
-		_ = bm.s.m.pg.AppendBenchmarkEvent(ctx, sess.ID, ch.UniqueCode, "challenge_timeout_rotate",
-			fmt.Sprintf("题目 %s 超过单题时间预算（%ds），已释放槽位调度后续题目", ch.UniqueCode, sess.PerChallengeTimeout), nil)
-		bm.scheduleChallengeAutoRetry(ctx, sess.ID, ch, fmt.Sprintf("单题预算超时（%ds）", sess.PerChallengeTimeout))
+		_ = bm.s.m.pg.AppendBenchmarkEvent(ctx, sess.ID, ch.UniqueCode, "challenge_timeout_rotate", evtMsg, nil)
+		bm.scheduleChallengeAutoRetry(ctx, sess.ID, ch, retryReason)
 		return true
 	}
 	return false
@@ -1465,7 +1510,19 @@ func pickChallengeQueue(unsolved []*db.BenchmarkChallenge, m *Manager) []*db.Ben
 		}
 		idle = append(idle, ch)
 	}
+	firstPassActive := benchmarkFirstPassTimeoutSec() > 0
 	bucket := func(ch *db.BenchmarkChallenge) int {
+		if firstPassActive {
+			// Two-phase MLFQ: finish fast first-pass screening on all untried challenges (AttemptCount == 0)
+			// before promoting retried high-value challenges into full-budget Round 2+.
+			if ch.AttemptCount == 0 {
+				return 0
+			}
+			if highValueHarvest[ch.UniqueCode] {
+				return 1
+			}
+			return 2
+		}
 		if highValueHarvest[ch.UniqueCode] {
 			return 0
 		}
@@ -1480,7 +1537,7 @@ func pickChallengeQueue(unsolved []*db.BenchmarkChallenge, m *Manager) []*db.Ben
 		if bi != bj {
 			return bi < bj
 		}
-		if bi == 0 {
+		if highValueHarvest[idle[i].UniqueCode] && highValueHarvest[idle[j].UniqueCode] {
 			if idle[i].TotalScore != idle[j].TotalScore {
 				return idle[i].TotalScore > idle[j].TotalScore
 			}

@@ -724,3 +724,115 @@ func TestBenchmarkEmptyHintMarksUsedNoSpam(t *testing.T) {
 		t.Fatalf("expected hint_used=true with empty hint_content, got %+v", chAfter)
 	}
 }
+
+func TestHostedBenchmarkFirstPassScreening(t *testing.T) {
+	t.Setenv("P3Y_HOSTED_MODE", "1")
+	t.Setenv("P3Y_BENCH_FIRST_PASS_TIMEOUT", "")
+
+	sess := &db.BenchmarkSession{
+		ID:                  9999,
+		HintPolicy:          "stagnant_only",
+		PerChallengeTimeout: 5400,
+	}
+	// 1. Single-flag Attempt 1 uses 600s first-pass budget.
+	chFirst := &db.BenchmarkChallenge{UniqueCode: "single_1", FlagCount: 1, AttemptCount: 1}
+	if dur, fp := effectiveChallengeTimeout(sess, chFirst); !fp || dur != 600*time.Second {
+		t.Fatalf("expected 600s first-pass budget for Attempt 1 single-flag, got dur=%v fp=%v", dur, fp)
+	}
+	// 2. Single-flag Attempt 2 uses full 5400s budget.
+	chSecond := &db.BenchmarkChallenge{UniqueCode: "single_1", FlagCount: 1, AttemptCount: 2}
+	if dur, fp := effectiveChallengeTimeout(sess, chSecond); fp || dur != 5400*time.Second {
+		t.Fatalf("expected 5400s full budget for Attempt 2, got dur=%v fp=%v", dur, fp)
+	}
+	// 3. Multi-flag Attempt 1 is exempt from first-pass cutoff.
+	chMulti := &db.BenchmarkChallenge{UniqueCode: "multi_3", FlagCount: 3, AttemptCount: 1}
+	if dur, fp := effectiveChallengeTimeout(sess, chMulti); fp || dur != 5400*time.Second {
+		t.Fatalf("expected multi-flag challenge to get full 5400s budget on Attempt 1, got dur=%v fp=%v", dur, fp)
+	}
+	// 4. Explicit P3Y_BENCH_FIRST_PASS_TIMEOUT=0 disables first-pass screening.
+	t.Setenv("P3Y_BENCH_FIRST_PASS_TIMEOUT", "0")
+	if dur, fp := effectiveChallengeTimeout(sess, chFirst); fp || dur != 5400*time.Second {
+		t.Fatalf("expected P3Y_BENCH_FIRST_PASS_TIMEOUT=0 to disable first-pass, got dur=%v fp=%v", dur, fp)
+	}
+
+	// 5. Under first-pass screening (600s): untried AttemptCount=0 beats high-value retry,
+	//    and first-pass checkChallengeTimeoutAndHint suppresses GetHint while rotating at >600s only when hasWaiting=true.
+	t.Setenv("P3Y_BENCH_FIRST_PASS_TIMEOUT", "600")
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) - skipping DB check", err)
+	}
+	t.Cleanup(func() { m.Close() })
+
+	bt, err := m.CreateTaskWithOptions("fp-high-retry", "goal", db.TaskCreateOptions{Mode: "ctf", ChallengeType: "web", ZeroTouch: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = m.DeleteTask(bt.ID, DeleteTaskOptions{}) })
+	btID, _ := strconv.ParseInt(bt.ID, 10, 64)
+	for i := 0; i < 4; i++ {
+		_, _ = bt.Store.AddNode("fact", map[string]any{"summary": fmt.Sprintf("f%d", i)}, 0, "confirmed", "worker", nil)
+	}
+	_ = m.SetTaskStatus(bt.ID, "timeout")
+
+	q := pickChallengeQueue([]*db.BenchmarkChallenge{
+		{ID: 1, UniqueCode: "high_retry", TotalScore: 1000, AttemptCount: 1, AutoRetryCount: 1, BoundTaskID: &btID},
+		{ID: 2, UniqueCode: "untried_new", TotalScore: 200, AttemptCount: 0},
+		{ID: 3, UniqueCode: "low_retry", TotalScore: 200, AttemptCount: 1, AutoRetryCount: 1},
+	}, m)
+	if len(q) != 3 || q[0].UniqueCode != "untried_new" || q[1].UniqueCode != "high_retry" || q[2].UniqueCode != "low_retry" {
+		t.Fatalf("expected first-pass order [untried_new, high_retry, low_retry], got [%s, %s, %s]", q[0].UniqueCode, q[1].UniqueCode, q[2].UniqueCode)
+	}
+
+	hintCalls := 0
+	mockTSec := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/openapi/v1/challenges/hint" {
+			hintCalls++
+			_, _ = w.Write([]byte(`{"unique_code":"fp_ch","hint":"some hint"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer mockTSec.Close()
+
+	dbSess, err := m.pg.CreateBenchmarkSession(t.Context(), db.BenchmarkSessionCreate{
+		Name: "fp-test", Provider: "tsecbench", BaseURL: mockTSec.URL, Token: "tok-fp",
+		MaxConcurrent: 1, HintPolicy: "stagnant_only", PerChallengeTimeout: 5400,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = m.pg.Exec(`DELETE FROM benchmark_sessions WHERE id=$1`, dbSess.ID) })
+	_ = m.pg.SyncBenchmarkChallenges(t.Context(), dbSess.ID, []db.BenchmarkChallengeUpsert{{
+		UniqueCode: "fp_ch", Title: "fp_ch", Category: "web", TotalScore: 300, FlagCount: 1,
+	}})
+	fpTask, _ := m.CreateTaskWithOptions("fp_ch", "goal", db.TaskCreateOptions{Mode: "ctf", ChallengeType: "web", ZeroTouch: true})
+	t.Cleanup(func() { _, _ = m.DeleteTask(fpTask.ID, DeleteTaskOptions{}) })
+	fpTID, _ := strconv.ParseInt(fpTask.ID, 10, 64)
+	_ = m.pg.BindBenchmarkChallengeTask(t.Context(), dbSess.ID, "fp_ch", fpTID)
+
+	td := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	s := New(ctx, m, td, td, td)
+	rt, _ := s.bench.runtimeFor(dbSess)
+	// At 7m (>600s/2): still in first-pass -> must NOT call GetHint and must NOT rotate.
+	rt.taskStartAt["fp_ch"] = time.Now().Add(-7 * time.Minute)
+	chLive, _ := m.pg.GetBenchmarkChallenge(t.Context(), dbSess.ID, "fp_ch")
+	if rotated := s.bench.checkChallengeTimeoutAndHint(t.Context(), rt, dbSess, chLive, true); rotated {
+		t.Fatal("must not rotate before 10m first-pass budget")
+	}
+	if hintCalls != 0 {
+		t.Fatalf("must not fetch hint during first-pass screening, got %d calls", hintCalls)
+	}
+	// At 11m (>600s) with hasWaiting=false -> must NOT rotate when queue is empty!
+	rt.taskStartAt["fp_ch"] = time.Now().Add(-11 * time.Minute)
+	if rotated := s.bench.checkChallengeTimeoutAndHint(t.Context(), rt, dbSess, chLive, false); rotated {
+		t.Fatal("must not rotate at 11m when no other challenges are waiting")
+	}
+	// At 11m (>600s) with hasWaiting=true -> MUST rotate to let untried challenges run!
+	if rotated := s.bench.checkChallengeTimeoutAndHint(t.Context(), rt, dbSess, chLive, true); !rotated {
+		t.Fatal("expected first-pass rotation at 11m when waiting challenges exist")
+	}
+}
