@@ -15,6 +15,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,13 +42,37 @@ type Service struct {
 var BenchmarkFlagHook func(ctx context.Context, taskID int64, execID, value, subFlagID string) (verdictJSON string, handled bool, err error)
 
 func New(root string, pg *db.DB) *Service {
+	runner := &ctfrunner.Client{URL: os.Getenv("P3Y_BOX_URL"), Token: os.Getenv("P3Y_BOX_TOKEN")}
+	bindMount := os.Getenv("P3Y_BOX_BIND_MOUNT") == "1"
+	if ctfrunner.LocalModeEnabled() {
+		runner = ctfrunner.DefaultLocalClient()
+		bindMount = true
+	}
 	return &Service{
 		Root:      root,
 		DB:        pg,
-		Runner:    &ctfrunner.Client{URL: os.Getenv("P3Y_BOX_URL"), Token: os.Getenv("P3Y_BOX_TOKEN")},
-		BindMount: os.Getenv("P3Y_BOX_BIND_MOUNT") == "1",
+		Runner:    runner,
+		BindMount: bindMount,
 		HostRoot:  strings.TrimSpace(os.Getenv("P3Y_BOX_HOST_ROOT")),
 	}
+}
+
+// IsLocalSandbox reports whether CTF executions use the in-process LocalBackend.
+func (s *Service) IsLocalSandbox() bool {
+	return s != nil && ctfrunner.IsLocalClient(s.Runner)
+}
+
+// TranslateSandboxWorkPaths rewrites standalone /work references inside script or
+// file contents to the isolated per-session directory when running in local mode.
+func (s *Service) TranslateSandboxWorkPaths(ctx context.Context, task, intent int64, raw string) string {
+	if !s.IsLocalSandbox() || !strings.Contains(raw, "/work") {
+		return raw
+	}
+	key, _, err := s.sessionKey(ctx, task, intent)
+	if err != nil || key == "" {
+		return raw
+	}
+	return ctfrunner.RewriteWorkPaths(raw, ctfrunner.LocalWorkAlias(s.Runner, key))
 }
 
 // WithProxy configures the host MITM traffic proxy passed into sandbox containers.
@@ -149,7 +174,7 @@ func (s *Service) prepareSession(ctx context.Context, task, intent int64) (strin
 		return "", ctfrunner.Session{}, m, "", err
 	}
 	if !shared {
-		seedNonSharedWorkDir(s.Root, task, work)
+		seedNonSharedWorkDir(s.Root, task, work, s.ancestorTaskIDs(task)...)
 	}
 	if err = os.MkdirAll(work, 0700); err != nil {
 		return "", ctfrunner.Session{}, m, "", err
@@ -289,6 +314,7 @@ func (s *Service) execute(ctx context.Context, task, intent int64, command strin
 	}
 	if autoCandidates {
 		if verifyMode, _ := s.DB.TaskCTFVerifyMode(saveCtx, task); verifyMode != db.CTFVerifyExploitProof {
+			var verdicts []string
 			for _, flag := range ExtractFlags(string(result.Stdout)+"\n"+string(result.Stderr), 32) {
 				if IsSelfConstructedMockFlag(command, flag) {
 					continue
@@ -296,8 +322,13 @@ func (s *Service) execute(ctx context.Context, task, intent int64, command strin
 				if cid, addErr := s.DB.AddCTFOutputCandidate(saveCtx, task, e.ID, flag); addErr != nil {
 					return nil, addErr
 				} else if cid > 0 && BenchmarkFlagHook != nil {
-					_, _, _ = BenchmarkFlagHook(saveCtx, task, e.ID, flag, "")
+					if v, handled, _ := BenchmarkFlagHook(saveCtx, task, e.ID, flag, ""); handled && v != "" {
+						verdicts = append(verdicts, v)
+					}
 				}
+			}
+			if len(verdicts) > 0 {
+				e.StdoutExcerpt = strings.TrimRight(e.StdoutExcerpt, "\n") + "\n[测评平台自动验真回执] " + strings.Join(verdicts, " | ")
 			}
 		}
 	}
@@ -374,14 +405,20 @@ func (s *Service) JobStatus(ctx context.Context, task, intent int64, jobID strin
 	}
 	if verifyMode, _ := s.DB.TaskCTFVerifyMode(ctx, task); verifyMode != db.CTFVerifyExploitProof {
 		combined := status.Stdout + "\n" + status.Stderr
+		var verdicts []string
 		for _, flag := range ExtractFlags(combined, 16) {
 			execID := status.ExecID
 			if execID == "" {
 				execID = status.ID
 			}
 			if cid, addErr := s.DB.AddCTFOutputCandidate(ctx, task, execID, flag); addErr == nil && cid > 0 && BenchmarkFlagHook != nil {
-				_, _, _ = BenchmarkFlagHook(ctx, task, execID, flag, "")
+				if v, handled, _ := BenchmarkFlagHook(ctx, task, execID, flag, ""); handled && v != "" {
+					verdicts = append(verdicts, v)
+				}
 			}
+		}
+		if len(verdicts) > 0 {
+			status.Stdout = strings.TrimRight(status.Stdout, "\n") + "\n[测评平台自动验真回执] " + strings.Join(verdicts, " | ")
 		}
 	}
 	return status, nil
@@ -454,10 +491,16 @@ func (s *Service) ReadInteractive(ctx context.Context, task, intent int64, sid s
 			if execID == "" {
 				execID = sid
 			}
+			var verdicts []string
 			for _, flag := range ExtractFlags(res.Output, 16) {
 				if cid, addErr := s.DB.AddCTFOutputCandidate(ctx, task, execID, flag); addErr == nil && cid > 0 && BenchmarkFlagHook != nil {
-					_, _, _ = BenchmarkFlagHook(ctx, task, execID, flag, "")
+					if v, handled, _ := BenchmarkFlagHook(ctx, task, execID, flag, ""); handled && v != "" {
+						verdicts = append(verdicts, v)
+					}
 				}
+			}
+			if len(verdicts) > 0 {
+				res.Output = strings.TrimRight(res.Output, "\n") + "\n[测评平台自动验真回执] " + strings.Join(verdicts, " | ")
 			}
 		}
 	}
@@ -521,87 +564,124 @@ func excerpt(b []byte, n int) string {
 }
 
 // seedNonSharedWorkDir 在非共享模式下（如 Web/Misc/Crypto），当新意图的 ctf-work 尚未创建时，
-// 从同任务最早已有内容的 i*/ctf-work 复制解包产物，避免每个并行方向重新解压附件。
-func seedNonSharedWorkDir(root string, task int64, targetWork string) {
+// 按“前序重跑任务（ancestorTasks，由旧到新）→ 当前任务已有 i*/ctf-work（按修改时间由旧到新）”顺序
+// 合并持久产物与具名脚本（如 exp2.py、check_rce.py、凭据与跳板脚本），避免后续意图或重试轮次丢失前序成果；
+// 同时仅跳过默认临时草稿 solve.py / debug.gdb 与编译缓存文件。
+func seedNonSharedWorkDir(root string, task int64, targetWork string, ancestorTasks ...int64) {
 	if _, err := os.Stat(targetWork); err == nil {
 		return
 	}
-	taskDir := filepath.Join(root, "tasks", strconv.FormatInt(task, 10))
-	entries, err := os.ReadDir(taskDir)
-	if err != nil {
+	type seedDir struct {
+		rank    int
+		path    string
+		name    string
+		modTime time.Time
+	}
+	collectTaskDirs := func(taskID int64, rank int, includeShared bool) []seedDir {
+		taskDir := filepath.Join(root, "tasks", strconv.FormatInt(taskID, 10))
+		entries, err := os.ReadDir(taskDir)
+		if err != nil {
+			return nil
+		}
+		var dirs []seedDir
+		for _, ent := range entries {
+			if !ent.IsDir() {
+				continue
+			}
+			name := ent.Name()
+			if !strings.HasPrefix(name, "i") && (!includeShared || name != "shared") {
+				continue
+			}
+			cand := filepath.Join(taskDir, name, "ctf-work")
+			if cand == targetWork {
+				continue
+			}
+			if sub, err := os.ReadDir(cand); err == nil && len(sub) > 0 {
+				var mt time.Time
+				if info, ierr := os.Stat(cand); ierr == nil {
+					mt = info.ModTime()
+				}
+				dirs = append(dirs, seedDir{rank: rank, path: cand, name: name, modTime: mt})
+			}
+		}
+		return dirs
+	}
+	var srcDirs []seedDir
+	for idx, anc := range ancestorTasks {
+		if anc > 0 && anc != task {
+			srcDirs = append(srcDirs, collectTaskDirs(anc, idx, true)...)
+		}
+	}
+	srcDirs = append(srcDirs, collectTaskDirs(task, len(ancestorTasks)+1, false)...)
+	if len(srcDirs) == 0 {
 		return
 	}
-	var srcDir string
-	for _, ent := range entries {
-		if !ent.IsDir() || !strings.HasPrefix(ent.Name(), "i") {
-			continue
+	sort.Slice(srcDirs, func(i, j int) bool {
+		if srcDirs[i].rank != srcDirs[j].rank {
+			return srcDirs[i].rank < srcDirs[j].rank
 		}
-		cand := filepath.Join(taskDir, ent.Name(), "ctf-work")
-		if cand == targetWork {
-			continue
+		if !srcDirs[i].modTime.Equal(srcDirs[j].modTime) {
+			return srcDirs[i].modTime.Before(srcDirs[j].modTime)
 		}
-		if sub, err := os.ReadDir(cand); err == nil && len(sub) > 0 {
-			srcDir = cand
-			break
-		}
-	}
-	if srcDir == "" {
-		return
-	}
+		return srcDirs[i].name < srcDirs[j].name
+	})
 	const maxSeedBytes int64 = 64 << 20
 	const maxSeedFiles = 256
 	var copiedBytes int64
 	copiedFiles := 0
-	_ = filepath.WalkDir(srcDir, func(p string, d fs.DirEntry, err error) error {
-		if err != nil || p == srcDir {
-			return err
-		}
-		rel, e := filepath.Rel(srcDir, p)
-		if e != nil {
-			return nil
-		}
-		slash := filepath.ToSlash(rel)
-		base := strings.ToLower(d.Name())
-		if base == ".cache" || base == ".config" || base == ".tools" || base == "__pycache__" || strings.HasPrefix(slash, ".inputs") {
+	for _, sd := range srcDirs {
+		srcDir := sd.path
+		_ = filepath.WalkDir(srcDir, func(p string, d fs.DirEntry, err error) error {
+			if err != nil || p == srcDir {
+				return err
+			}
+			rel, e := filepath.Rel(srcDir, p)
+			if e != nil {
+				return nil
+			}
+			slash := filepath.ToSlash(rel)
+			base := strings.ToLower(d.Name())
+			if base == ".cache" || base == ".config" || base == ".tools" || base == "__pycache__" || strings.HasPrefix(slash, ".inputs") {
+				if d.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if d.Type()&os.ModeSymlink != 0 {
+				return nil
+			}
+			dst := filepath.Join(targetWork, rel)
 			if d.IsDir() {
-				return filepath.SkipDir
+				return os.MkdirAll(dst, 0700)
+			}
+			if base == "solve.py" || base == "debug.gdb" || strings.HasSuffix(base, ".pyc") || strings.HasSuffix(base, ".tmp") || strings.HasSuffix(base, ".swp") {
+				return nil
+			}
+			info, e := d.Info()
+			if e != nil || !info.Mode().IsRegular() {
+				return nil
+			}
+			if info.Size() > 32<<20 || copiedBytes+info.Size() > maxSeedBytes || copiedFiles+1 > maxSeedFiles {
+				return nil
+			}
+			if err := os.MkdirAll(filepath.Dir(dst), 0700); err != nil {
+				return nil
+			}
+			data, e := os.ReadFile(p)
+			if e != nil {
+				return nil
+			}
+			mode := os.FileMode(0600)
+			if info.Mode()&0111 != 0 {
+				mode = 0700
+			}
+			if err := os.WriteFile(dst, data, mode); err == nil {
+				copiedBytes += info.Size()
+				copiedFiles++
 			}
 			return nil
-		}
-		if d.Type()&os.ModeSymlink != 0 {
-			return nil
-		}
-		dst := filepath.Join(targetWork, rel)
-		if d.IsDir() {
-			return os.MkdirAll(dst, 0700)
-		}
-		if strings.HasPrefix(base, "solve") || strings.HasPrefix(base, "exp") || base == "debug.gdb" || strings.HasSuffix(base, ".pyc") || strings.HasSuffix(base, ".tmp") {
-			return nil
-		}
-		info, e := d.Info()
-		if e != nil || !info.Mode().IsRegular() {
-			return nil
-		}
-		if info.Size() > 32<<20 || copiedBytes+info.Size() > maxSeedBytes || copiedFiles+1 > maxSeedFiles {
-			return nil
-		}
-		if err := os.MkdirAll(filepath.Dir(dst), 0700); err != nil {
-			return nil
-		}
-		data, e := os.ReadFile(p)
-		if e != nil {
-			return nil
-		}
-		mode := os.FileMode(0600)
-		if info.Mode()&0111 != 0 {
-			mode = 0700
-		}
-		if err := os.WriteFile(dst, data, mode); err == nil {
-			copiedBytes += info.Size()
-			copiedFiles++
-		}
-		return nil
-	})
+		})
+	}
 }
 
 func streamTar(ctx context.Context, send func(io.Reader) error, build func(*tar.Writer) error) error {

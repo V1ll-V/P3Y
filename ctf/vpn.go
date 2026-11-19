@@ -32,31 +32,52 @@ func (s *Service) sessionSpec(ctx context.Context, task, sessionIntent int64, m 
 	return spec, nil
 }
 
+// ancestorTaskIDs returns all upstream SourceTaskIDs of task ordered oldest-to-newest
+// (excluding task itself) so retried tasks can inherit non-shared /work artifacts.
+func (s *Service) ancestorTaskIDs(task int64) []int64 {
+	if s == nil || s.DB == nil || task <= 0 {
+		return nil
+	}
+	seen := map[int64]bool{task: true}
+	var chain []int64
+	cur := task
+	for depth := 0; depth < 8; depth++ {
+		t, err := s.DB.GetTask(cur)
+		if err != nil || t == nil || len(t.SourceTaskIDs) == 0 {
+			break
+		}
+		var next int64
+		for _, sid := range t.SourceTaskIDs {
+			if sid > 0 && !seen[sid] {
+				seen[sid] = true
+				chain = append(chain, sid)
+				if next == 0 || sid < next {
+					next = sid
+				}
+			}
+		}
+		if next == 0 {
+			break
+		}
+		cur = next
+	}
+	for i, j := 0, len(chain)-1; i < j; i, j = i+1, j-1 {
+		chain[i], chain[j] = chain[j], chain[i]
+	}
+	return chain
+}
+
 // sharedWorkVolume resolves the root ancestor task ID across SourceTaskIDs retries
 // so all intents within a task and all retried tasks of the same challenge share
 // one persistent Docker /work volume.
 func (s *Service) sharedWorkVolume(ctx context.Context, task int64) string {
 	rootID := task
-	if s != nil && s.DB != nil && task > 0 {
-		seen := map[int64]bool{task: true}
-		cur := task
-		for depth := 0; depth < 8; depth++ {
-			t, err := s.DB.GetTask(cur)
-			if err != nil || t == nil || len(t.SourceTaskIDs) == 0 {
-				break
+	if ancestors := s.ancestorTaskIDs(task); len(ancestors) > 0 {
+		rootID = ancestors[0]
+		for _, id := range ancestors[1:] {
+			if id < rootID {
+				rootID = id
 			}
-			next := int64(0)
-			for _, sid := range t.SourceTaskIDs {
-				if sid > 0 && !seen[sid] && (next == 0 || sid < next) {
-					next = sid
-				}
-			}
-			if next == 0 {
-				break
-			}
-			seen[next] = true
-			rootID = next
-			cur = next
 		}
 	}
 	return fmt.Sprintf("p3y-box-task-work-%d", rootID)

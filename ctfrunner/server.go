@@ -57,6 +57,7 @@ func (s SessionSpec) Valid() bool {
 
 type Server struct {
 	Engine       *Engine
+	Backend      Backend
 	Token        string
 	StateDir     string
 	mu           sync.Mutex
@@ -65,6 +66,16 @@ type Server struct {
 	doctorMu     sync.Mutex
 	doctorAt     time.Time
 	doctorResult map[string]any
+}
+
+func (s *Server) backend() Backend {
+	if s == nil {
+		return nil
+	}
+	if s.Backend != nil {
+		return s.Backend
+	}
+	return s.Engine
 }
 
 func (s *Server) lock(key string) func() {
@@ -147,13 +158,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
-		var image struct{ ID string }
-		err := s.Engine.json(ctx, "GET", "/images/"+s.Engine.Image+"/json", nil, &image)
+		bk := s.backend()
+		imgID, err := bk.ImageID(ctx)
 		if err != nil {
 			fail(w, err)
 			return
 		}
-		reply(w, 200, map[string]any{"ok": true, "image": s.Engine.Image, "image_id": image.ID})
+		reply(w, 200, map[string]any{"ok": true, "image": bk.ImageName(), "image_id": imgID})
 	})
 	s.registerVPNRoutes(mux)
 	mux.HandleFunc("POST /sessions", func(w http.ResponseWriter, r *http.Request) {
@@ -175,7 +186,8 @@ func (s *Server) Handler() http.Handler {
 		} else {
 			v.Spec = spec
 		}
-		id, err := s.Engine.EnsureSessionWithOptions(r.Context(), SessionContainerOptions{
+		bk := s.backend()
+		id, err := bk.EnsureSessionWithOptions(r.Context(), SessionContainerOptions{
 			Name:          v.Name,
 			Task:          fmt.Sprint(spec.TaskID),
 			InputHash:     spec.InputHash,
@@ -194,13 +206,13 @@ func (s *Server) Handler() http.Handler {
 		}
 		v.WorkSeeded = s.isWorkVolumeSeeded(spec.WorkVolume, spec.HostWorkDir)
 		v.ContainerID = id
-		container, inspectErr := s.Engine.Container(r.Context(), id)
+		container, inspectErr := bk.Container(r.Context(), id)
 		if inspectErr != nil {
 			fail(w, inspectErr)
 			return
 		}
 		v.ImageID = container.Image
-		v.Image = s.Engine.Image
+		v.Image = bk.ImageName()
 		if err = s.save(v); err != nil {
 			fail(w, err)
 			return
@@ -249,7 +261,7 @@ func (s *Server) Handler() http.Handler {
 		// 这样超时不会杀掉整个工具容器，后台进程、/tmp 与 /work 内文件得以保留。
 		ctx, cancel := context.WithTimeout(r.Context(), time.Duration(timeout+15)*time.Second)
 		defer cancel()
-		result, err := s.Engine.Exec(ctx, v.ContainerID, wrapTimeout(in.Command, timeout))
+		result, err := s.backend().Exec(ctx, v.ContainerID, wrapTimeout(in.Command, timeout))
 		if err == nil && result.ExitCode == 124 {
 			result.Error = fmt.Sprintf("command timed out after %d seconds", timeout)
 			note := fmt.Sprintf("\n[p3y-box] 命令超过 %d 秒已被终止（退出码 124）；容器与工作文件保留。长任务请改为后台运行（nohup ... &）并轮询日志。\n", timeout)
@@ -270,7 +282,7 @@ func (s *Server) Handler() http.Handler {
 			fail(w, err)
 			return
 		}
-		body, err := s.Engine.Get(r.Context(), v.ContainerID)
+		body, err := s.backend().Get(r.Context(), v.ContainerID)
 		if err != nil {
 			fail(w, err)
 			return
@@ -291,7 +303,7 @@ func (s *Server) Handler() http.Handler {
 			fail(w, err)
 			return
 		}
-		if err = s.Engine.Remove(r.Context(), v.Name); err != nil {
+		if err = s.backend().Remove(r.Context(), v.Name); err != nil {
 			fail(w, err)
 			return
 		}
@@ -324,7 +336,7 @@ func (s *Server) putFiles(w http.ResponseWriter, r *http.Request, inputs bool) {
 		_ = pw.CloseWithError(err)
 		done <- err
 	}()
-	err = s.Engine.Put(r.Context(), v.ContainerID, pr)
+	err = s.backend().Put(r.Context(), v.ContainerID, pr)
 	_ = pr.CloseWithError(err)
 	validation := <-done
 	if err != nil {
@@ -454,7 +466,7 @@ func (s *Server) Collect(ctx context.Context, olderThan time.Time) {
 		unlock := s.lock(key)
 		v, err := s.load(key)
 		if err == nil && v.UpdatedAt.Before(olderThan) {
-			if s.Engine.Remove(ctx, v.Name) == nil {
+			if bk := s.backend(); bk != nil && bk.Remove(ctx, v.Name) == nil {
 				_ = os.Remove(filepath.Join(s.StateDir, entry.Name()))
 			}
 		}

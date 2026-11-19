@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -137,60 +138,114 @@ func compactionConfig(windowTokens int) *compaction.Config {
 	return &compaction.Config{ContextWindow: windowTokens}
 }
 
-// FromEnv resolves the LLM provider config:
-//
-//	P3Y_LLM_PROVIDER = anthropic|openai (default: inferred from keys)
-//	P3Y_LLM_MODEL    = model id        (default: per provider)
-//	P3Y_LLM_BASE_URL = endpoint        (optional)
-//	P3Y_LLM_PROXY    = proxy URL        (optional; http/https/socks5)
-//	ANTHROPIC_API_KEY / OPENAI_API_KEY         = credentials
+// FromEnv resolves the primary LLM provider config from environment variables.
 func FromEnv() (Config, bool) {
-	prov := os.Getenv("P3Y_LLM_PROVIDER")
-	anthKey := os.Getenv("ANTHROPIC_API_KEY")
-	oaiKey := os.Getenv("OPENAI_API_KEY")
-
-	if prov == "" {
-		switch {
-		case anthKey != "":
-			prov = "anthropic"
-		case oaiKey != "":
-			prov = "openai"
-		default:
-			return Config{}, false
-		}
-	}
-
-	c := Config{
-		BaseURL: os.Getenv("P3Y_LLM_BASE_URL"),
-		Model:   os.Getenv("P3Y_LLM_MODEL"),
-		Proxy:   strings.TrimSpace(os.Getenv("P3Y_LLM_PROXY")),
-		// 默认流式;P3Y_LLM_STREAM=false/0/off 显式关闭走非流式。
-		Stream: !isFalsy(os.Getenv("P3Y_LLM_STREAM")),
-	}
-	switch prov {
-	case "openai":
-		c.Format = llm.FormatOpenAI
-		c.APIKey = oaiKey
-		if c.Model == "" {
-			c.Model = "gpt-4o"
-		}
-	case "openai-responses":
-		c.Format = llm.FormatOpenAIResponses
-		c.APIKey = oaiKey
-		if c.Model == "" {
-			c.Model = "gpt-5"
-		}
-	default:
-		c.Format = llm.FormatAnthropic
-		c.APIKey = anthKey
-		if c.Model == "" {
-			c.Model = "claude-opus-4-8"
-		}
-	}
-	if c.APIKey == "" {
+	cfgs, ok := FromEnvProfiles()
+	if !ok || len(cfgs) == 0 {
 		return Config{}, false
 	}
-	return c, true
+	return cfgs[0], true
+}
+
+func splitEnvAPIKeys(raw string) []string {
+	parts := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ';' || r == '\n' || r == '\r'
+	})
+	seen := map[string]bool{}
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		k := strings.TrimSpace(p)
+		if k != "" && !seen[k] {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// FromEnvProfiles resolves one or more LLM provider configs (supporting comma-separated
+// failover keys via P3Y_LLM_API_KEYS or provider key vars, DEEPSEEK_API_KEY, and
+// hosted gateway URLs such as http://api.deepseek.com.tsecbench.gw/v1).
+func FromEnvProfiles() ([]Config, bool) {
+	prov := strings.ToLower(strings.TrimSpace(os.Getenv("P3Y_LLM_PROVIDER")))
+	anthKeys := splitEnvAPIKeys(os.Getenv("ANTHROPIC_API_KEY"))
+	oaiKeys := splitEnvAPIKeys(os.Getenv("OPENAI_API_KEY"))
+	dsKeys := splitEnvAPIKeys(os.Getenv("DEEPSEEK_API_KEY"))
+	poolKeys := splitEnvAPIKeys(os.Getenv("P3Y_LLM_API_KEYS"))
+
+	defaultModel := ""
+	if prov == "" {
+		switch {
+		case len(anthKeys) > 0:
+			prov = "anthropic"
+		case len(oaiKeys) > 0:
+			prov = "openai"
+		case len(dsKeys) > 0:
+			prov = "openai"
+			defaultModel = "deepseek-chat"
+		case len(poolKeys) > 0:
+			prov = "openai"
+		default:
+			return nil, false
+		}
+	}
+	if prov == "deepseek" {
+		prov = "openai"
+		defaultModel = "deepseek-chat"
+	}
+
+	var keys []string
+	keys = append(keys, poolKeys...)
+	switch prov {
+	case "openai", "openai-responses":
+		keys = append(keys, oaiKeys...)
+		keys = append(keys, dsKeys...)
+	default:
+		keys = append(keys, anthKeys...)
+	}
+	// Deduplicate across combined sources.
+	keys = splitEnvAPIKeys(strings.Join(keys, ","))
+	if len(keys) == 0 {
+		return nil, false
+	}
+
+	model := strings.TrimSpace(os.Getenv("P3Y_LLM_MODEL"))
+	if model == "" {
+		model = defaultModel
+	}
+	baseURL := strings.TrimSpace(os.Getenv("P3Y_LLM_BASE_URL"))
+	proxy := strings.TrimSpace(os.Getenv("P3Y_LLM_PROXY"))
+	stream := !isFalsy(os.Getenv("P3Y_LLM_STREAM"))
+	maxTokens, _ := strconv.Atoi(strings.TrimSpace(os.Getenv("P3Y_LLM_MAX_TOKENS")))
+	ctxWinK, _ := strconv.Atoi(strings.TrimSpace(os.Getenv("P3Y_LLM_CONTEXT_WINDOW_K")))
+	ratePerSec, _ := strconv.ParseFloat(strings.TrimSpace(os.Getenv("P3Y_LLM_RATE_PER_SEC")), 64)
+	ratePerMin, _ := strconv.ParseFloat(strings.TrimSpace(os.Getenv("P3Y_LLM_RATE_PER_MIN")), 64)
+	tt := strings.TrimSpace(os.Getenv("P3Y_LLM_THINKING_TYPE"))
+	re := strings.TrimSpace(os.Getenv("P3Y_LLM_REASONING_EFFORT"))
+	sessHdr := strings.TrimSpace(os.Getenv("P3Y_LLM_SESSION_HEADER_KEY"))
+
+	out := make([]Config, 0, len(keys))
+	for _, k := range keys {
+		c := ConfigFrom(prov, model, baseURL, k, proxy)
+		c.Stream = stream
+		if maxTokens > 0 {
+			c.MaxTokens = maxTokens
+		}
+		if ctxWinK > 0 {
+			c.ContextWindowK = ctxWinK
+		}
+		if ratePerSec > 0 {
+			c.RatePerSecond = ratePerSec
+		}
+		if ratePerMin > 0 {
+			c.RatePerMinute = ratePerMin
+		}
+		c.ThinkingType = tt
+		c.ReasoningEffort = re
+		c.SessionHeaderKey = sessHdr
+		out = append(out, c)
+	}
+	return out, true
 }
 
 // ConfigFrom builds a Config from UI-provided strings (provider defaults to
@@ -347,7 +402,7 @@ func (t quotaAwareTransport) RoundTrip(req *http.Request) (*http.Response, error
 			req.Header.Set(t.sessionHeaderKey, sid)
 		}
 	}
-	if ov := llmrec.ThinkingOverrideFrom(req.Context()); ov.ThinkingType != "" || ov.ReasoningEffort != "" {
+	if ov := llmrec.ThinkingOverrideFrom(req.Context()); ov.ThinkingType != "" || ov.ReasoningEffort != "" || ov.Model != "" {
 		applyWireThinkingOverride(req, ov)
 	}
 	// When LLM recording is on, the Recorder puts a Capture on the context so the
@@ -549,17 +604,62 @@ func withRoleThinking(inner llm.Provider, agentKey, fallbackKey string, tagWorke
 	}
 }
 
+func envRoleModel(key string) string {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return ""
+	}
+	return strings.TrimSpace(os.Getenv("P3Y_LLM_" + strings.ToUpper(key) + "_MODEL"))
+}
+
+func isReasoningRole(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "planner", "critic", "plateau_fork":
+		return true
+	default:
+		return false
+	}
+}
+
+// resolveAgentModelOverride returns an optional per-role model name from environment
+// variables (P3Y_LLM_<ROLE>_MODEL or P3Y_LLM_REASONING_MODEL for planner/critic/plateau_fork)
+// so deep-reasoning roles can escalate to a stronger model on the same gateway and
+// rate-limiter while worker/helper keep fast execution. Returns "" when unset.
+func resolveAgentModelOverride(agentKey, fallbackKey string) string {
+	if m := envRoleModel(agentKey); m != "" {
+		return m
+	}
+	if isReasoningRole(agentKey) {
+		if m := strings.TrimSpace(os.Getenv("P3Y_LLM_REASONING_MODEL")); m != "" {
+			return m
+		}
+	}
+	if fallbackKey != "" && fallbackKey != agentKey {
+		if m := envRoleModel(fallbackKey); m != "" {
+			return m
+		}
+		if isReasoningRole(fallbackKey) {
+			if m := strings.TrimSpace(os.Getenv("P3Y_LLM_REASONING_MODEL")); m != "" {
+				return m
+			}
+		}
+	}
+	return ""
+}
+
 func (p *roleThinkingProvider) apply(ctx context.Context, req llm.CompletionRequest) (context.Context, llm.CompletionRequest) {
 	if p.tagWorker && p.agentKey != "" {
 		ctx = llmrec.WithWorker(ctx, p.agentKey)
 	}
 	tt, re := resolveAgentThinking(p.agentKey, p.fallbackKey)
-	// Explicit per-request Thinking (e.g. compaction/verifier "disabled") always wins.
+	modelOv := resolveAgentModelOverride(p.agentKey, p.fallbackKey)
+	// Explicit per-request Thinking (e.g. compaction/verifier "disabled") always wins
+	// and stays on the fast base model rather than escalating to a slow reasoning model.
 	if req.Thinking != "" {
 		if req.Thinking == "disabled" {
-			ctx = llmrec.WithThinkingOverride(ctx, "disabled", "")
+			ctx = llmrec.WithCallOverride(ctx, "disabled", "", "")
 		} else {
-			ctx = llmrec.WithThinkingOverride(ctx, req.Thinking, re)
+			ctx = llmrec.WithCallOverride(ctx, req.Thinking, re, modelOv)
 		}
 		return ctx, req
 	}
@@ -567,9 +667,9 @@ func (p *roleThinkingProvider) apply(ctx context.Context, req llm.CompletionRequ
 		req.Thinking = tt
 	}
 	if tt == "disabled" && re == "" {
-		ctx = llmrec.WithThinkingOverride(ctx, "disabled", "")
-	} else if tt != "" || re != "" {
-		ctx = llmrec.WithThinkingOverride(ctx, tt, re)
+		ctx = llmrec.WithCallOverride(ctx, "disabled", "", modelOv)
+	} else if tt != "" || re != "" || modelOv != "" {
+		ctx = llmrec.WithCallOverride(ctx, tt, re, modelOv)
 	}
 	return ctx, req
 }
@@ -585,7 +685,7 @@ func (p *roleThinkingProvider) Complete(ctx context.Context, req llm.CompletionR
 }
 
 func applyWireThinkingOverride(req *http.Request, ov llmrec.ThinkingOverride) {
-	if req == nil || (ov.ThinkingType == "" && ov.ReasoningEffort == "") {
+	if req == nil || (ov.ThinkingType == "" && ov.ReasoningEffort == "" && ov.Model == "") {
 		return
 	}
 	raw := requestBodySnapshot(req)
@@ -609,6 +709,11 @@ func applyWireThinkingOverride(req *http.Request, ov llmrec.ThinkingOverride) {
 	path := ""
 	if req.URL != nil {
 		path = req.URL.Path
+	}
+	if ov.Model != "" {
+		if _, hasModel := body["model"]; hasModel || !strings.Contains(path, "/models/") {
+			body["model"] = ov.Model
+		}
 	}
 	switch {
 	case strings.HasSuffix(path, "/responses"):

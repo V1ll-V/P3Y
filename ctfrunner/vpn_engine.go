@@ -790,6 +790,10 @@ func writeTarFile(tw *tar.Writer, name string, data []byte, mode int64) error {
 
 func (s *Server) registerVPNRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /tasks/{id}/vpn", func(w http.ResponseWriter, r *http.Request) {
+		if s.Engine == nil {
+			fail(w, errors.New("本地单容器模式不支持独立 VPN Sidecar"))
+			return
+		}
 		taskID, err := parseTaskIDParam(r.PathValue("id"))
 		if err != nil {
 			fail(w, err)
@@ -803,6 +807,10 @@ func (s *Server) registerVPNRoutes(mux *http.ServeMux) {
 		reply(w, 200, st)
 	})
 	mux.HandleFunc("PUT /tasks/{id}/vpn", func(w http.ResponseWriter, r *http.Request) {
+		if s.Engine == nil {
+			fail(w, errors.New("本地单容器模式不支持独立 VPN Sidecar"))
+			return
+		}
 		taskID, err := parseTaskIDParam(r.PathValue("id"))
 		if err != nil {
 			fail(w, err)
@@ -824,6 +832,10 @@ func (s *Server) registerVPNRoutes(mux *http.ServeMux) {
 		reply(w, 200, st)
 	})
 	mux.HandleFunc("DELETE /tasks/{id}/vpn", func(w http.ResponseWriter, r *http.Request) {
+		if s.Engine == nil {
+			reply(w, 200, map[string]any{"removed": true})
+			return
+		}
 		taskID, err := parseTaskIDParam(r.PathValue("id"))
 		if err != nil {
 			fail(w, err)
@@ -842,16 +854,18 @@ func (s *Server) registerVPNRoutes(mux *http.ServeMux) {
 			return
 		}
 		idStr := fmt.Sprint(taskID)
-		if err := s.Engine.RemoveTaskContainers(r.Context(), idStr); err != nil {
-			fail(w, err)
-			return
+		if s.Engine != nil {
+			if err := s.Engine.RemoveTaskContainers(r.Context(), idStr); err != nil {
+				fail(w, err)
+				return
+			}
 		}
-		s.purgeTaskState(idStr)
+		s.purgeTaskStateByID(r.Context(), taskID, idStr)
 		reply(w, 200, map[string]any{"deleted": true, "task_id": taskID})
 	})
 }
 
-func (s *Server) purgeTaskState(taskID string) {
+func (s *Server) purgeTaskStateByID(ctx context.Context, taskIDNum int64, taskID string) {
 	if s.StateDir == "" {
 		return
 	}
@@ -862,13 +876,24 @@ func (s *Server) purgeTaskState(taskID string) {
 	prefix := taskID + "-"
 	for _, entry := range entries {
 		name := entry.Name()
-		if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".json") {
+		if strings.HasPrefix(name, prefix) && strings.HasSuffix(name, ".json") {
+			key := strings.TrimSuffix(name, ".json")
+			unlock := s.lock(key)
+			_ = os.Remove(filepath.Join(s.StateDir, name))
+			unlock()
 			continue
 		}
 		key := strings.TrimSuffix(name, ".json")
-		unlock := s.lock(key)
-		_ = os.Remove(filepath.Join(s.StateDir, name))
-		unlock()
+		if sessionKeyPattern.MatchString(key) {
+			unlock := s.lock(key)
+			if v, loadErr := s.load(key); loadErr == nil && v.Spec.TaskID == taskIDNum {
+				if bk := s.backend(); bk != nil {
+					_ = bk.Remove(ctx, v.Name)
+				}
+				_ = os.Remove(filepath.Join(s.StateDir, name))
+			}
+			unlock()
+		}
 	}
 }
 

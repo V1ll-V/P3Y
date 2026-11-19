@@ -49,9 +49,11 @@ type CTFCandidate struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 type CTFGoalProof struct {
-	InputHash  string         `json:"input_hash"`
-	VerifyMode string         `json:"verify_mode,omitempty"`
-	Accepted   []CTFCandidate `json:"accepted"`
+	InputHash     string         `json:"input_hash"`
+	VerifyMode    string         `json:"verify_mode,omitempty"`
+	RequiredFlags int            `json:"required_flags,omitempty"`
+	SolvedFlags   int            `json:"solved_flags,omitempty"`
+	Accepted      []CTFCandidate `json:"accepted"`
 }
 
 func (s *ExplorationStore) Database() *DB { return s.db }
@@ -317,7 +319,36 @@ func ctfGoalProofTx(ctx context.Context, tx *sql.Tx, taskID int64) (*CTFGoalProo
 		}
 		p.Accepted = append(p.Accepted, c)
 	}
-	return p, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	var reqFlags, solvedFlags int
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(flag_count,0), COALESCE(correct_flag_count,0) FROM benchmark_challenges WHERE bound_task_id=$1 OR $1 = ANY(history_task_ids) ORDER BY id DESC LIMIT 1`, taskID).Scan(&reqFlags, &solvedFlags); err == nil && reqFlags > 1 {
+		p.RequiredFlags = reqFlags
+		p.SolvedFlags = solvedFlags
+	}
+	return p, nil
+}
+
+// BenchmarkTaskFlagProgress returns (solved, required, true) when taskID (or its
+// exploration ID) is bound to a benchmark challenge; otherwise ok=false.
+func (d *DB) BenchmarkTaskFlagProgress(ctx context.Context, taskID, expID int64) (solved, required int, ok bool) {
+	if d == nil {
+		return 0, 0, false
+	}
+	if taskID <= 0 && expID > 0 {
+		_ = d.QueryRowContext(ctx, `SELECT id FROM tasks WHERE exploration_id=$1 AND deleted_at IS NULL LIMIT 1`, expID).Scan(&taskID)
+	}
+	if taskID <= 0 {
+		return 0, 0, false
+	}
+	var reqFlags, correctFlags int
+	if err := d.QueryRowContext(ctx, `SELECT COALESCE(flag_count,0), COALESCE(correct_flag_count,0) FROM benchmark_challenges WHERE bound_task_id=$1 OR $1 = ANY(history_task_ids) ORDER BY id DESC LIMIT 1`, taskID).Scan(&reqFlags, &correctFlags); err != nil || reqFlags <= 0 {
+		return 0, 0, false
+	}
+	var distinctAccepted int
+	_ = d.QueryRowContext(ctx, `SELECT COUNT(DISTINCT c.value) FROM ctf_candidates c JOIN tasks t ON t.id=c.task_id WHERE c.task_id=$1 AND c.input_hash=t.ctf_input_hash AND c.state='accepted' AND c.kind<>'exploit_proof'`, taskID).Scan(&distinctAccepted)
+	return max(correctFlags, distinctAccepted), reqFlags, true
 }
 
 func (d *DB) CTFTaskIDsForWP(ctx context.Context) ([]int64, error) {
@@ -352,11 +383,21 @@ func RequireCTFAcceptedFlag(b *EvidenceBundle) error {
 		return fmt.Errorf("CTF 目标尚缺当前输入版本的可信答案确认；正则匹配和模型回复不能作为最终成功依据")
 	}
 	var hasFlag, hasProof bool
+	distinctFlagVals := make(map[string]bool, len(b.CTF.Accepted))
 	for _, c := range b.CTF.Accepted {
 		if c.Kind == CTFCandidateExploitProof {
 			hasProof = true
 		} else {
 			hasFlag = true
+			if v := strings.TrimSpace(c.Value); v != "" {
+				distinctFlagVals[v] = true
+			}
+		}
+	}
+	if b.CTF.RequiredFlags > 1 {
+		solvedFlags := max(len(distinctFlagVals), b.CTF.SolvedFlags)
+		if solvedFlags < b.CTF.RequiredFlags {
+			return fmt.Errorf("多阶段题目尚需拿齐全部 %d 个 Flag（当前仅完成 %d/%d），严禁提前结题，请继续推进下一阶段获取剩余 Flag", b.CTF.RequiredFlags, solvedFlags, b.CTF.RequiredFlags)
 		}
 	}
 	switch verifyMode {

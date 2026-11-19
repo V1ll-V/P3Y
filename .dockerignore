@@ -19,3 +19,5 @@ bench/.env
 bench/scheduler.py
 bench/entrypoint_v2.sh
 bench/seed_v2.sh
+p3y-bench-hosted.tar.gz
+*.tar.gz

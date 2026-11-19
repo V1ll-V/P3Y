@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"p3y/ctfrunner"
 	"p3y/db"
@@ -189,5 +190,92 @@ func TestSharedWorkVolumeAcrossIntentsAndSourceTaskRetries(t *testing.T) {
 	}
 	if putWorks != 1 {
 		t.Fatalf("expected PUT /work only once before WorkSeeded=true, got %d", putWorks)
+	}
+}
+
+func TestSeedNonSharedWorkDirMergesLaterIntentArtifacts(t *testing.T) {
+	root := t.TempDir()
+	i1 := filepath.Join(root, "tasks", "77", "i1", "ctf-work")
+	i2 := filepath.Join(root, "tasks", "77", "i2", "ctf-work")
+	if err := os.MkdirAll(i1, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(i2, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(i1, "recon.txt"), []byte("ports:80"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(i1, "cred.json"), []byte("old"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	oldT := time.Now().Add(-2 * time.Minute)
+	_ = os.Chtimes(i1, oldT, oldT)
+
+	if err := os.WriteFile(filepath.Join(i2, "id_rsa"), []byte("KEY"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(i2, "cred.json"), []byte("new"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	target := filepath.Join(root, "tasks", "77", "i3", "ctf-work")
+	seedNonSharedWorkDir(root, 77, target)
+
+	if _, err := os.Stat(filepath.Join(target, "recon.txt")); err != nil {
+		t.Fatalf("expected i1 artifact: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(target, "id_rsa")); err != nil {
+		t.Fatalf("expected i2 artifact (not just first non-empty dir): %v", err)
+	}
+	gotCred, err := os.ReadFile(filepath.Join(target, "cred.json"))
+	if err != nil || string(gotCred) != "new" {
+		t.Fatalf("expected newer i2 cred.json to win, got %q (%v)", string(gotCred), err)
+	}
+}
+
+func TestSeedNonSharedWorkDirInheritsNamedScriptsAndAncestors(t *testing.T) {
+	root := t.TempDir()
+	ancWork := filepath.Join(root, "tasks", "101", "i3", "ctf-work")
+	curWork := filepath.Join(root, "tasks", "140", "i1", "ctf-work")
+	if err := os.MkdirAll(ancWork, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(curWork, 0700); err != nil {
+		t.Fatal(err)
+	}
+	// Ancestor task (e.g. timed-out round #101) has named scripts + default scratch solve.py
+	if err := os.WriteFile(filepath.Join(ancWork, "exp2.py"), []byte("print('v1')"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ancWork, "solve_pow.py"), []byte("pow"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ancWork, "solve.py"), []byte("scratch"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// Current retry task (#140) intent 1 updated exp2.py and wrote check_rce.py
+	if err := os.WriteFile(filepath.Join(curWork, "exp2.py"), []byte("print('v2')"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(curWork, "check_rce.py"), []byte("rce"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	target := filepath.Join(root, "tasks", "140", "i2", "ctf-work")
+	seedNonSharedWorkDir(root, 140, target, 101)
+
+	gotExp, err := os.ReadFile(filepath.Join(target, "exp2.py"))
+	if err != nil || string(gotExp) != "print('v2')" {
+		t.Fatalf("expected current retry task exp2.py (v2) to override ancestor, got %q (%v)", string(gotExp), err)
+	}
+	if _, err := os.Stat(filepath.Join(target, "solve_pow.py")); err != nil {
+		t.Fatalf("expected ancestor named script solve_pow.py to be inherited: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(target, "check_rce.py")); err != nil {
+		t.Fatalf("expected current task check_rce.py to be inherited: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(target, "solve.py")); !os.IsNotExist(err) {
+		t.Fatalf("default scratch solve.py should still be skipped")
 	}
 }

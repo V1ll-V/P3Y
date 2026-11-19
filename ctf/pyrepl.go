@@ -133,6 +133,7 @@ func (s *Service) EvalPyREPL(ctx context.Context, task, intent int64, session, c
 	if s == nil {
 		return nil, fmt.Errorf("CTF 沙箱上下文未就绪")
 	}
+	code = s.TranslateSandboxWorkPaths(ctx, task, intent, code)
 	code = strings.TrimSpace(code)
 	if !reset && code == "" {
 		return nil, fmt.Errorf("code 不能为空（除非仅传 reset=true 重置会话）")

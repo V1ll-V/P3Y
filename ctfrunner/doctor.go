@@ -17,13 +17,14 @@ func (s *Server) tools(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
 	defer cancel()
-	var image struct{ ID string }
-	if err := s.Engine.json(ctx, "GET", "/images/"+s.Engine.Image+"/json", nil, &image); err != nil {
+	imgName := s.backend().ImageName()
+	imgID, err := s.backend().ImageID(ctx)
+	if err != nil {
 		fail(w, err)
 		return
 	}
 	const name = "p3y-box-doctor"
-	id, err := s.Engine.Ensure(ctx, name, "doctor", "environment")
+	id, err := s.backend().Ensure(ctx, name, "doctor", "environment")
 	if err != nil {
 		fail(w, err)
 		return
@@ -31,9 +32,13 @@ func (s *Server) tools(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		cleanup, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		_ = s.Engine.Remove(cleanup, name)
+		_ = s.backend().Remove(cleanup, name)
 	}()
-	result, err := s.Engine.Exec(ctx, id, "/usr/bin/python3 /opt/ctf/doctor.py")
+	probeCmd := "/usr/bin/python3 /opt/ctf/doctor.py"
+	if s.Backend != nil {
+		probeCmd = `if [ -f /opt/ctf/doctor.py ]; then /usr/bin/python3 /opt/ctf/doctor.py; else printf '[{"name":"bash","group":"local","ready":true,"version":"local-sandbox"}]'; fi`
+	}
+	result, err := s.backend().Exec(ctx, id, probeCmd)
 	if err != nil {
 		fail(w, err)
 		return
@@ -53,7 +58,7 @@ func (s *Server) tools(w http.ResponseWriter, r *http.Request) {
 			ready = false
 		}
 	}
-	s.doctorResult = map[string]any{"ok": ready, "image": s.Engine.Image, "image_id": image.ID, "checked_at": time.Now().UTC(), "tools": entries}
+	s.doctorResult = map[string]any{"ok": ready, "image": imgName, "image_id": imgID, "checked_at": time.Now().UTC(), "tools": entries}
 	s.doctorAt = time.Now()
 	reply(w, 200, s.doctorResult)
 }

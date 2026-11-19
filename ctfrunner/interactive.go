@@ -391,7 +391,7 @@ func (s *Server) execInteractiveHelper(ctx context.Context, containerID string, 
 	for _, a := range args {
 		cmdParts = append(cmdParts, shellQuote(a))
 	}
-	res, err := s.Engine.Exec(ctx, containerID, strings.Join(cmdParts, " "))
+	res, err := s.backend().Exec(ctx, containerID, strings.Join(cmdParts, " "))
 	if err != nil {
 		return "", err
 	}

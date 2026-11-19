@@ -1194,6 +1194,11 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 					return actool.Errorf(fmt.Sprintf("漏洞节点 #%d 尚未通过验收(technical_verdict=%s)，不能用于证明目标。请先补齐证据等待验收，或改用已通过验收的发现。", ev, st.TechnicalVerdict)), nil
 				}
 			}
+			if t.ts != nil && t.ts.Database() != nil {
+				if solved, required, ok := t.ts.Database().BenchmarkTaskFlagProgress(ctx, t.taskID, t.ts.ID()); ok && required > 1 && solved < required {
+					return actool.Errorf(fmt.Sprintf("当前多阶段题目仅完成 %d/%d 个 Flag，尚余 %d 个未取得；严禁提前提交目标验收！请立即调用 add_intent 基于已获立足点/凭据继续向下阶段（提权、容器逃逸或内网横向移动）推进。", solved, required, required-solved)), nil
+				}
+			}
 			// V1:目标证明必须落成**持久化验收请求**,不能只是内存里的状态位。
 			// 请求带幂等键(goal + 输入版本),重复提交不会产生第二个任务。
 			jobID, jerr := t.ts.SubmitGoalEvidence(ctx, goal, ev, a.Reason)

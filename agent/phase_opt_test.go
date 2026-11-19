@@ -285,3 +285,102 @@ func TestBuildCTFGDBScript(t *testing.T) {
 		t.Fatalf("expected 16B alignment check and disassembly in gdb script: %s", script)
 	}
 }
+
+func TestRoleModelWireOverride(t *testing.T) {
+	origHook := ThinkingOverride
+	t.Cleanup(func() { ThinkingOverride = origHook })
+	ThinkingOverride = nil
+
+	var (
+		mu     sync.Mutex
+		models []string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var body map[string]any
+		_ = json.Unmarshal(raw, &body)
+		m, _ := body["model"].(string)
+		mu.Lock()
+		models = append(models, m)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer srv.Close()
+
+	cfg := Config{
+		Format:    llm.FormatOpenAI,
+		BaseURL:   srv.URL,
+		APIKey:    "test-key",
+		Model:     "deepseek-flash",
+		MaxTokens: 512,
+		Stream:    false,
+	}
+	base, err := cfg.NewProvider()
+	if err != nil {
+		t.Fatalf("NewProvider: %v", err)
+	}
+	req := llm.CompletionRequest{Messages: []llm.Message{llm.UserText("hi")}, MaxTokens: 32}
+
+	// 1. Unset env -> all roles keep base model.
+	t.Setenv("P3Y_LLM_REASONING_MODEL", "")
+	t.Setenv("P3Y_LLM_PLANNER_MODEL", "")
+	t.Setenv("P3Y_LLM_WORKER_MODEL", "")
+	_, _, _, err = withRoleThinking(base, "planner", "", false).Complete(context.Background(), req)
+	if err != nil {
+		t.Fatalf("planner default: %v", err)
+	}
+
+	// 2. P3Y_LLM_REASONING_MODEL set -> planner/critic/plateau_fork escalate, worker stays fast,
+	//    and explicit Thinking:"disabled" (compaction) stays fast!
+	t.Setenv("P3Y_LLM_REASONING_MODEL", "deepseek-reasoner")
+	_, _, _, err = withRoleThinking(base, "planner", "", false).Complete(context.Background(), req)
+	if err != nil {
+		t.Fatalf("planner reasoning: %v", err)
+	}
+	_, _, _, err = withRoleThinking(base, "critic", "", true).Complete(context.Background(), req)
+	if err != nil {
+		t.Fatalf("critic reasoning: %v", err)
+	}
+	_, _, _, err = withRoleThinking(base, "plateau_fork", "worker", true).Complete(context.Background(), req)
+	if err != nil {
+		t.Fatalf("plateau_fork reasoning: %v", err)
+	}
+	_, _, _, err = withRoleThinking(base, "worker", "", false).Complete(context.Background(), req)
+	if err != nil {
+		t.Fatalf("worker fast: %v", err)
+	}
+	compactReq := req
+	compactReq.Thinking = "disabled"
+	_, _, _, err = withRoleThinking(base, "planner", "", false).Complete(context.Background(), compactReq)
+	if err != nil {
+		t.Fatalf("planner compaction: %v", err)
+	}
+
+	// 3. Explicit per-role env overrides P3Y_LLM_REASONING_MODEL.
+	t.Setenv("P3Y_LLM_PLANNER_MODEL", "deepseek-v4-pro")
+	_, _, _, err = withRoleThinking(base, "planner", "", false).Complete(context.Background(), req)
+	if err != nil {
+		t.Fatalf("planner custom model: %v", err)
+	}
+
+	want := []string{
+		"deepseek-flash",    // unset
+		"deepseek-reasoner", // planner
+		"deepseek-reasoner", // critic
+		"deepseek-reasoner", // plateau_fork
+		"deepseek-flash",    // worker
+		"deepseek-flash",    // planner compaction (Thinking: disabled)
+		"deepseek-v4-pro",   // planner explicit override
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(models) != len(want) {
+		t.Fatalf("expected %d calls, got %d (%v)", len(want), len(models), models)
+	}
+	for i := range want {
+		if models[i] != want[i] {
+			t.Fatalf("call #%d: want model %q, got %q (all=%v)", i, want[i], models[i], models)
+		}
+	}
+}

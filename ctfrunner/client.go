@@ -11,8 +11,9 @@ import (
 )
 
 type Client struct {
-	URL, Token string
-	HTTP       *http.Client
+	URL, Token    string
+	HTTP          *http.Client
+	localWorkRoot string
 }
 
 func (c *Client) request(ctx context.Context, method, path string, body io.Reader, typ string) (*http.Response, error) {

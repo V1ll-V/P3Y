@@ -433,7 +433,7 @@ func ctfToolsWithUnlock(s *ctf.Service, task, intent int64, verifyMode string, u
 		}),
 		commandTool("ctf_gdb", "以 GDB batch 运行实际调试脚本，可设断点、运行、查看寄存器/栈/反汇编；停止于断点/崩溃时自动附加结构化寄存器、16B 栈对齐校验、栈顶与反汇编摘要面板。保留 .gdb 脚本及输出。", obj(map[string]any{"path": str("样本路径，原始附件先复制到 /work 并 chmod +x"), "commands": str("多行 GDB 命令"), "timeout_seconds": intp("最多 300 秒")}, "path", "commands"), func(a map[string]json.RawMessage) (string, int, error) {
 			p, err := file(a)
-			script := buildCTFGDBScript(text(a, "commands"))
+			script := s.TranslateSandboxWorkPaths(context.Background(), task, intent, buildCTFGDBScript(text(a, "commands")))
 			return "printf %s " + quote(base64.StdEncoding.EncodeToString([]byte(script))) + " | base64 -d > debug.gdb\ngdb -q -nx -batch -x debug.gdb -- " + quote(p), num(a, "timeout_seconds", 120), err
 		}),
 		commandTool("ctf_python", "运行并留存实际 Python 求解脚本。pwn 使用 pwntools/ROP；reverse 使用 angr 10（from angr import claripy）、Z3、Unicorn、Keystone。", obj(map[string]any{"script": str("Python 源码"), "profile": str("pwn 或 reverse"), "filename": str("脚本文件名，默认 solve.py"), "timeout_seconds": intp("最多 300 秒")}, "script"), func(a map[string]json.RawMessage) (string, int, error) {
@@ -448,7 +448,8 @@ func ctfToolsWithUnlock(s *ctf.Service, task, intent int64, verifyMode string, u
 			if text(a, "profile") == "reverse" {
 				python = "/opt/ctf/re/bin/python"
 			}
-			return "printf %s " + quote(base64.StdEncoding.EncodeToString([]byte(text(a, "script")))) + " | base64 -d > " + quote(name) + "\n" + python + " " + quote(name), num(a, "timeout_seconds", 120), nil
+			script := s.TranslateSandboxWorkPaths(context.Background(), task, intent, text(a, "script"))
+			return "printf %s " + quote(base64.StdEncoding.EncodeToString([]byte(script))) + " | base64 -d > " + quote(name) + "\n" + python + " " + quote(name), num(a, "timeout_seconds", 120), nil
 		}),
 		commandTool("ctf_decompile", "使用 Ghidra headless 实际分析并反编译指定函数，自动启用持久分析缓存（首次全量导入约 15s，后续单函数约 5s）。stripped/复杂逻辑二进制务必优先调用它，而非在 Bash 用 objdump 盲看汇编。函数名为空时取前 5 个函数。", obj(map[string]any{"path": str("二进制路径"), "function": str("函数名，可为空"), "limit": intp("最多 20 个函数")}, "path"), func(a map[string]json.RawMessage) (string, int, error) {
 			p, err := file(a)
@@ -807,7 +808,8 @@ func ctfToolsWithUnlock(s *ctf.Service, task, intent int64, verifyMode string, u
 			if strings.HasPrefix(p, "/work/.inputs") {
 				err = fmt.Errorf("原始附件只读，请复制到工作区")
 			}
-			return "mkdir -p -- " + quote(path.Dir(p)) + "; printf %s " + quote(base64.StdEncoding.EncodeToString([]byte(text(a, "content")))) + " | base64 -d > " + quote(p), 30, err
+			content := s.TranslateSandboxWorkPaths(context.Background(), task, intent, text(a, "content"))
+			return "mkdir -p -- " + quote(path.Dir(p)) + "; printf %s " + quote(base64.StdEncoding.EncodeToString([]byte(content))) + " | base64 -d > " + quote(p), 30, err
 		}),
 		commandTool("Edit", "精准修改本题 /work 工作区内的文本文件（如调整 exp.py 偏移或脚本参数），避免重写整文件。", obj(map[string]any{
 			"file_path":   str("/work 内路径"),
@@ -822,8 +824,8 @@ func ctfToolsWithUnlock(s *ctf.Service, task, intent int64, verifyMode string, u
 			if strings.HasPrefix(p, "/work/.inputs") {
 				return "", 30, fmt.Errorf("原始附件只读，请复制到工作区")
 			}
-			oldStr := text(a, "old_string")
-			newStr := text(a, "new_string")
+			oldStr := s.TranslateSandboxWorkPaths(context.Background(), task, intent, text(a, "old_string"))
+			newStr := s.TranslateSandboxWorkPaths(context.Background(), task, intent, text(a, "new_string"))
 			if oldStr == "" {
 				return "", 30, fmt.Errorf("old_string 不能为空")
 			}
@@ -1024,7 +1026,7 @@ Bash 和文件工具只在独立容器 /work 执行；脚本写在 /work。应�
 执行自动保存命令、输出、脚本及 execution_id：
 - 若本题需要 Flag：常见 Flag 自动登记候选；非标准格式才需 ctf_submit_flag，且必须来自真实执行输出。
 - 若本题为「漏洞利用证明（无需 Flag）」或「复合验收第 2 阶段」：在目标环境实际完成利用并通过二次验证确认效果持久化后，调用 ctf_submit_exploit_proof 提交证明（必须绑定真实 execution_id 与实际验证细节）。
-一旦提交候选或证明，立即停止探测、重复 payload、资产扩展、漏洞报告和目标证明；只交付核心结论与来源执行，等待用户到赛题平台验证。WP 无需额外模型整理。
+一旦提交候选或证明（零交互多 Flag 题目且平台回执 completed=false 尚有剩余 Flag 未拿齐时除外——此时严禁停手，须留在当前意图继续向下一阶段推进），立即停止探测、重复 payload、资产扩展、漏洞报告和目标证明；只交付核心结论与来源执行，等待用户到赛题平台验证。WP 无需额外模型整理。
 候选不是最终通过结论：用户确认后才引用已确认记录证明对应目标；用户否定后按反馈继续，避免再次提交同一被否定答案。
 分析步骤不拆成必须验收的目标；多阶段或多 Flag 交付按题干要求与用户确认状态推进。`, filepath.Join(root, "tasks", fmt.Sprint(task), fmt.Sprintf("i%d", intent)))
 }

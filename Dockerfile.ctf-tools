@@ -65,6 +65,11 @@ RUN chmod +x /opt/tools/php_filter_chain_generator/php_filter_chain_generator.py
     && /opt/ctf/pwn/bin/python3 -c "import ddddocr, cv2, pytesseract; d = ddddocr.DdddOcr(show_ad=False); assert hasattr(d, 'classification')" \
     && /opt/ctf/pwn/bin/python3 /usr/local/bin/php_filter_chain_generator --chain '<?php echo 1; ?>' >/dev/null \
     && chmod -R a+rX /opt/ctf/pwn /opt/tools/php_filter_chain_generator
+# 多阶段内网渗透与代理转发工具（与 Dockerfile.bench 保持一致）
+RUN (sed -i 's/mirrors.tuna.tsinghua.edu.cn/mirrors.aliyun.com/g; s/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true) \
+    && apt-get -o Acquire::http::Timeout=60 -o Acquire::Retries=5 update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y -o Acquire::http::Timeout=60 -o Acquire::Retries=5 --no-install-recommends \
+    openssh-client sshpass proxychains4 && rm -rf /var/lib/apt/lists/*
 ENV PATH="/opt/ctf/pwn/bin:${PATH}" HOME=/work XDG_CACHE_HOME=/work/.cache XDG_CONFIG_HOME=/work/.config JAVA_TOOL_OPTIONS="-Duser.home=/work" PYTHONPYCACHEPREFIX=/tmp/pycache PWNLIB_NOTERM=1 TERM=dumb
 RUN useradd --uid 1000 --create-home ctf && mkdir -p /work && chown 1000:1000 /work
 USER 1000:1000

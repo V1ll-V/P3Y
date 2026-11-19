@@ -52,11 +52,13 @@ func main() {
 
 func run() int {
 	var (
-		addr    = flag.String("addr", ":8787", "HTTP listen address")
-		dataDir = flag.String("data", filepath.Join(config.BaseDir(), "data"), "data directory for SQLite stores (default: data/ next to the executable)")
-		proxy   = flag.String("proxy", "127.0.0.1:8788", "traffic recording proxy address (empty to disable)")
+		addr     = flag.String("addr", ":8787", "HTTP listen address")
+		dataDir  = flag.String("data", filepath.Join(config.BaseDir(), "data"), "data directory for SQLite stores (default: data/ next to the executable)")
+		proxy    = flag.String("proxy", "127.0.0.1:8788", "traffic recording proxy address (empty to disable)")
+		headless = flag.Bool("headless", false, "run without HTTP UI listener (hosted benchmark / CLI mode)")
 	)
 	flag.Parse()
+	isHeadless := *headless || os.Getenv("P3Y_HEADLESS") == "1"
 
 	// hand the build version to the server package so GET /api/health can report it
 	// to the frontend top bar.
@@ -119,28 +121,36 @@ func run() int {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	go func() {
-		log.Printf("p3y %s backend listening on %s (data=%s, workers=%d)", version, *addr, *dataDir, mgr.Workers())
-		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("serve: %v", err)
-		}
-	}()
+	if isHeadless {
+		log.Printf("p3y %s headless mode active (data=%s, workers=%d, ui=disabled)", version, *dataDir, mgr.Workers())
+	} else {
+		go func() {
+			log.Printf("p3y %s backend listening on %s (data=%s, workers=%d)", version, *addr, *dataDir, mgr.Workers())
+			if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("serve: %v", err)
+			}
+		}()
+	}
 
-	// Two ways out: a signal (normal stop → exit 0, the start script stops looping)
-	// or a staged update / rollback (→ exit 75, the script relaunches us and the
-	// bootstrap above installs the new build).
+	// Two ways out: a signal (normal stop → exit 0, the start script stops looping),
+	// a hosted benchmark finishing with P3Y_BENCH_EXIT_ON_DONE=1, or a staged update / rollback.
 	code := 0
 	select {
 	case <-ctx.Done():
+	case <-srv.BenchmarkDone():
+		log.Println("benchmark finished; shutting down...")
+		shutdown(agent.AbortShutdown)
 	case <-server.RestartRequested():
 		code = selfupdate.ExitRestart
 		shutdown(agent.AbortShutdown)
 	}
 
 	log.Println("shutting down...")
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_ = httpSrv.Shutdown(shutdownCtx)
+	if !isHeadless {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = httpSrv.Shutdown(shutdownCtx)
+	}
 	return code
 }
 

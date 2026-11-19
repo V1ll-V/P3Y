@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -262,6 +263,9 @@ func (d *DB) DeleteTipCard(ctx context.Context, id int64) error {
 // built-in cards are also backfilled into existing deployments without duplicating.
 func (d *DB) SeedDefaultTips(ctx context.Context) error {
 	if d == nil {
+		return nil
+	}
+	if os.Getenv("P3Y_HOSTED_MODE") == "1" || os.Getenv("P3Y_SKIP_BUILTIN_TIPS") == "1" {
 		return nil
 	}
 	existing := map[string]bool{}

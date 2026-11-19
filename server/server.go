@@ -122,8 +122,28 @@ type Server struct {
 	// channel coalesces enqueue bursts; the database remains the source of truth.
 	archiveWake chan struct{}
 	archiveWG   sync.WaitGroup
-	side        *sideQuestionState
-	bench       *BenchmarkManager
+	side          *sideQuestionState
+	bench         *BenchmarkManager
+	benchDone     chan struct{}
+	benchDoneOnce sync.Once
+}
+
+// BenchmarkDone closes once a hosted/auto-started benchmark reaches a terminal state
+// (when P3Y_BENCH_EXIT_ON_DONE=1 is configured).
+func (s *Server) BenchmarkDone() <-chan struct{} {
+	if s == nil || s.benchDone == nil {
+		return nil
+	}
+	return s.benchDone
+}
+
+func (s *Server) notifyBenchmarkDone() {
+	if s == nil || s.benchDone == nil {
+		return
+	}
+	s.benchDoneOnce.Do(func() {
+		close(s.benchDone)
+	})
 }
 
 // provEntry is a cached provider + its config for one LLM profile id.
@@ -155,7 +175,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
 		profChatAgents: map[int64]*agent.ChatAgent{},
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
-		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
+		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1), benchDone: make(chan struct{})}
 	s.initSideQuestions()
 	// 熔断阈值/冷却是失败路径上的热参数，启动时把全局重试策略推给 Registry 一次；
 	// 之后每次保存策略再推一次（saveLLMRetryPolicy）。
@@ -256,7 +276,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		go newNotifier(s).Run(s.ctx)
 		// Fill the tool cache for any enabled MCP that has none yet (notably the
 		// seeded browser MCP on first run). Async so it never blocks startup.
-		go s.discoverEmptyMCPsOnStartup()
+		if os.Getenv("P3Y_HOSTED_MODE") != "1" && os.Getenv("P3Y_DISABLE_STARTUP_MCP_DISCOVERY") != "1" {
+			go s.discoverEmptyMCPsOnStartup()
+		}
 		logSink.SetDB(ctx, m.pg) // restore last 100 log rows and enable async persistence
 	}
 	// precedence: persisted DB config > env.
@@ -266,11 +288,15 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		} else {
 			log.Printf("[engine] LLM configured from DB: %s / %s", cfg.Provider(), cfg.Model)
 		}
-	} else if cfg, ok := agent.FromEnv(); ok {
-		if err := s.applyLLM(cfg); err != nil {
+	} else if cfgs, ok := agent.FromEnvProfiles(); ok && len(cfgs) > 0 {
+		s.seedLLMProfilesFromEnv(cfgs)
+		if dbCfg, ok2 := s.loadLLMConfig(); ok2 {
+			cfgs[0] = dbCfg
+		}
+		if err := s.applyLLM(cfgs[0]); err != nil {
 			log.Printf("[engine] env provider init failed — engine idle: %v", err)
 		} else {
-			log.Printf("[engine] LLM configured from env: %s / %s", cfg.Provider(), cfg.Model)
+			log.Printf("[engine] LLM configured from env (%d profile(s)): %s / %s", len(cfgs), cfgs[0].Provider(), cfgs[0].Model)
 		}
 	} else {
 		log.Printf("[engine] no LLM provider configured — engine idle until set via /api/llm or env")
@@ -282,6 +308,36 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	s.registerBenchmarkHooks()
 	s.wireInterceptReviewer() // LLM 兜底审批:未命中拦截规则的命令交给模型判定
 	return s
+}
+
+func (s *Server) seedLLMProfilesFromEnv(cfgs []agent.Config) {
+	if s == nil || s.m == nil || s.m.pg == nil || len(cfgs) == 0 {
+		return
+	}
+	if existing, err := s.m.pg.ListProfiles(); err != nil || len(existing) > 0 {
+		return
+	}
+	var activeID int64
+	for i, cfg := range cfgs {
+		name := "default"
+		if i > 0 {
+			name = fmt.Sprintf("env-pool-%d", i+1)
+		}
+		prio := max(100-i*10, 1)
+		id, err := s.m.pg.SaveProfile(&db.LLMProfile{
+			Name: name, Format: cfg.Provider(), Model: cfg.Model, BaseURL: cfg.BaseURL, Proxy: cfg.Proxy,
+			APIKey: cfg.APIKey, RatePerSecond: cfg.RatePerSecond, RatePerMinute: cfg.RatePerMinute,
+			ContextWindowK: cfg.ContextWindowK, ThinkingType: cfg.ThinkingType, ReasoningEffort: cfg.ReasoningEffort,
+			IsDefault: i == 0, Priority: prio, PoolExclude: false, Streaming: cfg.Stream,
+			MaxTokens: cfg.MaxTokens, MaxTokensField: cfg.MaxTokensField, SessionHeaderKey: cfg.SessionHeaderKey,
+		})
+		if err == nil && id > 0 && activeID == 0 {
+			activeID = id
+		}
+	}
+	if activeID > 0 {
+		_ = s.m.pg.SetActiveProfile(activeID)
+	}
 }
 
 // Restored deadline and worker loops must inherit the same context as new tasks,

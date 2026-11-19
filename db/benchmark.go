@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"log"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -724,17 +726,28 @@ func benchmarkAnswerHash(subFlagID, answer string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func (d *DB) HasSubmittedBenchmarkAnswer(ctx context.Context, sessionID int64, uniqueCode, subFlagID, answer string) (bool, error) {
-	var exists bool
+func (d *DB) LookupSubmittedBenchmarkAnswer(ctx context.Context, sessionID int64, uniqueCode, subFlagID, answer string) (submitted bool, wasCorrect bool, err error) {
 	h := benchmarkAnswerHash(subFlagID, answer)
+	var cnt int
 	// Ignore http_status = 0 rows caused by transient transport errors that never reached platform grading.
-	err := d.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM benchmark_submissions WHERE session_id=$1 AND unique_code=$2 AND answer_sha256=$3 AND (http_status > 0 OR correct = true))`, sessionID, uniqueCode, h).Scan(&exists)
-	return exists, err
+	err = d.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(BOOL_OR(correct), false) FROM benchmark_submissions WHERE session_id=$1 AND unique_code=$2 AND answer_sha256=$3 AND (http_status > 0 OR correct = true)`, sessionID, uniqueCode, h).Scan(&cnt, &wasCorrect)
+	return cnt > 0, wasCorrect, err
+}
+
+func (d *DB) HasSubmittedBenchmarkAnswer(ctx context.Context, sessionID int64, uniqueCode, subFlagID, answer string) (bool, error) {
+	submitted, _, err := d.LookupSubmittedBenchmarkAnswer(ctx, sessionID, uniqueCode, subFlagID, answer)
+	return submitted, err
 }
 
 func (d *DB) CountRejectedBenchmarkSubmissions(ctx context.Context, sessionID int64, uniqueCode string) (int, error) {
 	var n int
-	err := d.QueryRowContext(ctx, `SELECT COUNT(*) FROM benchmark_submissions WHERE session_id=$1 AND unique_code=$2 AND http_status > 0 AND correct = false`, sessionID, uniqueCode).Scan(&n)
+	// Count consecutive rejections since the latest accepted stage flag so multi-flag
+	// challenges reset their rejection budget upon solving each stage.
+	err := d.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM benchmark_submissions
+WHERE session_id=$1 AND unique_code=$2 AND http_status > 0 AND correct = false
+  AND id > COALESCE((SELECT MAX(id) FROM benchmark_submissions WHERE session_id=$1 AND unique_code=$2 AND correct = true), 0)`,
+		sessionID, uniqueCode).Scan(&n)
 	return n, err
 }
 
@@ -772,6 +785,9 @@ func (d *DB) AppendBenchmarkEvent(ctx context.Context, sessionID int64, uniqueCo
 		}
 	}
 	_, err := d.ExecContext(ctx, `INSERT INTO benchmark_events(session_id,unique_code,kind,summary,detail_json) VALUES ($1,$2,$3,$4,$5)`, sessionID, uniqueCode, kind, summary, raw)
+	if os.Getenv("P3Y_HOSTED_MODE") == "1" || os.Getenv("P3Y_BENCH_LOG") == "1" {
+		log.Printf("[BENCH] session=%d code=%s kind=%s %s", sessionID, uniqueCode, kind, summary)
+	}
 	return err
 }
 

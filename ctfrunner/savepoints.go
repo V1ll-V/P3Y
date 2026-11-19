@@ -44,23 +44,31 @@ func (s *Server) createSavepoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	_, isLocal := s.backend().(*LocalBackend)
+	findCmd := "find"
+	cpFlags := "cp -al"
+	if isLocal {
+		findCmd = "find -H"
+		cpFlags = "cp -a --reflink=auto"
+	}
+
 	snapDir := "/work/.snapshots/" + id
 	tmpDir := snapDir + ".tmp"
-	// Copy all user files/dirs/dotfiles from /work via hardlinks on the same filesystem,
-	// excluding read-only inputs and internal caches/metadata directories.
+	// Copy all user files/dirs/dotfiles from /work, excluding read-only inputs and
+	// internal caches/metadata directories.
 	script := fmt.Sprintf(`set -e
 mkdir -p /work/.snapshots
 rm -rf %s
 mkdir -p %s
-find /work -mindepth 1 -maxdepth 1 ! -name '.inputs' ! -name '.snapshots' ! -name '.ghidra' ! -name '.cache' ! -name '.jobs' ! -name '.interactive' -exec cp -al -- {} %s/ \;
+%s /work -mindepth 1 -maxdepth 1 ! -name '.inputs' ! -name '.snapshots' ! -name '.ghidra' ! -name '.cache' ! -name '.jobs' ! -name '.interactive' -exec %s -- {} %s/ \;
 rm -rf %s
 mv %s %s`,
-		shQuote(tmpDir), shQuote(tmpDir), shQuote(tmpDir), shQuote(snapDir), shQuote(tmpDir), shQuote(snapDir),
+		shQuote(tmpDir), shQuote(tmpDir), findCmd, cpFlags, shQuote(tmpDir), shQuote(snapDir), shQuote(tmpDir), shQuote(snapDir),
 	)
 
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	res, err := s.Engine.Exec(ctx, v.ContainerID, script)
+	res, err := s.backend().Exec(ctx, v.ContainerID, script)
 	if err != nil {
 		fail(w, err)
 		return
@@ -98,10 +106,18 @@ func (s *Server) rewindSavepoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	_, isLocal := s.backend().(*LocalBackend)
+	findCmd := "find"
+	cpFlags := "cp -al"
+	if isLocal {
+		findCmd = "find -H"
+		cpFlags = "cp -a --reflink=auto"
+	}
+
 	snapDir := "/work/.snapshots/" + id
 	// Verify snapshot exists, terminate stray background solver/script processes holding
 	// files under /work (without touching PID 1 sleep or this shell), clear /work user
-	// files, and restore the hardlink snapshot back into /work.
+	// files, and restore the snapshot back into /work.
 	script := fmt.Sprintf(`set -e
 test -d %s || { echo "savepoint not found" >&2; exit 44; }
 for c in /proc/[0-9]*/cmdline; do
@@ -113,14 +129,14 @@ for c in /proc/[0-9]*/cmdline; do
     *"/work/"*) kill -TERM "$pid" 2>/dev/null || true ;;
   esac
 done
-find /work -mindepth 1 -maxdepth 1 ! -name '.inputs' ! -name '.snapshots' ! -name '.ghidra' ! -name '.cache' ! -name '.jobs' ! -name '.interactive' -exec rm -rf -- {} +
-find %s -mindepth 1 -maxdepth 1 -exec cp -al -- {} /work/ \;`,
-		shQuote(snapDir), shQuote(snapDir),
+%s /work -mindepth 1 -maxdepth 1 ! -name '.inputs' ! -name '.snapshots' ! -name '.ghidra' ! -name '.cache' ! -name '.jobs' ! -name '.interactive' -exec rm -rf -- {} +
+%s %s -mindepth 1 -maxdepth 1 -exec %s -- {} /work/ \;`,
+		shQuote(snapDir), findCmd, findCmd, shQuote(snapDir), cpFlags,
 	)
 
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	res, err := s.Engine.Exec(ctx, v.ContainerID, script)
+	res, err := s.backend().Exec(ctx, v.ContainerID, script)
 	if err != nil {
 		fail(w, err)
 		return

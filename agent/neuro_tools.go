@@ -66,6 +66,15 @@ func ctfNeuroTools(s *ctf.Service, task, intent int64) []actool.CoreTool {
 			if err := json.Unmarshal(in, &spec); err != nil {
 				return actool.Errorf(fmt.Sprintf("参数解析失败: %v", err)), nil
 			}
+			spec.ScriptPath = s.TranslateSandboxWorkPaths(ctx, task, intent, spec.ScriptPath)
+			spec.LocalCmd = s.TranslateSandboxWorkPaths(ctx, task, intent, spec.LocalCmd)
+			spec.RemoteCmd = s.TranslateSandboxWorkPaths(ctx, task, intent, spec.RemoteCmd)
+			for i := range spec.LocalArgs {
+				spec.LocalArgs[i] = s.TranslateSandboxWorkPaths(ctx, task, intent, spec.LocalArgs[i])
+			}
+			for i := range spec.RemoteArgs {
+				spec.RemoteArgs[i] = s.TranslateSandboxWorkPaths(ctx, task, intent, spec.RemoteArgs[i])
+			}
 			cmd, timeout, err := ctf.BuildDiffLocalRemoteCommand(spec)
 			if err != nil {
 				return actool.Errorf(err.Error()), nil

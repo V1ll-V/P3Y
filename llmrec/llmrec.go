@@ -20,28 +20,38 @@ type taskIDContextKey struct{}
 type workerContextKey struct{}
 type thinkingContextKey struct{}
 
-// ThinkingOverride holds per-call or per-role overrides for thinking_type and
-// reasoning_effort injected via context so a single shared Provider / rate-limiter
-// can run different agents at different reasoning intensities.
+// ThinkingOverride holds per-call or per-role overrides for thinking_type,
+// reasoning_effort, and optional wire-level model name injected via context so a
+// single shared Provider / rate-limiter can run different agents at different
+// reasoning intensities or fast/slow models.
 type ThinkingOverride struct {
 	ThinkingType    string
 	ReasoningEffort string
+	Model           string
 }
 
 // WithThinkingOverride attaches per-call thinking overrides to ctx. Empty fields
 // leave the underlying profile / request configuration untouched.
 func WithThinkingOverride(ctx context.Context, thinkingType, reasoningEffort string) context.Context {
+	return WithCallOverride(ctx, thinkingType, reasoningEffort, "")
+}
+
+// WithCallOverride attaches per-call thinking and optional model overrides to ctx.
+// Empty fields leave the underlying profile / request configuration untouched.
+func WithCallOverride(ctx context.Context, thinkingType, reasoningEffort, model string) context.Context {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	tt := strings.TrimSpace(thinkingType)
 	re := strings.TrimSpace(reasoningEffort)
-	if tt == "" && re == "" {
+	md := strings.TrimSpace(model)
+	if tt == "" && re == "" && md == "" {
 		return ctx
 	}
 	return context.WithValue(ctx, thinkingContextKey{}, ThinkingOverride{
 		ThinkingType:    tt,
 		ReasoningEffort: re,
+		Model:           md,
 	})
 }
 
@@ -175,6 +185,7 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 	// untouched wire bodies — the normalized view below cannot reconstruct them
 	// (tool schemas are dropped, tool_use blocks never reach this layer, and the
 	// SSE framing is already decoded). See capture.go.
+	effModel := r.effectiveModel(ctx)
 	reqBody := ""
 	var capt *Capture
 	if recordBodies {
@@ -202,10 +213,10 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 				status = "error"
 			}
 			// Lightweight metering row — always written.
-			r.recordUsage(taskID, expID, worker, usage, int(time.Since(start).Milliseconds()), status)
+			r.recordUsage(taskID, expID, worker, effModel, usage, int(time.Since(start).Milliseconds()), status)
 			// Heavy trace row — only when body recording is on.
 			if recordBodies {
-				r.record(req, session, taskID, worker, reqBody, capt, start, textBuf.String(), thinkingBuf.String(), usage, stopReason, err)
+				r.record(req, session, taskID, worker, effModel, reqBody, capt, start, textBuf.String(), thinkingBuf.String(), usage, stopReason, err)
 			}
 		}
 		defer func() { finish(ctx.Err()) }()
@@ -268,6 +279,7 @@ func (r *Recorder) Complete(ctx context.Context, req llm.CompletionRequest) (llm
 		taskID = parsedID
 	}
 
+	effModel := r.effectiveModel(ctx)
 	reqBody := ""
 	var capt *Capture
 	if recordBodies {
@@ -280,11 +292,18 @@ func (r *Recorder) Complete(ctx context.Context, req llm.CompletionRequest) (llm
 	if err != nil {
 		status = "error"
 	}
-	r.recordUsage(taskID, expID, worker, usage, int(time.Since(start).Milliseconds()), status)
+	r.recordUsage(taskID, expID, worker, effModel, usage, int(time.Since(start).Milliseconds()), status)
 	if recordBodies {
-		r.record(req, session, taskID, worker, reqBody, capt, start, msg.Text(), thinkingText(msg), usage, stopReason, err)
+		r.record(req, session, taskID, worker, effModel, reqBody, capt, start, msg.Text(), thinkingText(msg), usage, stopReason, err)
 	}
 	return msg, stopReason, usage, err
+}
+
+func (r *Recorder) effectiveModel(ctx context.Context) string {
+	if ov := ThinkingOverrideFrom(ctx); ov.Model != "" {
+		return ov.Model
+	}
+	return r.model
 }
 
 func thinkingText(msg llm.Message) string {
@@ -299,11 +318,11 @@ func thinkingText(msg llm.Message) string {
 
 // recordUsage appends one lightweight metering row to llm_usage (no bodies). Skips
 // zero-token calls with no model, which carry nothing worth metering.
-func (r *Recorder) recordUsage(taskID string, expID int64, worker string, usage llm.Usage, latencyMs int, status string) {
+func (r *Recorder) recordUsage(taskID string, expID int64, worker, model string, usage llm.Usage, latencyMs int, status string) {
 	if r.pg == nil {
 		return
 	}
-	if r.model == "" && usage.InputTokens == 0 && usage.OutputTokens == 0 &&
+	if model == "" && usage.InputTokens == 0 && usage.OutputTokens == 0 &&
 		usage.CacheReadTokens == 0 && usage.CacheWriteTokens == 0 {
 		return
 	}
@@ -311,7 +330,7 @@ func (r *Recorder) recordUsage(taskID string, expID int64, worker string, usage 
 		TaskID:        taskID,
 		ExplorationID: expID,
 		Worker:        worker,
-		Model:         r.model,
+		Model:         model,
 		ProfileName:   r.prof,
 		LatencyMs:     latencyMs,
 		InputTokens:   usage.InputTokens,
@@ -328,7 +347,7 @@ func (r *Recorder) recordUsage(taskID string, expID int64, worker string, usage 
 // record persists one LLM call to PostgreSQL before the provider stream returns.
 // Keeping the write inside the owning task operation means task deletion can
 // drain calls and then remove records without a late async insert recreating one.
-func (r *Recorder) record(req llm.CompletionRequest, session, taskID, worker, reqBody string, capt *Capture, start time.Time, text, thinking string, usage llm.Usage, stopReason string, streamErr error) {
+func (r *Recorder) record(req llm.CompletionRequest, session, taskID, worker, model, reqBody string, capt *Capture, start time.Time, text, thinking string, usage llm.Usage, stopReason string, streamErr error) {
 	latency := int(time.Since(start).Milliseconds())
 	status := "ok"
 	errMsg := ""
@@ -352,12 +371,6 @@ func (r *Recorder) record(req llm.CompletionRequest, session, taskID, worker, re
 		resp["thinking"] = thinking
 	}
 	respBody, _ := json.Marshal(resp)
-
-	model := ""
-	if len(req.System) > 0 {
-		// model is not in CompletionRequest; use the configured model name
-	}
-	model = r.model
 
 	rec := &db.LLMRecord{
 		SessionID:    session,
