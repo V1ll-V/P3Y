@@ -650,3 +650,77 @@ func TestBenchmarkFlagPrefixNormalizationZeroPenalty(t *testing.T) {
 		t.Fatalf("expected challenge completed via normalized prefix fallback, got %+v", chEnd)
 	}
 }
+
+func TestBenchmarkEmptyHintMarksUsedNoSpam(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) - skipping", err)
+	}
+	t.Cleanup(func() { m.Close() })
+
+	hintCalls := 0
+	mockTSec := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/openapi/v1/challenges/hint" {
+			hintCalls++
+			_, _ = w.Write([]byte(`{"unique_code":"Aperture","hint":null}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer mockTSec.Close()
+
+	sess, err := m.pg.CreateBenchmarkSession(t.Context(), db.BenchmarkSessionCreate{
+		Name:                "empty-hint-no-spam",
+		Provider:            "tsecbench",
+		BaseURL:             mockTSec.URL,
+		Token:               "tok-empty-hint",
+		MaxConcurrent:       1,
+		HintPolicy:          "stagnant_only",
+		PerChallengeTimeout: 1200,
+	})
+	if err != nil {
+		t.Fatalf("CreateBenchmarkSession: %v", err)
+	}
+	t.Cleanup(func() { _, _ = m.pg.Exec(`DELETE FROM benchmark_sessions WHERE id=$1`, sess.ID) })
+
+	if err := m.pg.SyncBenchmarkChallenges(t.Context(), sess.ID, []db.BenchmarkChallengeUpsert{{
+		UniqueCode: "Aperture",
+		Title:      "Aperture",
+		Category:   "web",
+		TotalScore: 500,
+		FlagCount:  1,
+	}}); err != nil {
+		t.Fatalf("SyncBenchmarkChallenges: %v", err)
+	}
+	taskObj, err := m.CreateTaskWithOptions("Aperture", "find flag", db.TaskCreateOptions{Mode: "ctf", ChallengeType: "web", ZeroTouch: true})
+	if err != nil {
+		t.Fatalf("CreateTaskWithOptions: %v", err)
+	}
+	tidNum, _ := strconv.ParseInt(taskObj.ID, 10, 64)
+	t.Cleanup(func() { _, _ = m.DeleteTask(taskObj.ID, DeleteTaskOptions{}) })
+	_ = m.pg.BindBenchmarkChallengeTask(t.Context(), sess.ID, "Aperture", tidNum)
+
+	td := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	s := New(ctx, m, td, td, td)
+	rt, err := s.bench.runtimeFor(sess)
+	if err != nil {
+		t.Fatalf("runtimeFor: %v", err)
+	}
+	// Simulate elapsed >= timeout/2 so shouldFetch=true on every tick.
+	rt.taskStartAt["Aperture"] = time.Now().Add(-15 * time.Minute)
+
+	for i := 0; i < 10; i++ {
+		ch, _ := m.pg.GetBenchmarkChallenge(t.Context(), sess.ID, "Aperture")
+		s.bench.checkChallengeTimeoutAndHint(t.Context(), rt, sess, ch, false)
+	}
+	if hintCalls != 1 {
+		t.Fatalf("expected /hint to be called at most once when platform returns null hint, got %d", hintCalls)
+	}
+	chAfter, _ := m.pg.GetBenchmarkChallenge(t.Context(), sess.ID, "Aperture")
+	if chAfter == nil || !chAfter.HintUsed || chAfter.HintContent != "" {
+		t.Fatalf("expected hint_used=true with empty hint_content, got %+v", chAfter)
+	}
+}

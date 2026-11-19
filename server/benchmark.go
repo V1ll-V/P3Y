@@ -38,6 +38,7 @@ type benchSessionRuntime struct {
 	toolsLoaded      bool
 	lastEnvPoll      map[string]time.Time
 	taskStartAt      map[string]time.Time
+	lastHintAttempt  map[string]time.Time
 }
 
 // BenchmarkManager orchestrates unattended zero-touch multi-platform benchmark
@@ -1177,15 +1178,45 @@ func (bm *BenchmarkManager) checkChallengeTimeoutAndHint(ctx context.Context, rt
 		earlyWindow := min(10*time.Minute, timeout/4)
 		shouldFetch := elapsed >= timeout/2 || (earlyWindow > 0 && elapsed >= earlyWindow && bm.isChallengeStagnant(ctx, *ch.BoundTaskID))
 		if shouldFetch {
-			if hint, err := rt.prov.GetHint(ctx, ch.UniqueCode); err == nil && strings.TrimSpace(hint) != "" {
-				_ = bm.s.m.pg.SaveBenchmarkChallengeHint(ctx, sess.ID, ch.UniqueCode, hint)
-				_ = bm.s.m.pg.AppendBenchmarkEvent(ctx, sess.ID, ch.UniqueCode, "hint_fetched", "停滞自动获取题目 Hint", map[string]any{"hint": hint, "elapsed_sec": int(elapsed.Seconds())})
-				if t, ok := bm.s.m.Task(strconv.FormatInt(*ch.BoundTaskID, 10)); ok {
-					_, _ = t.Store.AddNode("fact", map[string]any{
-						"summary": "【平台 Hint 提示】" + hint,
-						"subtype": "benchmark_hint",
-					}, 0, "confirmed", "benchmark", nil)
-					t.Notify()
+			bm.mu.Lock()
+			if rt.lastHintAttempt == nil {
+				rt.lastHintAttempt = map[string]time.Time{}
+			}
+			recentlyTried := !rt.lastHintAttempt[ch.UniqueCode].IsZero() && time.Since(rt.lastHintAttempt[ch.UniqueCode]) < 5*time.Minute
+			if !recentlyTried {
+				rt.lastHintAttempt[ch.UniqueCode] = time.Now()
+			}
+			bm.mu.Unlock()
+			if !recentlyTried {
+				hint, err := rt.prov.GetHint(ctx, ch.UniqueCode)
+				cleanHint := strings.TrimSpace(hint)
+				if err == nil {
+					// Always persist hint_used=true (even when hint is empty/null) so the
+					// scheduler tick never hammers /hint repeatedly for challenges without hints.
+					_ = bm.s.m.pg.SaveBenchmarkChallengeHint(ctx, sess.ID, ch.UniqueCode, cleanHint)
+					ch.HintUsed = true
+					ch.HintContent = cleanHint
+					if cleanHint != "" {
+						_ = bm.s.m.pg.AppendBenchmarkEvent(ctx, sess.ID, ch.UniqueCode, "hint_fetched", "停滞自动获取题目 Hint", map[string]any{"hint": cleanHint, "elapsed_sec": int(elapsed.Seconds())})
+						if t, ok := bm.s.m.Task(strconv.FormatInt(*ch.BoundTaskID, 10)); ok {
+							_, _ = t.Store.AddNode("fact", map[string]any{
+								"summary": "【平台 Hint 提示】" + cleanHint,
+								"subtype": "benchmark_hint",
+							}, 0, "confirmed", "benchmark", nil)
+							t.Notify()
+						}
+					} else {
+						_ = bm.s.m.pg.AppendBenchmarkEvent(ctx, sess.ID, ch.UniqueCode, "hint_empty", "题目未配置可用 Hint，已标记不再重复请求", map[string]any{"elapsed_sec": int(elapsed.Seconds())})
+					}
+				} else {
+					transientWait, _ := isTransientPlatformUnavailableError(err)
+					var se *benchmark.StructuredError
+					isClientErr := errors.As(err, &se) && se.HTTPStatus >= 400 && se.HTTPStatus < 500 && se.HTTPStatus != http.StatusTooManyRequests
+					if transientWait == 0 && (isClientErr || strings.Contains(err.Error(), "不支持单独 hint 接口")) {
+						_ = bm.s.m.pg.SaveBenchmarkChallengeHint(ctx, sess.ID, ch.UniqueCode, "")
+						ch.HintUsed = true
+						_ = bm.s.m.pg.AppendBenchmarkEvent(ctx, sess.ID, ch.UniqueCode, "hint_unavailable", "平台返回无可用 Hint，已停止重试："+err.Error(), nil)
+					}
 				}
 			}
 		}
