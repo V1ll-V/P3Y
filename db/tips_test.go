@@ -121,6 +121,15 @@ func TestTipsBayesianRankingAndTaskDedup(t *testing.T) {
 	if !(pos[proven.ID] < pos[fresh.ID] && pos[fresh.ID] < pos[noisy.ID]) {
 		t.Fatalf("expected proven < fresh < noisy under web category search, got positions %+v", pos)
 	}
+
+	// Coarse category-only tag ["web"] without specific feature tags must NOT false-recall cards.
+	coarseOnly, err := d.SearchTips(ctx, "web", []string{"web"}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(coarseOnly) != 0 {
+		t.Fatalf("expected 0 cards recalled for coarse category-only tag [web], got %d", len(coarseOnly))
+	}
 }
 
 func TestNormalizeThinkingConfigAndAgentPersistence(t *testing.T) {

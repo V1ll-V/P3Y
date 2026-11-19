@@ -48,6 +48,11 @@ func (s *Server) startTaskEngine(t *Task) {
 	if ctx.Err() != nil || s.engine.IsDeleting(t.ID) {
 		return
 	}
+	if db.IsSandboxTaskMode(t.Mode) {
+		if id, err := strconv.ParseInt(t.ID, 10, 64); err == nil && id > 0 {
+			_ = s.ctfService().Sync(ctx, id)
+		}
+	}
 	s.engine.emitActivity(t, db.Activity{Worker: "planner", Kind: "round",
 		Summary: "第 0 轮目标拆解"})
 	goals := s.createGoals(ctx, t, func(r db.Activity) {

@@ -106,6 +106,9 @@ func taskInputContextForRole(root string, ts *db.ExplorationStore, taskID, inten
 					limit := min(len(pre.MatchedTips), 3)
 					for _, tip := range pre.MatchedTips[:limit] {
 						fmt.Fprintf(&b, "- [%s] %s：%s\n", tip.Category, tip.Title, tip.Pitfall)
+						if code := strings.TrimSpace(tip.PatternCode); code != "" {
+							fmt.Fprintf(&b, "  参考模板：`%s`\n", strings.ReplaceAll(code, "\n", " ; "))
+						}
 					}
 				}
 			}

@@ -123,6 +123,15 @@ func (d *DB) ListTips(ctx context.Context, category string, limit int) ([]TipCar
 	return out, rows.Err()
 }
 
+func isCoarseCategoryTag(tag string) bool {
+	switch strings.ToLower(strings.TrimSpace(tag)) {
+	case "pwn", "reverse", "web", "crypto", "misc", "ad", "auto", "all":
+		return true
+	default:
+		return false
+	}
+}
+
 // SearchTips retrieves up to limit relevant tip cards scored by category/tag relevance plus Bayesian solve rate.
 func (d *DB) SearchTips(ctx context.Context, category string, tags []string, limit int) ([]TipCard, error) {
 	if d == nil {
@@ -144,25 +153,30 @@ func (d *DB) SearchTips(ctx context.Context, category string, tags []string, lim
 	}
 	ranked := make([]scored, 0, len(all))
 	for _, c := range all {
-		relScore := 0.0
+		catBonus := 0.0
 		if wantCat != "" && wantCat != "auto" && c.Category == wantCat {
-			relScore += 3.0
+			catBonus = 3.0
 		}
 		hay := strings.ToLower(c.Title + " " + c.Pitfall)
 		cardTagSet := make(map[string]bool, len(c.Tags))
 		for _, t := range c.Tags {
 			cardTagSet[strings.ToLower(t)] = true
 		}
+		tagMatchScore := 0.0
 		for _, wt := range wantTags {
+			if isCoarseCategoryTag(wt) {
+				continue
+			}
 			if cardTagSet[wt] {
-				relScore += 5.0
+				tagMatchScore += 5.0
 			} else if strings.Contains(hay, wt) {
-				relScore += 2.0
+				tagMatchScore += 2.0
 			}
 		}
-		if len(wantTags) > 0 && relScore == 0 {
+		if len(wantTags) > 0 && tagMatchScore == 0 {
 			continue
 		}
+		relScore := catBonus + tagMatchScore
 		// Bayesian smoothed win-rate prior plus self-cleaning penalty for cards recalled repeatedly without solving.
 		winRate := float64(c.SolveCount+1) / float64(c.HitCount+3)
 		score := relScore + winRate*4.0
