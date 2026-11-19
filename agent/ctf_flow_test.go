@@ -174,28 +174,52 @@ func TestCTFHumanChatHandsOffNewFlagWithoutAnotherModelCall(t *testing.T) {
 
 func TestCTFReportToolsStaySeparateFromGenericTasks(t *testing.T) {
 	pg, task, root, _ := ctfHandoffFixture(t)
-	base := NewToolSet(pg.Exploration(task.ExplorationID), "worker").WorkerTools()
-	containsReport := func(tools []actool.CoreTool) bool {
+	ts := pg.Exploration(task.ExplorationID)
+	base := NewToolSet(ts, "worker").WorkerTools()
+	plannerBase := NewToolSet(ts, "planner").PlannerTools()
+	hasTool := func(tools []actool.CoreTool, want string) bool {
 		for _, tool := range tools {
-			if tool.Name() == "report_finding" {
+			if tool.Name() == want {
 				return true
 			}
 		}
 		return false
 	}
-	if !containsReport(base) {
-		t.Fatal("generic report tool missing from fixture")
+	if !hasTool(base, "report_finding") || !hasTool(base, "insert_assets") || !hasTool(base, "list_assets") || !hasTool(base, "list_findings") {
+		t.Fatal("generic report/asset tools missing from worker fixture")
 	}
-	ctx, tools := ctfBase(t.Context(), root, pg.Exploration(task.ExplorationID), task.ID, 1, base)
-	if !isCTFContext(ctx) || containsReport(tools) {
-		t.Fatal("CTF attached generic vulnerability reporting")
+	ctx, tools := ctfBase(t.Context(), root, ts, task.ID, 1, base)
+	if !isCTFContext(ctx) {
+		t.Fatal("expected CTF context")
+	}
+	for _, forbidden := range []string{"report_finding", "list_findings", "insert_assets", "list_assets"} {
+		if hasTool(tools, forbidden) {
+			t.Fatalf("CTF worker should not expose enterprise tool %s", forbidden)
+		}
+	}
+	pCtx, pTools := ctfBaseForPlanner(t.Context(), ts, plannerBase)
+	if !isCTFContext(pCtx) {
+		t.Fatal("expected CTF planner context")
+	}
+	for _, forbidden := range []string{"report_finding", "list_findings", "insert_assets", "list_assets"} {
+		if hasTool(pTools, forbidden) {
+			t.Fatalf("CTF planner should not expose enterprise tool %s", forbidden)
+		}
+	}
+	// AD mode must retain finding tools.
+	if _, err := pg.Exec(`UPDATE tasks SET mode='ad' WHERE id=$1`, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	ctx, tools = ctfBase(t.Context(), root, ts, task.ID, 1, base)
+	if !isCTFContext(ctx) || !hasTool(tools, "report_finding") || !hasTool(tools, "list_findings") {
+		t.Fatal("AD mode lost finding tools")
 	}
 	if _, err := pg.Exec(`UPDATE tasks SET mode='pentest' WHERE id=$1`, task.ID); err != nil {
 		t.Fatal(err)
 	}
-	ctx, tools = ctfBase(t.Context(), root, pg.Exploration(task.ExplorationID), task.ID, 1, base)
-	if isCTFContext(ctx) || !containsReport(tools) {
-		t.Fatal("generic report flow was changed")
+	ctx, tools = ctfBase(t.Context(), root, ts, task.ID, 1, base)
+	if isCTFContext(ctx) || !hasTool(tools, "report_finding") || !hasTool(tools, "insert_assets") {
+		t.Fatal("generic report/asset flow was changed")
 	}
 }
 

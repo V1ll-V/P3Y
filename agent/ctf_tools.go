@@ -122,9 +122,9 @@ func ctfBase(ctx context.Context, root string, ts *db.ExplorationStore, task, in
 		switch t.Name() {
 		case "Bash", "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "LS", "http_send":
 			continue
-		case "report_finding", "update_finding_report":
+		case "report_finding", "update_finding_report", "list_findings", "insert_assets", "list_assets":
 			if mode == "ctf" {
-				continue // CTF answers use their own evidence/WP flow, not vulnerability reports.
+				continue // CTF answers use their own evidence/WP flow, not enterprise asset/finding registries.
 			}
 		}
 		out = append(out, t)
@@ -194,7 +194,19 @@ func ctfBaseForPlanner(ctx context.Context, ts *db.ExplorationStore, base []acto
 	if err != nil || !db.IsSandboxTaskMode(mode) {
 		return ctx, base
 	}
-	return context.WithValue(ctx, ctfRunKey{}, true), stripCTFPlannerBase(base)
+	filtered := stripCTFPlannerBase(base)
+	if mode == "ctf" {
+		out := make([]actool.CoreTool, 0, len(filtered))
+		for _, t := range filtered {
+			switch t.Name() {
+			case "list_findings", "insert_assets", "list_assets":
+				continue
+			}
+			out = append(out, t)
+		}
+		filtered = out
+	}
+	return context.WithValue(ctx, ctfRunKey{}, true), filtered
 }
 
 var ctfExecutionTools = []string{"Bash", "Write", "Edit", "Grep", "Glob", "ctf_http", "http_send", "http_fuzz_diff", "http_race_probe", "diff_local_remote", "py_repl", "ask_helper", "plateau_fork", "ctf_binary_info", "ctf_pwn_triage", "ctf_gdb", "ctf_python", "ctf_decompile", "ctf_radare2", "Read", "LS", "ctf_tools", "ctf_unlock_toolpack", "ctf_run_background", "ctf_job_status", "ctf_job_stop", "ctf_probe_target", "ctf_session_start", "ctf_session_send", "ctf_session_read", "ctf_session_close", "ctf_pcap_analyze", "board_mark_savepoint", "board_rewind", "board_save_kit"}

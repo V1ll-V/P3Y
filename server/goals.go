@@ -386,6 +386,22 @@ func (s *Server) createGoals(ctx context.Context, t *Task, emit func(db.Activity
 	if t == nil {
 		return nil
 	}
+	// Zero-touch benchmark tasks carry a deterministic platform-generated goal and
+	// never require LLM extraction of human allow/deny operational constraints.
+	// Materialize the single goal node directly without spending a Round-0 LLM call.
+	if t.ZeroTouch {
+		if g := strings.TrimSpace(t.Goal); g != "" {
+			origin, _ := t.Store.OriginFactID()
+			id, err := t.Store.AddNode(db.KindGoal, map[string]any{"text": g}, 0, "open", "system", nil)
+			if err == nil && id > 0 {
+				if origin > 0 {
+					_ = t.Store.Link(origin, db.RelSpawns, id)
+				}
+				return []goalSpec{{Text: g}}
+			}
+		}
+		return nil
+	}
 	// A task without an available execution model can still retain the exact
 	// goal. Optional finding/report automation does not control decomposition.
 	if !s.engine.ReadyFor(t) {
