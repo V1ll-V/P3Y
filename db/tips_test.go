@@ -2,7 +2,10 @@ package db
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -184,5 +187,96 @@ func TestNormalizeThinkingConfigAndAgentPersistence(t *testing.T) {
 	}
 	if updated.ThinkingType != "enabled" || updated.ReasoningEffort != "low" {
 		t.Fatalf("expected updated critic enabled/low, got %q/%q", updated.ThinkingType, updated.ReasoningEffort)
+	}
+}
+
+func TestSeedTipsFromFileIdempotent(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+
+	ctx := context.Background()
+	if n, err := d.SeedTipsFromFile(ctx, filepath.Join(t.TempDir(), "does-not-exist.json")); err != nil || n != 0 {
+		t.Fatalf("missing seed file should return (0, nil), got (%d, %v)", n, err)
+	}
+
+	tag := fmt.Sprintf("seed-file-test-%d", time.Now().UnixNano())
+	fakeTaskID := int64(999999999)
+	cards := []TipCard{
+		{
+			Category:     "reverse",
+			Tags:         []string{tag, "axml"},
+			Title:        fmt.Sprintf("Seed File Card A %s", tag),
+			Pitfall:      "Use /opt/ctf/kits/parse_axml.py",
+			PatternCode:  "python3 /opt/ctf/kits/parse_axml.py AndroidManifest.xml",
+			SourceTaskID: &fakeTaskID,
+		},
+		{
+			Category: "web",
+			Tags:     []string{tag, "ssti"},
+			Title:    fmt.Sprintf("Seed File Card B %s", tag),
+			Pitfall:  "Check filter differential",
+		},
+		{
+			// Duplicate title (case/space insensitive) inside same file must be ignored.
+			Category: "web",
+			Tags:     []string{tag},
+			Title:    fmt.Sprintf("  seed file card b %s  ", tag),
+			Pitfall:  "Duplicate",
+		},
+	}
+	raw, err := json.Marshal(cards)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedFile := filepath.Join(t.TempDir(), "tips-seed.json")
+	if err := os.WriteFile(seedFile, raw, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// P3Y_SKIP_BUILTIN_TIPS=1 must bypass seeding.
+	t.Setenv("P3Y_SKIP_BUILTIN_TIPS", "1")
+	if n, err := d.SeedTipsFromFile(ctx, seedFile); err != nil || n != 0 {
+		t.Fatalf("expected skip under P3Y_SKIP_BUILTIN_TIPS=1, got (%d, %v)", n, err)
+	}
+	t.Setenv("P3Y_SKIP_BUILTIN_TIPS", "")
+
+	// Hosted mode MUST still allow SeedTipsFromFile (unlike SeedDefaultTips).
+	t.Setenv("P3Y_HOSTED_MODE", "1")
+	n, err := d.SeedTipsFromFile(ctx, seedFile)
+	if err != nil {
+		t.Fatalf("first SeedTipsFromFile failed: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("expected 2 inserted cards, got %d", n)
+	}
+
+	got, err := d.SearchTips(ctx, "", []string{tag}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		for _, c := range got {
+			_ = d.DeleteTipCard(context.Background(), c.ID)
+		}
+	})
+	if len(got) != 2 {
+		t.Fatalf("expected 2 seeded cards searchable by tag %s, got %d", tag, len(got))
+	}
+	for _, c := range got {
+		if c.SourceTaskID != nil {
+			t.Fatalf("expected stripped source_task_id, got %v for %q", *c.SourceTaskID, c.Title)
+		}
+	}
+
+	// Second call must be idempotent (0 inserted).
+	n2, err := d.SeedTipsFromFile(ctx, seedFile)
+	if err != nil {
+		t.Fatalf("second SeedTipsFromFile failed: %v", err)
+	}
+	if n2 != 0 {
+		t.Fatalf("expected 0 inserted on second SeedTipsFromFile call, got %d", n2)
 	}
 }

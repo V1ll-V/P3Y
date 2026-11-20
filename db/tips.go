@@ -384,3 +384,65 @@ func (d *DB) SeedDefaultTips(ctx context.Context) error {
 	}
 	return nil
 }
+
+// SeedTipsFromFile idempotently imports TipCard entries from a JSON array file (e.g. bundled
+// local arsenal /app/tips-seed.json in hosted benchmark images), deduplicating by lowercase
+// trimmed title and stripping source_task_id so cards load cleanly into fresh databases.
+func (d *DB) SeedTipsFromFile(ctx context.Context, path string) (int, error) {
+	if d == nil {
+		return 0, nil
+	}
+	path = strings.TrimSpace(path)
+	if path == "" || os.Getenv("P3Y_SKIP_BUILTIN_TIPS") == "1" {
+		return 0, nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" {
+		return 0, nil
+	}
+	var cards []TipCard
+	if err := json.Unmarshal([]byte(trimmed), &cards); err != nil {
+		return 0, fmt.Errorf("parse tips seed %s: %w", path, err)
+	}
+	if len(cards) == 0 {
+		return 0, nil
+	}
+	existing := map[string]bool{}
+	rows, err := d.QueryContext(ctx, `SELECT LOWER(TRIM(title)) FROM tips_cards`)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var title string
+		if rows.Scan(&title) == nil && title != "" {
+			existing[title] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	inserted := 0
+	for _, c := range cards {
+		key := strings.ToLower(strings.TrimSpace(c.Title))
+		if key == "" || existing[key] {
+			continue
+		}
+		// Never carry over source_task_id from another deployment (FK would fail on a fresh DB).
+		c.ID = 0
+		c.SourceTaskID = nil
+		if _, err := d.CreateTipCard(ctx, c); err != nil {
+			return inserted, err
+		}
+		existing[key] = true
+		inserted++
+	}
+	return inserted, nil
+}

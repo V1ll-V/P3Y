@@ -256,6 +256,15 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		if err := m.pg.SeedDefaultTips(ctx); err != nil && ctx.Err() == nil {
 			log.Printf("[tips] seed defaults failed: %v", err)
 		}
+		seedPath := strings.TrimSpace(os.Getenv("P3Y_TIPS_SEED_FILE"))
+		if seedPath == "" {
+			seedPath = "/app/tips-seed.json"
+		}
+		if n, err := m.pg.SeedTipsFromFile(ctx, seedPath); err != nil && ctx.Err() == nil {
+			log.Printf("[tips] seed from %s failed: %v", seedPath, err)
+		} else if n > 0 {
+			log.Printf("[tips] seeded %d card(s) from %s", n, seedPath)
+		}
 		s.seedOrchestrationTools() // P2 跨任务编排工具 seed 进 tools 表(可按 agent 绑定)
 		agent.CTFVPNStatusHook = func(pCtx context.Context, taskID int64, vpnHash string) (string, string, string) {
 			svc := s.ctfService()
