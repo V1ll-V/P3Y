@@ -195,6 +195,14 @@ func taskInputContextForRole(root string, ts *db.ExplorationStore, taskID, inten
 			b.WriteString("本意图续跑保持该输入快照；新附件由规划者分派后续意图处理。\n")
 		}
 	}
+	if db.IsSandboxTaskMode(mode) && intentID > 0 && root != "" && ts != nil {
+		if recent := ctf.New(root, ts.Database()).RecentWorkArtifacts(context.Background(), taskID, intentID, 12); len(recent) > 0 {
+			fmt.Fprintf(&b, "\n【/work 已有产物（最近修改 Top %d，可直接复用，无需重复解包或重算）】\n", len(recent))
+			for _, item := range recent {
+				fmt.Fprintf(&b, "- %s (%d B)\n", item.Path, item.Size)
+			}
+		}
+	}
 	return b.String(), nil
 }
 

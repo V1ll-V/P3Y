@@ -36,16 +36,17 @@ type PrecheckFile struct {
 
 // PrecheckResult stores the Phase-0 deterministic triage sheet for a CTF task.
 type PrecheckResult struct {
-	TaskID           int64          `json:"task_id"`
-	InputHash        string         `json:"input_hash"`
-	ChallengeType    string         `json:"challenge_type"`
-	InferredCategory string         `json:"inferred_category"`
-	Targets          []string       `json:"targets,omitempty"`
-	Tags             []string       `json:"tags,omitempty"`
-	Files            []PrecheckFile `json:"files,omitempty"`
-	MatchedTips      []db.TipCard   `json:"matched_tips,omitempty"`
-	Summary          string         `json:"summary"`
-	GeneratedAt      time.Time      `json:"generated_at"`
+	TaskID                   int64          `json:"task_id"`
+	InputHash                string         `json:"input_hash"`
+	ChallengeType            string         `json:"challenge_type"`
+	InferredCategory         string         `json:"inferred_category"`
+	Targets                  []string       `json:"targets,omitempty"`
+	Tags                     []string       `json:"tags,omitempty"`
+	Files                    []PrecheckFile `json:"files,omitempty"`
+	MatchedTips              []db.TipCard   `json:"matched_tips,omitempty"`
+	BaselinePlaceholderFlags []string       `json:"baseline_placeholder_flags,omitempty"`
+	Summary                  string         `json:"summary"`
+	GeneratedAt              time.Time      `json:"generated_at"`
 }
 
 var (
@@ -380,6 +381,68 @@ func inferCategory(configured string, files []PrecheckFile, tags []string, targe
 	return "auto"
 }
 
+func isPlaceholderCandidateFileName(name string) bool {
+	l := strings.ToLower(strings.TrimSpace(filepath.ToSlash(name)))
+	base := strings.ToLower(filepath.Base(l))
+	if strings.HasSuffix(base, ".md") || strings.HasSuffix(base, ".markdown") {
+		return true
+	}
+	for _, needle := range []string{
+		"readme", "dummy", "example", "sample", "dockerfile", "docker-compose",
+		"flag.sh", "run.sh", "start.sh", "entrypoint.sh", "fake_flag", "test_flag",
+	} {
+		if strings.Contains(base, needle) || strings.Contains(l, "/"+needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func extractAttachmentPlaceholderFlags(a artifacts.Artifact, diskPath string) []string {
+	const maxRead = 256 << 10
+	seen := map[string]bool{}
+	var out []string
+	collect := func(buf []byte) {
+		if len(buf) == 0 {
+			return
+		}
+		for _, fl := range ExtractFlags(string(buf), 16) {
+			k := strings.ToLower(fl)
+			if !seen[k] {
+				seen[k] = true
+				out = append(out, fl)
+			}
+		}
+	}
+	if zr, err := zip.OpenReader(diskPath); err == nil {
+		defer zr.Close()
+		scanned := 0
+		for _, f := range zr.File {
+			if f.FileInfo().IsDir() || f.Flags&0x1 != 0 || scanned >= 64 || f.UncompressedSize64 > 2<<20 {
+				continue
+			}
+			if !isPlaceholderCandidateFileName(f.Name) {
+				continue
+			}
+			scanned++
+			if rc, oerr := f.Open(); oerr == nil {
+				buf, _ := io.ReadAll(io.LimitReader(rc, maxRead))
+				_ = rc.Close()
+				collect(buf)
+			}
+		}
+		return out
+	}
+	if isPlaceholderCandidateFileName(a.Name) && a.Size <= 2<<20 {
+		if f, err := os.Open(diskPath); err == nil {
+			buf, _ := io.ReadAll(io.LimitReader(f, maxRead))
+			_ = f.Close()
+			collect(buf)
+		}
+	}
+	return out
+}
+
 // RunPrecheck runs deterministic zero-LLM Phase-0 inspection on taskID's attachments
 // and target description, matches historical Tips, persists precheck_result, and
 // writes an L1/L2/L3 diagnostic Fact onto the shared Board.
@@ -420,6 +483,8 @@ func (s *Service) RunPrecheck(ctx context.Context, taskID int64, force bool) (*P
 	targets := extractTargets(taskRow.Description, taskRow.Goal)
 	files := make([]PrecheckFile, 0, len(m.Files))
 	tagSet := map[string]bool{}
+	baselineSeen := map[string]bool{}
+	var baselineFlags []string
 	for _, a := range m.Files {
 		diskPath, perr := store.InputPath(taskID, a)
 		if perr != nil {
@@ -430,7 +495,19 @@ func (s *Service) RunPrecheck(ctx context.Context, taskID int64, force bool) (*P
 		for _, tg := range pf.Tags {
 			tagSet[tg] = true
 		}
+		// Only record attachment plaintext placeholder flags when the challenge has a remote target,
+		// so pure static offline challenges whose real flag sits in attachments are never filtered.
+		if len(targets) > 0 {
+			for _, fl := range extractAttachmentPlaceholderFlags(a, diskPath) {
+				k := strings.ToLower(fl)
+				if !baselineSeen[k] {
+					baselineSeen[k] = true
+					baselineFlags = append(baselineFlags, fl)
+				}
+			}
+		}
 	}
+	sort.Strings(baselineFlags)
 	if taskRow.ChallengeType != "" && taskRow.ChallengeType != "auto" {
 		tagSet[strings.ToLower(taskRow.ChallengeType)] = true
 	}
@@ -464,16 +541,17 @@ func (s *Service) RunPrecheck(ctx context.Context, taskID int64, force bool) (*P
 	}
 
 	res := &PrecheckResult{
-		TaskID:           taskID,
-		InputHash:        fpHash,
-		ChallengeType:    taskRow.ChallengeType,
-		InferredCategory: inferred,
-		Targets:          targets,
-		Tags:             tags,
-		Files:            files,
-		MatchedTips:      tips,
-		Summary:          strings.Join(sumParts, " | "),
-		GeneratedAt:      time.Now().UTC(),
+		TaskID:                   taskID,
+		InputHash:                fpHash,
+		ChallengeType:            taskRow.ChallengeType,
+		InferredCategory:         inferred,
+		Targets:                  targets,
+		Tags:                     tags,
+		Files:                    files,
+		MatchedTips:              tips,
+		BaselinePlaceholderFlags: baselineFlags,
+		Summary:                  strings.Join(sumParts, " | "),
+		GeneratedAt:              time.Now().UTC(),
 	}
 	raw, err := json.Marshal(res)
 	if err != nil {

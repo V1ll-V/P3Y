@@ -152,3 +152,17 @@ func (zeroReader) Read(p []byte) (int, error) {
 	clear(p)
 	return len(p), nil
 }
+
+func TestParseExtraReadOnlyMounts(t *testing.T) {
+	raw := "C:/Users/Chen/Downloads/burnheart:/mnt/evidence, /data/case2:/evidence/disk, /etc:/etc/evil, /tmp/x:/work/hijack"
+	mounts, hash := parseExtraReadOnlyMounts(raw)
+	if len(mounts) != 2 || hash == "" {
+		t.Fatalf("expected 2 safe RO mounts, got %d (%+v) hash=%q", len(mounts), mounts, hash)
+	}
+	if mounts[0]["Source"] != "C:/Users/Chen/Downloads/burnheart" || mounts[0]["Target"] != "/mnt/evidence" || mounts[0]["ReadOnly"] != true {
+		t.Fatalf("unexpected Windows host mount parsed: %+v", mounts[0])
+	}
+	if mounts[1]["Source"] != "/data/case2" || mounts[1]["Target"] != "/evidence/disk" || mounts[1]["ReadOnly"] != true {
+		t.Fatalf("unexpected Linux host mount parsed: %+v", mounts[1])
+	}
+}

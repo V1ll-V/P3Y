@@ -138,6 +138,116 @@ func (s *Service) LogicalPath(a artifacts.Artifact) string {
 	return "/work/.inputs/" + a.ID + "/original"
 }
 
+func (s *Service) baselinePlaceholderFlags(ctx context.Context, taskID int64) []string {
+	if s == nil || s.DB == nil || taskID <= 0 {
+		return nil
+	}
+	raw, err := s.DB.TaskPrecheck(ctx, taskID)
+	if err != nil || len(raw) == 0 {
+		return nil
+	}
+	var pre PrecheckResult
+	if json.Unmarshal(raw, &pre) != nil {
+		return nil
+	}
+	return pre.BaselinePlaceholderFlags
+}
+
+// WorkArtifactEntry summarizes one reusable workspace file for cross-intent handoff.
+type WorkArtifactEntry struct {
+	Path    string
+	Size    int64
+	ModTime time.Time
+}
+
+// RecentWorkArtifacts lists up to limit most recently modified files in the task's
+// effective /work directory (falling back to the latest sibling intent directory when
+// a non-shared intent has not yet been seeded on disk).
+func (s *Service) RecentWorkArtifacts(ctx context.Context, task, intent int64, limit int) []WorkArtifactEntry {
+	if s == nil || s.Root == "" || task <= 0 {
+		return nil
+	}
+	if limit <= 0 || limit > 32 {
+		limit = 12
+	}
+	_, workDir, _, shared := s.resolveScope(ctx, task, intent)
+	scanDir := workDir
+	if !shared {
+		if entries, err := os.ReadDir(scanDir); err != nil || len(entries) == 0 {
+			// Fall back to the most recently modified sibling intent's ctf-work,
+			// matching what seedNonSharedWorkDir will copy upon first execution.
+			taskRoot := filepath.Join(s.Root, "tasks", strconv.FormatInt(task, 10))
+			if dirEntries, derr := os.ReadDir(taskRoot); derr == nil {
+				var bestDir string
+				var bestMod time.Time
+				for _, de := range dirEntries {
+					if !de.IsDir() || !strings.HasPrefix(de.Name(), "i") {
+						continue
+					}
+					cand := filepath.Join(taskRoot, de.Name(), "ctf-work")
+					if cand == workDir {
+						continue
+					}
+					if fi, serr := os.Stat(cand); serr == nil && fi.IsDir() {
+						if sub, rerr := os.ReadDir(cand); rerr == nil && len(sub) > 0 && fi.ModTime().After(bestMod) {
+							bestMod = fi.ModTime()
+							bestDir = cand
+						}
+					}
+				}
+				if bestDir != "" {
+					scanDir = bestDir
+				}
+			}
+		}
+	}
+	if _, err := os.Stat(scanDir); err != nil {
+		return nil
+	}
+	var out []WorkArtifactEntry
+	_ = filepath.WalkDir(scanDir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || p == scanDir {
+			return nil
+		}
+		rel, rerr := filepath.Rel(scanDir, p)
+		if rerr != nil {
+			return nil
+		}
+		slash := filepath.ToSlash(rel)
+		base := strings.ToLower(d.Name())
+		if d.IsDir() {
+			switch base {
+			case ".inputs", ".cache", ".config", ".ghidra", ".jobs", ".interactive", ".snapshots", ".tools", "__pycache__", ".git", "node_modules":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.Type()&os.ModeSymlink != 0 || strings.HasSuffix(base, ".pyc") || strings.HasSuffix(base, ".tmp") || strings.HasSuffix(base, ".swp") {
+			return nil
+		}
+		info, ierr := d.Info()
+		if ierr != nil || !info.Mode().IsRegular() {
+			return nil
+		}
+		out = append(out, WorkArtifactEntry{
+			Path:    "/work/" + slash,
+			Size:    info.Size(),
+			ModTime: info.ModTime(),
+		})
+		return nil
+	})
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].ModTime.Equal(out[j].ModTime) {
+			return out[i].ModTime.After(out[j].ModTime)
+		}
+		return out[i].Path < out[j].Path
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
 func (s *Service) resolveScope(ctx context.Context, task, intent int64) (sessionIntent int64, workDir, lockKey string, shared bool) {
 	if s != nil && s.DB != nil && task > 0 {
 		if mode, challenge, err := s.DB.TaskChallengeType(ctx, task); err == nil && db.IsSandboxTaskMode(mode) {
@@ -325,9 +435,10 @@ func (s *Service) execute(ctx context.Context, task, intent int64, command strin
 	}
 	if autoCandidates {
 		if verifyMode, _ := s.DB.TaskCTFVerifyMode(saveCtx, task); verifyMode != db.CTFVerifyExploitProof {
+			baselines := s.baselinePlaceholderFlags(saveCtx, task)
 			var verdicts []string
 			for _, flag := range ExtractFlags(string(result.Stdout)+"\n"+string(result.Stderr), 32) {
-				if IsSelfConstructedMockFlag(command, flag) {
+				if IsSelfConstructedMockFlag(command, flag) || IsBaselinePlaceholderFlag(baselines, flag) {
 					continue
 				}
 				if cid, addErr := s.DB.AddCTFOutputCandidate(saveCtx, task, e.ID, flag); addErr != nil {

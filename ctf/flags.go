@@ -109,12 +109,48 @@ func ExtractFlags(text string, limit int) []string {
 }
 
 // IsSelfConstructedMockFlag reports whether flag appears verbatim inside command
-// (e.g. a local dummy /tmp/flag test literal) and therefore should not trigger
-// automatic candidate submission.
+// (e.g. a local dummy /tmp/flag test literal) or is an obvious single-character
+// repeated probe filler such as FLAG{AAAA} / FLAG{BBBB}, and therefore should not
+// trigger automatic candidate submission.
 func IsSelfConstructedMockFlag(command, value string) bool {
 	v := strings.TrimSpace(value)
-	if v == "" || command == "" {
+	if v == "" {
 		return false
 	}
-	return strings.Contains(strings.ToLower(command), strings.ToLower(v))
+	if command != "" && strings.Contains(strings.ToLower(command), strings.ToLower(v)) {
+		return true
+	}
+	if l := strings.IndexByte(v, '{'); l >= 0 && strings.HasSuffix(v, "}") {
+		body := v[l+1 : len(v)-1]
+		if len(body) >= 3 && len(body) <= 8 {
+			first := body[0]
+			allSame := true
+			for i := 1; i < len(body); i++ {
+				if body[i] != first {
+					allSame = false
+					break
+				}
+			}
+			if allSame {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// IsBaselinePlaceholderFlag reports whether value exactly matches (case-insensitively)
+// a plaintext placeholder flag already present inside the challenge's own README/dummy
+// scaffold files before exploitation began.
+func IsBaselinePlaceholderFlag(baselines []string, value string) bool {
+	v := strings.ToLower(strings.TrimSpace(value))
+	if v == "" || len(baselines) == 0 {
+		return false
+	}
+	for _, b := range baselines {
+		if strings.ToLower(strings.TrimSpace(b)) == v {
+			return true
+		}
+	}
+	return false
 }

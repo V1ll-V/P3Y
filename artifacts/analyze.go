@@ -113,6 +113,9 @@ func (s Store) ExtractZIP(scope, id, artifactID string) (Manifest, error) {
 	if parent == nil {
 		return m, os.ErrNotExist
 	}
+	if parent.Size > 64<<20 {
+		return m, errors.New("超过 64 MiB 的大压缩包跳过同步自动解压，请在沙箱容器内按需使用 7z / unzip 读取")
+	}
 	f, err := openVerified(dir, *parent)
 	if err != nil {
 		return m, err

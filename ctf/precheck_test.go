@@ -280,3 +280,100 @@ func TestRunPrecheckZippedELFInfersPwnAndSharedScope(t *testing.T) {
 		t.Fatalf("expected auto->pwn task to enable shared work dir, got shared=%v intent=%d workDir=%q", shared, sessionIntent, workDir)
 	}
 }
+
+func TestBaselinePlaceholderFlagsRemoteVsStaticAndMockFiller(t *testing.T) {
+	if !IsSelfConstructedMockFlag("python3 test.py", "FLAG{AAAA}") || !IsSelfConstructedMockFlag("", "flag{bbbb}") {
+		t.Fatal("expected repeated single-char filler flags FLAG{AAAA}/flag{bbbb} to be treated as mock")
+	}
+	if IsSelfConstructedMockFlag("python3 exp.py", "TPCTF{d6a2fe77-a449-4534-9721-332485f9701e}") {
+		t.Fatal("real flag must not be classified as mock")
+	}
+
+	dsn, _, err := db.DSN()
+	if err != nil {
+		t.Skip("test database required")
+	}
+	pg, err := db.Open(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pg.Close()
+
+	makeZip := func(t *testing.T) string {
+		t.Helper()
+		p := filepath.Join(t.TempDir(), "chal.zip")
+		f, err := os.Create(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		zw := zip.NewWriter(f)
+		w1, _ := zw.Create("README.md")
+		_, _ = w1.Write([]byte("Example: TPCTF{test-uuid} and TPCTF{local-only-test}\n"))
+		w2, _ := zw.Create("flagdisk_dummy.img")
+		_, _ = w2.Write([]byte("flag{local_test_canonicoledger}\n"))
+		_ = zw.Close()
+		_ = f.Close()
+		return p
+	}
+
+	// 1. Remote task -> scaffold README/dummy flags are recorded as baseline placeholders.
+	remoteTask, err := pg.CreateTaskWithOptions("remote-web", "Target 47.115.125.167:45089", db.TaskCreateOptions{Mode: "ctf", ChallengeType: "web"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pg.DeleteTask(remoteTask.ID)
+
+	root := t.TempDir()
+	store := artifacts.Store{Root: root}
+	zf, _ := os.Open(makeZip(t))
+	_, err = store.Add("task", fmt.Sprint(remoteTask.ID), "chal.zip", "attachment", zf)
+	_ = zf.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := New(root, pg)
+	res, err := svc.RunPrecheck(t.Context(), remoteTask.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !IsBaselinePlaceholderFlag(res.BaselinePlaceholderFlags, "TPCTF{test-uuid}") ||
+		!IsBaselinePlaceholderFlag(res.BaselinePlaceholderFlags, "flag{local_test_canonicoledger}") {
+		t.Fatalf("expected README/dummy flags in baseline placeholders, got %v", res.BaselinePlaceholderFlags)
+	}
+	if IsBaselinePlaceholderFlag(res.BaselinePlaceholderFlags, "TPCTF{real-remote-answer-1234}") {
+		t.Fatal("real remote flag must not match baseline placeholders")
+	}
+
+	// 2. Pure static offline task (no remote target) -> BaselinePlaceholderFlags must remain empty (zero false negatives).
+	staticTask, err := pg.CreateTaskWithOptions("offline-misc", "Find the flag hidden in the archive", db.TaskCreateOptions{Mode: "ctf", ChallengeType: "misc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pg.DeleteTask(staticTask.ID)
+	zf2, _ := os.Open(makeZip(t))
+	_, err = store.Add("task", fmt.Sprint(staticTask.ID), "chal.zip", "attachment", zf2)
+	_ = zf2.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	staticRes, err := svc.RunPrecheck(t.Context(), staticTask.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(staticRes.BaselinePlaceholderFlags) != 0 {
+		t.Fatalf("pure static offline task must not populate baseline placeholder flags, got %v", staticRes.BaselinePlaceholderFlags)
+	}
+
+	// 3. RecentWorkArtifacts falls back to latest sibling ctf-work on non-shared tasks.
+	prevWork := svc.WorkDir(remoteTask.ID, 100)
+	if err := os.MkdirAll(prevWork, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(prevWork, "exp_ready.py"), []byte("print(1)\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	recent := svc.RecentWorkArtifacts(t.Context(), remoteTask.ID, 200, 12)
+	if len(recent) != 1 || recent[0].Path != "/work/exp_ready.py" {
+		t.Fatalf("expected sibling fallback artifact /work/exp_ready.py, got %+v", recent)
+	}
+}

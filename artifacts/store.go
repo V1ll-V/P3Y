@@ -20,11 +20,35 @@ import (
 )
 
 const (
-	MaxFileSize    int64 = 64 << 20
-	MaxTotalSize   int64 = 256 << 20
+	MaxFileSize    int64 = 256 << 20
+	MaxTotalSize   int64 = 512 << 20
 	MaxFiles             = 512
 	MaxUploadFiles       = 32
 )
+
+// MaxFileBytes returns the effective single-artifact byte cap (default 256 MiB,
+// overridable via P3Y_MAX_ARTIFACT_MB in [64, 2048]).
+func MaxFileBytes() int64 {
+	if raw := strings.TrimSpace(os.Getenv("P3Y_MAX_ARTIFACT_MB")); raw != "" {
+		if mb, err := strconv.Atoi(raw); err == nil && mb >= 64 {
+			if mb > 2048 {
+				mb = 2048
+			}
+			return int64(mb) << 20
+		}
+	}
+	return MaxFileSize
+}
+
+// MaxTotalBytes returns the effective per-task total artifact byte cap.
+func MaxTotalBytes() int64 {
+	perFile := MaxFileBytes()
+	total := perFile * 2
+	if total < MaxTotalSize {
+		total = MaxTotalSize
+	}
+	return total
+}
 
 type Artifact struct {
 	ID        string    `json:"id"`
@@ -315,8 +339,10 @@ func (s Store) Add(scope, id, name, role string, r io.Reader) (Artifact, error) 
 	if err != nil {
 		return a, err
 	}
+	maxFile := MaxFileBytes()
+	maxTotal := MaxTotalBytes()
 	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(f, h), io.LimitReader(r, MaxFileSize+1))
+	n, err := io.Copy(io.MultiWriter(f, h), io.LimitReader(r, maxFile+1))
 	if err == nil {
 		err = f.Sync()
 	}
@@ -324,8 +350,8 @@ func (s Store) Add(scope, id, name, role string, r io.Reader) (Artifact, error) 
 	if err == nil {
 		err = closeErr
 	}
-	if err == nil && (n > MaxFileSize || totalSize(m)+n > MaxTotalSize) {
-		err = errors.New("文件超过大小限制（单文件 64 MiB，任务总量 256 MiB）")
+	if err == nil && (n > maxFile || totalSize(m)+n > maxTotal) {
+		err = fmt.Errorf("文件超过大小限制（单文件 %d MiB，任务总量 %d MiB）", maxFile>>20, maxTotal>>20)
 	}
 	if err != nil {
 		os.Remove(p)
@@ -499,7 +525,7 @@ func openVerified(dir string, a Artifact) (*os.File, error) {
 		return nil, errors.New("附件文件状态无效")
 	}
 	h := sha256.New()
-	n, err := io.Copy(h, io.LimitReader(f, MaxTotalSize+1))
+	n, err := io.Copy(h, io.LimitReader(f, MaxTotalBytes()+1))
 	if err != nil || n != a.Size || hex.EncodeToString(h.Sum(nil)) != a.SHA256 {
 		f.Close()
 		return nil, errors.New("附件哈希校验失败：" + a.Name)

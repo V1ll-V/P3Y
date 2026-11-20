@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"mime"
 	"net/http"
 	"os"
@@ -121,29 +122,43 @@ func (s *Server) uploadArtifacts(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 409, "请先重试绑定原有附件")
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxChatUpload)
-	if err := r.ParseMultipartForm(8 << 20); err != nil {
-		writeErr(w, 400, "上传超过 128 MiB 或表单无效")
+	maxUpload := artifacts.MaxTotalBytes() + 16<<20
+	r.Body = http.MaxBytesReader(w, r.Body, maxUpload)
+	mr, err := r.MultipartReader()
+	if err != nil {
+		writeErr(w, 400, fmt.Sprintf("上传超过 %d MiB 或表单无效", artifacts.MaxTotalBytes()>>20))
 		return
 	}
-	defer r.MultipartForm.RemoveAll()
-	files := r.MultipartForm.File["file"]
-	if len(files) == 0 || len(files) > artifacts.MaxUploadFiles {
-		writeErr(w, 400, "每次请选择 1 至 32 个文件")
-		return
+	uploaded := 0
+	for {
+		part, err := mr.NextPart()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			writeErr(w, 400, fmt.Sprintf("上传读取失败或超过 %d MiB：%v", artifacts.MaxTotalBytes()>>20, err))
+			return
+		}
+		if part.FormName() != "file" {
+			_ = part.Close()
+			continue
+		}
+		uploaded++
+		if uploaded > artifacts.MaxUploadFiles {
+			_ = part.Close()
+			writeErr(w, 400, fmt.Sprintf("每次请选择 1 至 %d 个文件", artifacts.MaxUploadFiles))
+			return
+		}
+		_, addErr := s.artifactStore().Add(scope, id, part.FileName(), "attachment", part)
+		_ = part.Close()
+		if addErr != nil {
+			writeErr(w, 400, addErr.Error())
+			return
+		}
 	}
-	for _, hdr := range files {
-		f, err := hdr.Open()
-		if err != nil {
-			writeErr(w, 400, err.Error())
-			return
-		}
-		_, err = s.artifactStore().Add(scope, id, hdr.Filename, "attachment", f)
-		f.Close()
-		if err != nil {
-			writeErr(w, 400, err.Error())
-			return
-		}
+	if uploaded == 0 {
+		writeErr(w, 400, fmt.Sprintf("每次请选择 1 至 %d 个文件", artifacts.MaxUploadFiles))
+		return
 	}
 	if t != nil {
 		if err := s.m.taskInputsError(t); err != nil {

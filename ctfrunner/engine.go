@@ -15,6 +15,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -154,6 +156,7 @@ func (e *Engine) EnsureSessionWithOptions(ctx context.Context, opts SessionConta
 		workVol = ""
 	}
 	envList, envHash := mergeToolEnvironment(opts.ExtraEnv)
+	extraMounts, extraMountsHash := parseExtraReadOnlyMounts(os.Getenv("P3Y_BOX_EXTRA_RO_MOUNTS"))
 
 	netMode, wgID, err := e.resolveSessionNetwork(ctx, task, vpnHash)
 	if err != nil {
@@ -169,7 +172,8 @@ func (e *Engine) EnsureSessionWithOptions(ctx context.Context, opts SessionConta
 			c.Config.Labels["p3y.box.work_mount"] != hostWork ||
 			c.Config.Labels["p3y.box.work_vol"] != workVol ||
 			c.Config.Labels["p3y.box.inputs_mount"] != hostInputs ||
-			c.Config.Labels["p3y.box.env_hash"] != envHash {
+			c.Config.Labels["p3y.box.env_hash"] != envHash ||
+			c.Config.Labels["p3y.box.extra_mounts"] != extraMountsHash {
 			if err = e.removeContainerOnly(ctx, name); err != nil {
 				return "", err
 			}
@@ -184,7 +188,7 @@ func (e *Engine) EnsureSessionWithOptions(ctx context.Context, opts SessionConta
 	} else if !strings.Contains(err.Error(), ": 404 ") {
 		return "", err
 	}
-	mounts := make([]map[string]any, 0, 2)
+	mounts := make([]map[string]any, 0, 2+len(extraMounts))
 	if hostWork != "" {
 		mounts = append(mounts, map[string]any{"Type": "bind", "Source": hostWork, "Target": "/work"})
 	} else {
@@ -203,6 +207,7 @@ func (e *Engine) EnsureSessionWithOptions(ctx context.Context, opts SessionConta
 	if hostInputs != "" {
 		mounts = append(mounts, map[string]any{"Type": "bind", "Source": hostInputs, "Target": "/work/.inputs", "ReadOnly": true})
 	}
+	mounts = append(mounts, extraMounts...)
 	labels := map[string]string{"p3y.box.managed": "true", "p3y.box.task": task, "p3y.box.input": inputHash}
 	if vpnHash != "" {
 		labels["p3y.box.vpn"] = vpnHash
@@ -219,6 +224,9 @@ func (e *Engine) EnsureSessionWithOptions(ctx context.Context, opts SessionConta
 	}
 	if envHash != "" {
 		labels["p3y.box.env_hash"] = envHash
+	}
+	if extraMountsHash != "" {
+		labels["p3y.box.extra_mounts"] = extraMountsHash
 	}
 	config := map[string]any{
 		"Image": e.Image, "User": "1000:1000", "WorkingDir": "/work", "Entrypoint": []string{"sleep"}, "Cmd": []string{"infinity"},
@@ -371,4 +379,51 @@ func (e *Engine) Remove(ctx context.Context, name string) error {
 		}
 	}
 	return nil
+}
+
+// parseExtraReadOnlyMounts parses P3Y_BOX_EXTRA_RO_MOUNTS entries of the form
+// "<hostPath>:<containerTarget>" (comma/semicolon separated, supporting Windows
+// drive prefixes like C:/data/case:/mnt/evidence). Only read-only mounts under
+// /mnt/, /evidence/, or /opt/evidence/ are accepted so sandbox system paths stay protected.
+func parseExtraReadOnlyMounts(raw string) ([]map[string]any, string) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, ""
+	}
+	var specs []string
+	var mounts []map[string]any
+	seenTarget := map[string]bool{}
+	for _, entry := range strings.FieldsFunc(raw, func(r rune) bool { return r == ',' || r == ';' || r == '\n' }) {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		sep := strings.LastIndex(entry, ":")
+		if sep <= 0 || sep >= len(entry)-1 {
+			continue
+		}
+		src := strings.TrimSpace(entry[:sep])
+		dst := path.Clean(strings.TrimSpace(entry[sep+1:]))
+		if src == "" || strings.ContainsAny(src, "\x00\r\n") || !strings.HasPrefix(dst, "/") {
+			continue
+		}
+		allowedTarget := strings.HasPrefix(dst, "/mnt/") || strings.HasPrefix(dst, "/evidence/") || strings.HasPrefix(dst, "/opt/evidence/")
+		if !allowedTarget || seenTarget[dst] {
+			continue
+		}
+		seenTarget[dst] = true
+		specs = append(specs, src+"->"+dst)
+		mounts = append(mounts, map[string]any{
+			"Type":     "bind",
+			"Source":   src,
+			"Target":   dst,
+			"ReadOnly": true,
+		})
+	}
+	if len(mounts) == 0 {
+		return nil, ""
+	}
+	sort.Strings(specs)
+	sum := sha256.Sum256([]byte(strings.Join(specs, "\n")))
+	return mounts, hex.EncodeToString(sum[:8])
 }

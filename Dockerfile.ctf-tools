@@ -69,7 +69,13 @@ RUN chmod +x /opt/tools/php_filter_chain_generator/php_filter_chain_generator.py
 RUN (sed -i 's/mirrors.tuna.tsinghua.edu.cn/mirrors.aliyun.com/g; s/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true) \
     && apt-get -o Acquire::http::Timeout=60 -o Acquire::Retries=5 update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y -o Acquire::http::Timeout=60 -o Acquire::Retries=5 --no-install-recommends \
-    openssh-client sshpass proxychains4 && rm -rf /var/lib/apt/lists/*
+    openssh-client sshpass proxychains4 sleuthkit ewf-tools e2fsprogs sqlite3 && rm -rf /var/lib/apt/lists/*
+# 高速 SAT 求解器（python-sat 内置 CaDiCaL / Glucose / MiniSat），同时装入 pwn 与 re 环境
+RUN /opt/ctf/pwn/bin/pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple python-sat \
+    && /opt/ctf/re/bin/pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple python-sat \
+    && /opt/ctf/pwn/bin/python3 -c "from pysat.solvers import Cadical195" \
+    && /opt/ctf/re/bin/python3 -c "from pysat.solvers import Cadical195" \
+    && chmod -R a+rX /opt/ctf/pwn /opt/ctf/re
 ENV PATH="/opt/ctf/pwn/bin:${PATH}" HOME=/work XDG_CACHE_HOME=/work/.cache XDG_CONFIG_HOME=/work/.config JAVA_TOOL_OPTIONS="-Duser.home=/work" PYTHONPYCACHEPREFIX=/tmp/pycache PWNLIB_NOTERM=1 TERM=dumb
 RUN useradd --uid 1000 --create-home ctf && mkdir -p /work && chown 1000:1000 /work
 USER 1000:1000

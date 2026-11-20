@@ -15,6 +15,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -331,8 +332,12 @@ func (s *Server) putFiles(w http.ResponseWriter, r *http.Request, inputs bool) {
 	}
 	pr, pw := io.Pipe()
 	done := make(chan error, 1)
+	maxReq := int64(1024 << 20)
+	if inputs {
+		maxReq = maxInputsUploadBytes() + (64 << 20)
+	}
 	go func() {
-		err := validateUpload(pw, http.MaxBytesReader(w, r.Body, 1024<<20), inputs)
+		err := validateUpload(pw, http.MaxBytesReader(w, r.Body, maxReq), inputs)
 		_ = pw.CloseWithError(err)
 		done <- err
 	}()
@@ -359,12 +364,28 @@ func (s *Server) putFiles(w http.ResponseWriter, r *http.Request, inputs bool) {
 	reply(w, 200, map[string]bool{"ok": true})
 }
 
+func maxInputsUploadBytes() int64 {
+	if raw := strings.TrimSpace(os.Getenv("P3Y_BOX_INPUTS_MAX_MB")); raw != "" {
+		if mb, err := strconv.Atoi(raw); err == nil && mb >= 256 {
+			if mb > 4096 {
+				mb = 4096
+			}
+			return int64(mb) << 20
+		}
+	}
+	return 1024 << 20
+}
+
 func safeRelative(name string) bool {
 	return name != "" && !strings.ContainsAny(name, "\\:\x00") && !path.IsAbs(name) && path.Clean(name) == strings.TrimSuffix(name, "/") && name != ".." && !strings.HasPrefix(name, "../")
 }
 func validateUpload(w io.Writer, r io.Reader, inputs bool) error {
 	tr := tar.NewReader(r)
 	tw := tar.NewWriter(w)
+	maxTotal := int64(512 << 20)
+	if inputs {
+		maxTotal = maxInputsUploadBytes()
+	}
 	var total int64
 	count := 0
 	for {
@@ -386,7 +407,7 @@ func validateUpload(w io.Writer, r io.Reader, inputs bool) error {
 		}
 		total += h.Size
 		count++
-		if h.Size < 0 || total > 512<<20 || count > 8192 {
+		if h.Size < 0 || total > maxTotal || count > 8192 {
 			return errors.New("workspace upload limit exceeded")
 		}
 		executable := h.Mode&0111 != 0

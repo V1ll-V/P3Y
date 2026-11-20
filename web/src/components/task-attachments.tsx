@@ -102,10 +102,10 @@ export function TaskAttachments({
     if (!files.length || readOnly) return;
     if (
       files.length > 32 ||
-      files.some((f) => f.size > 64 * 1048576) ||
-      files.reduce((n, f) => n + f.size, 0) > 120 * 1048576
+      files.some((f) => f.size > 256 * 1048576) ||
+      files.reduce((n, f) => n + f.size, 0) > 512 * 1048576
     ) {
-      setError("每次最多 32 个文件，单文件不超过 64 MiB，每批文件总量不超过 120 MiB。");
+      setError("每次最多 32 个文件，单文件不超过 256 MiB，每批文件总量不超过 512 MiB（超大镜像可通过只读挂载接入）。");
       return;
     }
     await run(async () => {
@@ -164,7 +164,7 @@ export function TaskAttachments({
             {busy ? <Loader2Icon className="animate-spin" /> : <PaperclipIcon />} 上传附件
           </Button>
           <p className="mt-2 text-muted-foreground text-xs">
-            支持拖拽、多文件和 ZIP；可上传主程序、libc、Loader、源码及输入文件。单文件最大 64 MiB。
+            支持拖拽、多文件和 ZIP；可上传主程序、libc、Loader、源码及输入文件。单文件最大 256 MiB（单批 512 MiB）。
           </p>
         </section>
       )}
