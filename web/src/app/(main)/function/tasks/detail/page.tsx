@@ -205,10 +205,18 @@ function TaskDetailInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const id = searchParams.get("id") ?? "";
+  const requestedTab = searchParams.get("tab") ?? "";
   const [task, setTask] = React.useState<Task | null>(null);
   const [paused, setPaused] = React.useState(false);
   const [loaded, setLoaded] = React.useState(false);
-  const [tab, setTab] = React.useState("sessions");
+  const [tab, setTab] = React.useState(() =>
+    TABS.some((t) => t.value === requestedTab) || requestedTab === "ad" ? requestedTab : "sessions",
+  );
+  React.useEffect(() => {
+    if (requestedTab && (TABS.some((t) => t.value === requestedTab) || requestedTab === "ad")) {
+      setTab(requestedTab);
+    }
+  }, [requestedTab]);
   const [interceptPendingCount, setInterceptPendingCount] = React.useState(0);
   const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
   const [archiving, setArchiving] = React.useState(false);
@@ -423,6 +431,11 @@ function TaskDetailInner() {
             ).map((t) => (
               <TabsTrigger key={t.value} value={t.value}>
                 {t.value === "report" && task.mode === "ctf" ? "解题报告（WP）" : t.label}
+                {t.value === "report" && task.mode === "ctf" && (task.pending_ctf_candidates ?? 0) > 0 && (
+                  <span className="ml-1.5 inline-flex h-4 min-w-[16px] items-center justify-center rounded-full bg-amber-500 px-1 text-[10px] font-semibold leading-none text-white">
+                    {(task.pending_ctf_candidates ?? 0) > 99 ? "99+" : task.pending_ctf_candidates}
+                  </span>
+                )}
                 {t.value === "intercept" && interceptPendingCount > 0 && (
                   <span className="ml-1.5 inline-flex h-4 min-w-[16px] items-center justify-center rounded-full bg-amber-500 px-1 text-[10px] font-semibold leading-none text-white">
                     {interceptPendingCount > 99 ? "99+" : interceptPendingCount}

@@ -23,6 +23,7 @@ import {
   ArrowUpIcon,
   ChevronRightIcon,
   EyeIcon,
+  FlagIcon,
   FolderInputIcon,
   GripVerticalIcon,
   Loader2Icon,
@@ -426,6 +427,7 @@ export default function TasksPage() {
   // POLL_MS but usually comes back unchanged, and setTasks on an identical payload would
   // re-render the whole page for nothing. Bail out when it matches.
   const lastRef = React.useRef<string>("");
+  const seenPendingFlagRef = React.useRef<Set<string> | null>(null);
 
   const load = React.useCallback(() => {
     api
@@ -435,6 +437,19 @@ export default function TasksPage() {
         const sig = JSON.stringify(next);
         if (sig === lastRef.current) return;
         lastRef.current = sig;
+        const currentPending = new Set(next.filter((t) => (t.pending_ctf_candidates ?? 0) > 0).map((t) => t.id));
+        if (seenPendingFlagRef.current !== null) {
+          for (const t of next) {
+            if ((t.pending_ctf_candidates ?? 0) > 0 && !seenPendingFlagRef.current.has(t.id)) {
+              const label = t.name?.trim() || `#${t.id}`;
+              toast.warning(`任务「${label}」发现候选 Flag 等待确认`, {
+                description: t.latest_ctf_candidate || "请进入「解题报告（WP）」确认或否定。",
+                duration: 10_000,
+              });
+            }
+          }
+        }
+        seenPendingFlagRef.current = currentPending;
         setTasks(next);
       })
       .catch(() => {
@@ -490,6 +505,10 @@ export default function TasksPage() {
   // 只在确有 running 任务时才每秒 tick——其余情况「运行时长」是静态值,空转的 tick 会白白
   // 重渲染整张表。
   const hasRunning = React.useMemo(() => tasks.some((t) => t.status === "running"), [tasks]);
+  const pendingFlagTasks = React.useMemo(
+    () => tasks.filter((t) => (t.pending_ctf_candidates ?? 0) > 0),
+    [tasks],
+  );
 
   // tick every second so running tasks' 运行时长 counts up live.
   React.useEffect(() => {
@@ -886,6 +905,42 @@ export default function TasksPage() {
               />
             </div>
 
+            {pendingFlagTasks.length > 0 && (
+              <div
+                role="status"
+                className="mx-4 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3.5 py-2.5 text-sm lg:mx-6"
+              >
+                <div className="flex items-center gap-2 font-medium text-amber-800 dark:text-amber-200">
+                  <span className="relative flex size-2.5 shrink-0">
+                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-amber-500 opacity-75" />
+                    <span className="relative inline-flex size-2.5 rounded-full bg-amber-500" />
+                  </span>
+                  <FlagIcon className="size-4 shrink-0" />
+                  <span>有 {pendingFlagTasks.length} 个 CTF 任务发现候选 Flag 等待确认：</span>
+                </div>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {pendingFlagTasks.map((t) => (
+                    <Link
+                      key={t.id}
+                      href={`/function/tasks/detail?id=${encodeURIComponent(t.id)}&tab=report`}
+                      title={t.latest_ctf_candidate ? `候选值：${t.latest_ctf_candidate}` : "点击前往确认候选 Flag"}
+                      className="inline-flex items-center gap-1.5 rounded-md border border-amber-500/50 bg-background/90 px-2.5 py-1 text-xs font-medium text-amber-800 transition-colors hover:bg-amber-500/20 dark:text-amber-200"
+                    >
+                      <span className="max-w-44 truncate">
+                        #{t.id} {t.name?.trim() || t.description}
+                      </span>
+                      {(t.pending_ctf_candidates ?? 0) > 1 && (
+                        <span className="rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white">
+                          {t.pending_ctf_candidates}
+                        </span>
+                      )}
+                      <span>去确认 →</span>
+                    </Link>
+                  ))}
+                </div>
+              </div>
+            )}
+
             {tasks.length === 0 ? (
               <div className="text-muted-foreground mx-4 flex items-center justify-center rounded-lg border border-dashed py-20 text-sm lg:mx-6">
                 暂无任务，点击右上角「新建任务」开始。
@@ -1151,8 +1206,13 @@ const TaskRow = React.memo(function TaskRow({
   selected: boolean;
   onSelectedChange: (id: string, checked: boolean) => void;
 }) {
+  const pendingFlagCount = task.pending_ctf_candidates ?? 0;
+  const hasPendingFlag = pendingFlagCount > 0;
   return (
-    <TableRow className="group border-border/60" data-state={selected ? "selected" : undefined}>
+    <TableRow
+      className={cn("group border-border/60", hasPendingFlag && "bg-amber-500/5 hover:bg-amber-500/10")}
+      data-state={selected ? "selected" : undefined}
+    >
       <TableCell>
         <Checkbox
           checked={selected}
@@ -1183,7 +1243,24 @@ const TaskRow = React.memo(function TaskRow({
         {task.goal}
       </TableCell>
       <TableCell>
-        <StatusBadge domain="task" value={task.status} dot />
+        <div className="flex flex-wrap items-center gap-1.5">
+          <StatusBadge domain="task" value={task.status} dot />
+          {hasPendingFlag && (
+            <Link
+              href={`/function/tasks/detail?id=${encodeURIComponent(task.id)}&tab=report`}
+              title={
+                task.latest_ctf_candidate
+                  ? `待确认候选：${task.latest_ctf_candidate}\n点击直达「解题报告（WP）」确认`
+                  : "发现候选 Flag，点击前往确认"
+              }
+              className="inline-flex items-center gap-1 rounded-md border border-amber-500/50 bg-amber-500/15 px-2 py-0.5 text-xs font-semibold text-amber-800 whitespace-nowrap transition-colors hover:bg-amber-500/25 dark:text-amber-200"
+            >
+              <span className="size-1.5 animate-pulse rounded-full bg-amber-500" />
+              <FlagIcon className="size-3 shrink-0" />
+              待确认 Flag{pendingFlagCount > 1 ? ` (${pendingFlagCount})` : ""}
+            </Link>
+          )}
+        </div>
       </TableCell>
       <TableCell className="text-muted-foreground text-center text-xs tabular-nums">
         {typeof task.goals_total === "number" && task.goals_total > 0 ? (

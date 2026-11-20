@@ -146,3 +146,53 @@ func TestClaimIntentGuardedSerializesPwnExploit(t *testing.T) {
 		t.Fatalf("expected second exploit claimable after first stopped, got ok=%v err=%v", okAfter, err)
 	}
 }
+
+func TestTaskListMetricsAllPendingCTFCandidates(t *testing.T) {
+	pg, err := privateVerificationInputDB(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := pg.CreateTaskWithOptions("pending-flag-ui", "flag", TaskCreateOptions{Mode: "ctf"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = pg.SyncCTFInput(t.Context(), task.ID, "input-hash-1"); err != nil {
+		t.Fatal(err)
+	}
+	e := &CTFExecution{ID: uuid.NewString(), TaskID: task.ID, InputHash: "input-hash-1", StartedAt: time.Now()}
+	if err := pg.SaveCTFExecution(t.Context(), e); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pg.AddCTFOutputCandidate(t.Context(), task.ID, e.ID, "flag{need_confirm}"); err != nil {
+		t.Fatal(err)
+	}
+
+	all, err := pg.TaskListMetricsAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := all[task.ExplorationID]
+	if m.PendingCTFCandidates != 1 || m.LatestCTFCandidate != "flag{need_confirm}" {
+		t.Fatalf("expected 1 pending candidate flag{need_confirm}, got count=%d latest=%q", m.PendingCTFCandidates, m.LatestCTFCandidate)
+	}
+	cnt, latest, err := pg.PendingCTFCandidateSummary(t.Context(), task.ID)
+	if err != nil || cnt != 1 || latest != "flag{need_confirm}" {
+		t.Fatalf("PendingCTFCandidateSummary got (%d, %q, %v)", cnt, latest, err)
+	}
+
+	// Once task reaches terminal status 'done', leftover unreviewed candidate rows must NOT surface as pending.
+	if _, err := pg.Exec(`UPDATE tasks SET status='done' WHERE id=$1`, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	all2, err := pg.TaskListMetricsAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if all2[task.ExplorationID].PendingCTFCandidates != 0 {
+		t.Fatalf("expected 0 pending candidates for done task, got %d", all2[task.ExplorationID].PendingCTFCandidates)
+	}
+	cnt2, _, err := pg.PendingCTFCandidateSummary(t.Context(), task.ID)
+	if err != nil || cnt2 != 0 {
+		t.Fatalf("expected 0 pending candidates from summary for done task, got (%d, %v)", cnt2, err)
+	}
+}

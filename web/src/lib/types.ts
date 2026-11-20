@@ -50,6 +50,8 @@ export interface Task {
   archive_blocked_by_task_id?: string; // live direct dependent that must be archived first
   company_ids?: number[]; // associated company scopes; current company assets join the task at creation
   coverage_enabled?: boolean; // 资产覆盖度功能开关(创建时定,默认开)；false=不计算/不展示覆盖度
+  pending_ctf_candidates?: number; // 待人工确认的 CTF 候选 Flag / 利用证明数
+  latest_ctf_candidate?: string; // 最新待确认候选值预览
 }
 
 export interface TaskArtifact {

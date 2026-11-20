@@ -1184,6 +1184,10 @@ func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
 			Medium:   metric.Findings.Medium,
 			Low:      metric.Findings.Low,
 		}
+		if !isTerminalStatus(dto.Status) && metric.PendingCTFCandidates > 0 {
+			dto.PendingCTFCandidates = metric.PendingCTFCandidates
+			dto.LatestCTFCandidate = metric.LatestCTFCandidate
+		}
 		dtos = append(dtos, dto)
 	}
 	writeJSON(w, 200, map[string]any{"tasks": dtos, "active": active})
@@ -1896,6 +1900,14 @@ func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
 	dto.InputsBlockedReason = s.taskInputsBlockReason(t)
 	archiveBlockers, _ := s.m.PG().TaskArchiveBlockers()
 	applyTaskArchiveBlocker(&dto, archiveBlockers)
+	if t.Mode == "ctf" && !isTerminalStatus(dto.Status) {
+		if tidNum, err := strconv.ParseInt(t.ID, 10, 64); err == nil && tidNum > 0 {
+			if cnt, latest, err := s.m.PG().PendingCTFCandidateSummary(r.Context(), tidNum); err == nil && cnt > 0 {
+				dto.PendingCTFCandidates = cnt
+				dto.LatestCTFCandidate = latest
+			}
+		}
+	}
 	writeJSON(w, 200, dto)
 }
 

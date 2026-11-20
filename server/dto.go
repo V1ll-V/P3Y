@@ -71,6 +71,8 @@ type TaskDTO struct {
 	CoverageEnabled        bool               `json:"coverage_enabled"` // 资产覆盖度功能开关(创建时定)
 	ZeroTouch              bool               `json:"zero_touch,omitempty"`
 	BenchmarkSessionID     *int64             `json:"benchmark_session_id,omitempty"`
+	PendingCTFCandidates   int                `json:"pending_ctf_candidates,omitempty"`
+	LatestCTFCandidate     string             `json:"latest_ctf_candidate,omitempty"`
 }
 
 // FindingSeverityDTO 是任务列表里按严重度分档的漏洞计数（严重/高/中/低）。

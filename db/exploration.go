@@ -1348,11 +1348,13 @@ type FindingSeverityCounts struct{ Critical, High, Medium, Low int }
 
 // TaskListMetrics contains the aggregates rendered in task lists.
 type TaskListMetrics struct {
-	Tokens         TokenUsage
-	LastActivity   int64
-	Goals          GoalCounts
-	RunningIntents int                   // kind='intent' 且 state='running' 的条数，即运行中 Worker 数
-	Findings       FindingSeverityCounts // findings 表里该任务的漏洞数（按严重度分档）
+	Tokens               TokenUsage
+	LastActivity         int64
+	Goals                GoalCounts
+	RunningIntents       int                   // kind='intent' 且 state='running' 的条数，即运行中 Worker 数
+	Findings             FindingSeverityCounts // findings 表里该任务的漏洞数（按严重度分档）
+	PendingCTFCandidates int                   // 当前输入快照下尚未确认的 CTF 候选 Flag/利用证明数（仅非终态 CTF 任务）
+	LatestCTFCandidate   string                // 最新一条待确认候选值预览
 }
 
 // TaskListMetricsAll returns list aggregates for every live task in one query.
@@ -1372,7 +1374,9 @@ func (d *DB) TaskListMetricsAll() (map[int64]TaskListMetrics, error) {
 		       COALESCE(finding_metrics.critical,0),
 		       COALESCE(finding_metrics.high,0),
 		       COALESCE(finding_metrics.medium,0),
-		       COALESCE(finding_metrics.low,0)
+		       COALESCE(finding_metrics.low,0),
+		       COALESCE(ctf_pending.pending_count,0),
+		       COALESCE(ctf_pending.latest_value,'')
 		FROM tasks task
 		LEFT JOIN LATERAL (
 			SELECT SUM(input_tokens) AS input_tokens,
@@ -1408,6 +1412,16 @@ func (d *DB) TaskListMetricsAll() (map[int64]TaskListMetrics, error) {
 			FROM findings
 			WHERE task_id=task.id
 		) finding_metrics ON true
+		LEFT JOIN LATERAL (
+			SELECT COUNT(*) AS pending_count,
+			       COALESCE((ARRAY_AGG(c.value ORDER BY c.id DESC))[1], '') AS latest_value
+			FROM ctf_candidates c
+			WHERE task.mode='ctf'
+			  AND task.status NOT IN ('done', 'failed', 'timeout')
+			  AND c.task_id=task.id
+			  AND c.input_hash=task.ctf_input_hash
+			  AND c.state='candidate'
+		) ctf_pending ON true
 		WHERE task.deleted_at IS NULL`)
 	if err != nil {
 		return nil, err
@@ -1431,6 +1445,8 @@ func (d *DB) TaskListMetricsAll() (map[int64]TaskListMetrics, error) {
 			&metrics.Findings.High,
 			&metrics.Findings.Medium,
 			&metrics.Findings.Low,
+			&metrics.PendingCTFCandidates,
+			&metrics.LatestCTFCandidate,
 		); err != nil {
 			return nil, err
 		}
