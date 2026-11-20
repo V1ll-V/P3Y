@@ -110,26 +110,65 @@ func classifyCTFToolFailure(name string, result []byte, isErr bool) (failed bool
 			return true, "check passed=false"
 		}
 		if rc, ok := obj["exit_code"].(float64); ok && int(rc) != 0 {
-			stderr, _ := obj["stderr_excerpt"].(string)
-			stdout, _ := obj["stdout_excerpt"].(string)
+			stderr := firstNonEmptyString(obj["stderr_excerpt"], obj["stderr"])
+			stdout := firstNonEmptyString(obj["stdout_excerpt"], obj["stdout"])
 			detail := strings.TrimSpace(stderr)
 			if detail == "" {
 				detail = strings.TrimSpace(stdout)
 			}
-			return true, fmt.Sprintf("exit=%d %s", int(rc), truncOutput(detail, 220))
+			return true, fmt.Sprintf("exit=%d %s", int(rc), truncOutput(detail, 260))
 		}
 		// Check stdout/stderr inside JSON for crash/exception tracebacks even when wrapped by timeout/bash.
-		for _, k := range []string{"stdout_excerpt", "stderr_excerpt", "stderr"} {
+		for _, k := range []string{"stdout_excerpt", "stderr_excerpt", "stdout", "stderr"} {
 			if s, _ := obj[k].(string); containsCTFFailureSignature(s) {
-				return true, truncOutput(s, 240)
+				return true, truncOutput(s, 260)
 			}
 		}
 		return false, ""
 	}
 	if containsCTFFailureSignature(raw) {
-		return true, truncOutput(raw, 240)
+		return true, truncOutput(raw, 260)
 	}
 	return false, ""
+}
+
+func firstNonEmptyString(vals ...any) string {
+	for _, v := range vals {
+		if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// summarizeCriticToolOutput extracts actual exit_code/error/stdout/stderr from JSON tool
+// responses instead of blindly truncating raw JSON metadata (which previously hid stdout
+// behind id/task_id/command fields and caused Critic to hallucinate missing responses).
+func summarizeCriticToolOutput(result []byte, maxLen int) string {
+	raw := strings.TrimSpace(string(result))
+	if raw == "" {
+		return ""
+	}
+	var obj map[string]any
+	if json.Unmarshal([]byte(raw), &obj) == nil {
+		var parts []string
+		if rc, ok := obj["exit_code"].(float64); ok {
+			parts = append(parts, fmt.Sprintf("exit=%d", int(rc)))
+		}
+		if errText, _ := obj["error"].(string); strings.TrimSpace(errText) != "" {
+			parts = append(parts, "error="+strings.TrimSpace(errText))
+		}
+		if out := strings.TrimSpace(firstNonEmptyString(obj["stdout"], obj["stdout_excerpt"])); out != "" {
+			parts = append(parts, "stdout="+out)
+		}
+		if errOut := strings.TrimSpace(firstNonEmptyString(obj["stderr"], obj["stderr_excerpt"])); errOut != "" {
+			parts = append(parts, "stderr="+errOut)
+		}
+		if len(parts) > 0 {
+			return truncOutput(strings.Join(parts, " | "), maxLen)
+		}
+	}
+	return truncOutput(raw, maxLen)
 }
 
 func containsCTFFailureSignature(s string) bool {
@@ -162,9 +201,10 @@ func (h *ctfCriticHooks) PreToolUse(ctx context.Context, name string, input []by
 			return block, msg, mod
 		}
 	}
-	// Always allow board_rewind / plateau_fork / diff_local_remote pivot tools through without blocking;
+	// Always allow pivot & progress-recording tools through without blocking;
 	// only consume pendingCritique when actually injecting it to block a blind retry.
-	allowPivot := name == "board_rewind" || name == "plateau_fork" || name == "diff_local_remote"
+	allowPivot := name == "board_rewind" || name == "plateau_fork" || name == "diff_local_remote" ||
+		name == "record_fact" || name == "board_record" || name == "board_mark_savepoint"
 	if allowPivot {
 		return false, "", nil
 	}
@@ -201,7 +241,7 @@ func (h *ctfCriticHooks) PostToolUse(ctx context.Context, name string, input, re
 	sample := criticFailureSample{
 		Tool:   name,
 		Input:  truncOutput(strings.TrimSpace(string(input)), 260),
-		Output: truncOutput(strings.TrimSpace(string(result)), 260),
+		Output: summarizeCriticToolOutput(result, 520),
 	}
 	failed, reason := classifyCTFToolFailure(name, result, isErr)
 

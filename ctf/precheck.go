@@ -8,6 +8,7 @@ import (
 	"debug/pe"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -107,6 +108,9 @@ func extractTextTags(texts ...string) []string {
 		{"captcha", []string{"captcha", "验证码"}},
 		{"pow", []string{"proof of work", "工作量证明", "pow"}},
 		{"race_condition", []string{"race condition", "race_condition", "竞态", "并发", "双花"}},
+		{"pwn", []string{"pwn", "rop", "glibc", "seccomp", "execve", "shellcode", "heap", "llvm", "rustc", "uaf"}},
+		{"reverse", []string{"reverse", "逆向", "crackme", "反编译", "decompile"}},
+		{"crypto", []string{"crypto", "密码", "3pc", "mpc", "mp-spdz", "elliptic", "lattice", "lwe", "rsa"}},
 	}
 	var out []string
 	for _, r := range rules {
@@ -261,10 +265,31 @@ func inspectArtifactFile(a artifacts.Artifact, diskPath string) PrecheckFile {
 		if zr, err := zip.OpenReader(diskPath); err == nil {
 			defer zr.Close()
 			enc := false
+			inspected := 0
 			for _, f := range zr.File {
 				if f.Flags&0x1 != 0 {
 					enc = true
-					break
+				}
+				if f.FileInfo().IsDir() || f.Flags&0x1 != 0 || inspected >= 16 || f.UncompressedSize64 > 32<<20 {
+					continue
+				}
+				inspected++
+				lname := strings.ToLower(f.Name)
+				if strings.Contains(lname, "libc") && strings.Contains(lname, ".so") {
+					addTag("libc_provided")
+				}
+				if strings.HasSuffix(lname, ".pcap") || strings.HasSuffix(lname, ".pcapng") {
+					addTag("pcap")
+				}
+				if rc, oerr := f.Open(); oerr == nil {
+					var magic [4]byte
+					n, _ := io.ReadFull(rc, magic[:])
+					_ = rc.Close()
+					if n >= 4 && bytes.Equal(magic[:4], []byte{0x7f, 'E', 'L', 'F'}) {
+						addTag("elf")
+					} else if n >= 2 && bytes.Equal(magic[:2], []byte{'M', 'Z'}) {
+						addTag("pe")
+					}
 				}
 			}
 			if enc {
@@ -333,14 +358,14 @@ func inferCategory(configured string, files []PrecheckFile, tags []string, targe
 	if tagSet["pwn"] || (tagSet["elf"] && (tagSet["libc_provided"] || len(targets) > 0)) {
 		return "pwn"
 	}
-	if tagSet["elf"] || tagSet["pe"] {
+	if tagSet["elf"] || tagSet["pe"] || tagSet["reverse"] {
 		return "reverse"
-	}
-	if tagSet["pcap"] || tagSet["zip"] || tagSet["image"] {
-		return "misc"
 	}
 	if tagSet["crypto"] || tagSet["rsa"] {
 		return "crypto"
+	}
+	if tagSet["pcap"] || tagSet["zip"] || tagSet["image"] {
+		return "misc"
 	}
 	if tagSet["web"] || len(targets) > 0 {
 		for _, tg := range targets {
@@ -376,10 +401,11 @@ func (s *Service) RunPrecheck(ctx context.Context, taskID int64, force bool) (*P
 	}
 	fpRaw, _ := json.Marshal(struct {
 		Hash string `json:"hash"`
+		Name string `json:"name"`
 		Desc string `json:"desc"`
 		Goal string `json:"goal"`
 		Chal string `json:"chal"`
-	}{Hash: Hash(m), Desc: taskRow.Description, Goal: taskRow.Goal, Chal: taskRow.ChallengeType})
+	}{Hash: Hash(m), Name: taskRow.Name, Desc: taskRow.Description, Goal: taskRow.Goal, Chal: taskRow.ChallengeType})
 	fpHash := SHA(fpRaw)
 
 	if !force {
@@ -408,7 +434,7 @@ func (s *Service) RunPrecheck(ctx context.Context, taskID int64, force bool) (*P
 	if taskRow.ChallengeType != "" && taskRow.ChallengeType != "auto" {
 		tagSet[strings.ToLower(taskRow.ChallengeType)] = true
 	}
-	for _, tg := range extractTextTags(taskRow.Description, taskRow.Goal) {
+	for _, tg := range extractTextTags(taskRow.Name, taskRow.Description, taskRow.Goal) {
 		tagSet[tg] = true
 	}
 	tags := make([]string, 0, len(tagSet))

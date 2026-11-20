@@ -223,3 +223,60 @@ func TestRunPrecheckExtractsWebTextTagsAndBackfillsTips(t *testing.T) {
 		t.Fatalf("expected top matched tip card to be Next.js Middleware, got %+v", res.MatchedTips)
 	}
 }
+
+func TestRunPrecheckZippedELFInfersPwnAndSharedScope(t *testing.T) {
+	dsn, _, err := db.DSN()
+	if err != nil {
+		t.Skip("test database required")
+	}
+	pg, err := db.Open(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pg.Close()
+
+	task, err := pg.CreateTaskWithOptions(
+		"Pwn | passbox",
+		"提交 Rust 源码，服务端用 rustc 1.81.0（LLVM 18）编译并运行 smolstats pass；execve 被禁。靶场：47.112.26.126:36052",
+		db.TaskCreateOptions{Mode: "ctf", ChallengeType: "auto"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pg.DeleteTask(task.ID)
+
+	root := t.TempDir()
+	store := artifacts.Store{Root: root}
+	zipPath := filepath.Join(t.TempDir(), "passbox.zip")
+	f, err := os.Create(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(f)
+	w, _ := zw.Create("chall/passrunner")
+	_, _ = w.Write(buildMinimalELF64Header(62, 3))
+	_ = zw.Close()
+	_ = f.Close()
+
+	zf, err := os.Open(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer zf.Close()
+	if _, err := store.Add("task", fmt.Sprint(task.ID), "passbox.zip", "attachment", zf); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := New(root, pg)
+	res, err := svc.RunPrecheck(t.Context(), task.ID, true)
+	if err != nil {
+		t.Fatalf("RunPrecheck: %v", err)
+	}
+	if res.InferredCategory != "pwn" {
+		t.Fatalf("expected zipped ELF + target auto task to infer pwn, got %q (tags=%v)", res.InferredCategory, res.Tags)
+	}
+	sessionIntent, workDir, _, shared := svc.resolveScope(t.Context(), task.ID, 1737)
+	if !shared || sessionIntent != 0 || !strings.HasSuffix(filepath.ToSlash(workDir), "/shared/ctf-work") {
+		t.Fatalf("expected auto->pwn task to enable shared work dir, got shared=%v intent=%d workDir=%q", shared, sessionIntent, workDir)
+	}
+}

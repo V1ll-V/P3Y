@@ -44,3 +44,45 @@ func TestDeleteEndpointPathPattern(t *testing.T) {
 		}
 	}
 }
+
+func TestShutdownRebootAndDestructivePatterns(t *testing.T) {
+	reShutdown := regexp.MustCompile(shutdownRebootPattern)
+	reDestructive := regexp.MustCompile(destructiveShellPattern)
+
+	hit := []string{
+		`{"command":"shutdown -h now"}`,
+		`{"command":"sudo shutdown now"}`,
+		`{"command":"echo done && reboot"}`,
+		`{"command":"echo done; /sbin/reboot -f"}`,
+		`{"command":"echo done\npoweroff"}`,
+		`{"command":"sudo halt"}`,
+		`{"command":"/sbin/init 0"}`,
+		`{"command":"init 6"}`,
+	}
+	for _, s := range hit {
+		if !reShutdown.MatchString(s) {
+			t.Errorf("shutdownRebootPattern 应命中却放行: %s", s)
+		}
+		if !reDestructive.MatchString(s) {
+			t.Errorf("destructiveShellPattern 应命中却放行: %s", s)
+		}
+	}
+
+	miss := []string{
+		`{"command":"cat > /work/r12.py <<'PYEOF'\nimport socket\ns.shutdown(socket.SHUT_WR)\nPYEOF"}`,
+		`{"command":"python3 -c 'import socket; s.shutdown(1)'"}`,
+		`{"command":"python3 -c 'server.shutdown(); executor.shutdown(wait=False)'"}`,
+		`{"command":"echo 'shutdown(fd, SHUT_WR)'"}`,
+		`{"command":"grep -n shutdown /work/server.py"}`,
+		`{"command":"python3 -c '\nhalt = True\nreboot = 0\n'"}`,
+		`{"command":"curl http://10.0.0.1/status"}`,
+	}
+	for _, s := range miss {
+		if reShutdown.MatchString(s) {
+			t.Errorf("shutdownRebootPattern 误拦: %s", s)
+		}
+		if reDestructive.MatchString(s) {
+			t.Errorf("destructiveShellPattern 误拦: %s", s)
+		}
+	}
+}

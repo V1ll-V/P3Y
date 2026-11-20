@@ -304,6 +304,9 @@ ON CONFLICT (name) DO NOTHING`,
 	if err := d.seedDefaultInterceptRulesV3(); err != nil {
 		return fmt.Errorf("seed intercept rules v3: %w", err)
 	}
+	if err := d.seedDefaultInterceptRulesV4(); err != nil {
+		return fmt.Errorf("seed intercept rules v4: %w", err)
+	}
 	// V1 历史过渡:升级前已存在的 finding 标 legacy 来源,已判误报的转为可追溯的
 	// 人工否定。由 settings 守卫只跑一次(不能放进幂等的 schema.sql)。
 	if err := d.migrateLegacyFindingVerdicts(); err != nil {
@@ -436,7 +439,7 @@ func (d *DB) seedDefaultInterceptRules() error {
 			name:     "[内置] 关机 / 重启",
 			target:   "tool_input",
 			typ:      "regex",
-			pattern:  `\b(?:shutdown|reboot|halt|poweroff|init\s+[06])\b`,
+			pattern:  shutdownRebootPattern,
 			action:   "deny",
 			message:  "禁止执行关机或重启命令",
 			priority: 100,
@@ -581,7 +584,7 @@ func (d *DB) seedDefaultInterceptRulesV2() error {
 	}{
 		{
 			name:     "[内置] 破坏性系统命令",
-			pattern:  `(?i)\b(rm\s+-rf\s+/|mkfs|dd\s+if=|:\(\)\s*\{|shutdown|reboot|>\s*/dev/sd)`,
+			pattern:  destructiveShellPattern,
 			action:   "deny",
 			message:  "破坏性命令被拒绝（rm -rf / / mkfs / dd / fork bomb / 关机重启 / 覆写磁盘设备）",
 			enabled:  true,
@@ -641,4 +644,33 @@ WHERE NOT EXISTS (SELECT 1 FROM intercept_rules WHERE name = $1)`,
 		return fmt.Errorf("rule %q: %w", name, err)
 	}
 	return d.SetSetting("intercept_default_rules_v3", "done")
+}
+
+const (
+	legacyShutdownRebootPattern   = `\b(?:shutdown|reboot|halt|poweroff|init\s+[06])\b`
+	legacyDestructiveShellPattern = `(?i)\b(rm\s+-rf\s+/|mkfs|dd\s+if=|:\(\)\s*\{|shutdown|reboot|>\s*/dev/sd)`
+
+	// shutdownRebootPattern matches shell-level shutdown/reboot/halt/poweroff/init commands
+	// while avoiding false positives on code tokens such as Python/C sock.shutdown(socket.SHUT_WR)
+	// or variable assignments like halt = True inside heredoc scripts.
+	shutdownRebootPattern   = `(?:^|["';&|]\s*|\\n\s*|\bsudo\s+)(?:/s?bin/)?(?:shutdown\s+(?:-[hHrPkcfF]+|now|\+\d+|\d{1,2}:\d{2})|(?:reboot|halt|poweroff)(?:\s+-[fpnwdhf]+|\s*(?:["';&|]|\\n|$))|init\s+[06](?:["';&|\s]|\\n|$))`
+	destructiveShellPattern = `(?i)(?:\b(?:rm\s+-rf\s+/|mkfs|dd\s+if=)|:\(\)\s*\{|>\s*/dev/sd|` + shutdownRebootPattern + `)`
+)
+
+// seedDefaultInterceptRulesV4 refines the built-in shutdown/reboot patterns so legitimate
+// socket.shutdown(SHUT_WR) calls in exploit scripts are not falsely blocked as host poweroff.
+// Only untouched default patterns are updated; user-customized rules are preserved.
+func (d *DB) seedDefaultInterceptRulesV4() error {
+	if v, _, _ := d.GetSetting("intercept_default_rules_v4"); v == "done" {
+		return nil
+	}
+	if _, err := d.Exec(`UPDATE intercept_rules SET pattern=$1 WHERE name=$2 AND pattern=$3`,
+		shutdownRebootPattern, "[内置] 关机 / 重启", legacyShutdownRebootPattern); err != nil {
+		return fmt.Errorf("update shutdown rule: %w", err)
+	}
+	if _, err := d.Exec(`UPDATE intercept_rules SET pattern=$1 WHERE name=$2 AND pattern=$3`,
+		destructiveShellPattern, "[内置] 破坏性系统命令", legacyDestructiveShellPattern); err != nil {
+		return fmt.Errorf("update destructive shell rule: %w", err)
+	}
+	return d.SetSetting("intercept_default_rules_v4", "done")
 }

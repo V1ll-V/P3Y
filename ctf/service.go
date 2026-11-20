@@ -140,8 +140,19 @@ func (s *Service) LogicalPath(a artifacts.Artifact) string {
 
 func (s *Service) resolveScope(ctx context.Context, task, intent int64) (sessionIntent int64, workDir, lockKey string, shared bool) {
 	if s != nil && s.DB != nil && task > 0 {
-		if mode, challenge, err := s.DB.TaskChallengeType(ctx, task); err == nil && db.IsSandboxTaskMode(mode) && (challenge == "pwn" || challenge == "reverse") {
-			return 0, s.SharedWorkDir(task), fmt.Sprintf("%s/%d/shared", s.Root, task), true
+		if mode, challenge, err := s.DB.TaskChallengeType(ctx, task); err == nil && db.IsSandboxTaskMode(mode) {
+			effective := strings.ToLower(strings.TrimSpace(challenge))
+			if effective == "" || effective == "auto" {
+				if preRaw, perr := s.DB.TaskPrecheck(ctx, task); perr == nil && len(preRaw) > 0 {
+					var pre PrecheckResult
+					if json.Unmarshal(preRaw, &pre) == nil && strings.TrimSpace(pre.InferredCategory) != "" {
+						effective = strings.ToLower(strings.TrimSpace(pre.InferredCategory))
+					}
+				}
+			}
+			if effective == "pwn" || effective == "reverse" {
+				return 0, s.SharedWorkDir(task), fmt.Sprintf("%s/%d/shared", s.Root, task), true
+			}
 		}
 	}
 	return intent, s.WorkDir(task, intent), fmt.Sprintf("%s/%d/%d", s.Root, task, intent), false

@@ -332,6 +332,43 @@ func ctfTools(s *ctf.Service, task, intent int64, verifyMode string) []actool.Co
 	return ctfToolsWithUnlock(s, task, intent, verifyMode, nil)
 }
 
+// ctfExecToolResult is the compact LLM-facing projection of db.CTFExecution.
+// The full record (including command echo, environment, hashes, and the complete
+// /work script snapshot array `files`) is still persisted in Postgres for WP/UI,
+// but omitting those repeated fields from every tool_result prevents context bloat
+// from reaching 100K+ tokens across long solving loops.
+type ctfExecToolResult struct {
+	ID         string `json:"id"`
+	ExitCode   int    `json:"exit_code"`
+	Stdout     string `json:"stdout,omitempty"`
+	Stderr     string `json:"stderr,omitempty"`
+	Error      string `json:"error,omitempty"`
+	Truncated  bool   `json:"truncated,omitempty"`
+	FilesCount int    `json:"files_count,omitempty"`
+}
+
+func formatCTFExecToolResult(e *db.CTFExecution) string {
+	if e == nil {
+		return "{}"
+	}
+	res := ctfExecToolResult{
+		ID:        e.ID,
+		ExitCode:  e.ExitCode,
+		Stdout:    e.StdoutExcerpt,
+		Stderr:    e.StderrExcerpt,
+		Error:     e.Error,
+		Truncated: e.Truncated,
+	}
+	if len(e.Files) > 0 {
+		var files []json.RawMessage
+		if json.Unmarshal(e.Files, &files) == nil {
+			res.FilesCount = len(files)
+		}
+	}
+	b, _ := json.Marshal(res)
+	return string(b)
+}
+
 func ctfToolsWithUnlock(s *ctf.Service, task, intent int64, verifyMode string, unlockTargets *[]*actool.UnlockSet) []actool.CoreTool {
 	run := func(ctx context.Context, command string, timeout int) (actool.Result, error) {
 		if s == nil {
@@ -341,8 +378,7 @@ func ctfToolsWithUnlock(s *ctf.Service, task, intent int64, verifyMode string, u
 		if err != nil {
 			return actool.Errorf(err.Error()), nil
 		}
-		b, _ := json.Marshal(e)
-		return actool.Text(string(b)), nil
+		return actool.Text(formatCTFExecToolResult(e)), nil
 	}
 	commandTool := func(name, desc string, schema map[string]any, build func(map[string]json.RawMessage) (string, int, error)) actool.CoreTool {
 		return writeTool(name, desc, schema, func(ctx context.Context, in json.RawMessage) (actool.Result, error) {

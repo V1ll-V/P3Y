@@ -471,3 +471,49 @@ func TestCTFVPNStatusHookAndIsolatedHTTPPaths(t *testing.T) {
 		t.Fatalf("expected ctf_http transient files under /tmp/.ctf-http, got:\n%s", cmd)
 	}
 }
+
+func TestFormatCTFExecToolResultAndCriticStdoutVisibility(t *testing.T) {
+	e := &db.CTFExecution{
+		ID:            "exec-123",
+		TaskID:        151,
+		IntentID:      1740,
+		InputHash:     strings.Repeat("a", 64),
+		Command:       strings.Repeat("python3 long_script.py ", 40),
+		ExitCode:      0,
+		StdoutSHA:     strings.Repeat("b", 64),
+		StderrSHA:     strings.Repeat("c", 64),
+		StdoutExcerpt: "code=200 size=144 {\"ok\":true}",
+		StderrExcerpt: "",
+		Files:         json.RawMessage(`[{"path":"a.py","size":100},{"path":"b.py","size":200}]`),
+		Environment:   json.RawMessage(`{"image":"p3y-box"}`),
+	}
+	compact := formatCTFExecToolResult(e)
+	if strings.Contains(compact, "long_script.py") || strings.Contains(compact, "stdout_sha") || strings.Contains(compact, `"files":`) {
+		t.Fatalf("compact tool result should omit command/hashes/files array, got: %s", compact)
+	}
+	if !strings.Contains(compact, `"files_count":2`) || !strings.Contains(compact, `code=200 size=144`) {
+		t.Fatalf("compact tool result missing files_count or stdout, got: %s", compact)
+	}
+
+	// Even if a legacy verbose JSON payload is passed to Critic, summarizeCriticToolOutput must surface stdout.
+	verboseRaw, _ := json.Marshal(e)
+	summary := summarizeCriticToolOutput(verboseRaw, 300)
+	if !strings.Contains(summary, "code=200 size=144") {
+		t.Fatalf("Critic summary hid stdout behind verbose metadata: %s", summary)
+	}
+
+	// classifyCTFToolFailure must inspect both "stdout" and "stdout_excerpt".
+	if failed, _ := classifyCTFToolFailure("Bash", []byte(`{"exit_code":0,"stdout":"HTTP/1.1 502 Bad Gateway"}`), false); !failed {
+		t.Fatal("expected soft 502 in stdout field to be detected as failure")
+	}
+
+	// Pending critique must NOT block progress-recording tools (record_fact / board_record).
+	hooks := newCTFCriticHooks(nil, nil, nil, 0, 0, nil)
+	hooks.pendingCritique = "【Critic 反向证伪提醒 #1】test"
+	if block, _, _ := hooks.PreToolUse(t.Context(), "record_fact", []byte(`{}`)); block {
+		t.Fatal("record_fact must bypass pending critic block")
+	}
+	if block, _, _ := hooks.PreToolUse(t.Context(), "board_record", []byte(`{}`)); block {
+		t.Fatal("board_record must bypass pending critic block")
+	}
+}
