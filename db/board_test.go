@@ -3,6 +3,8 @@ package db
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -124,5 +126,76 @@ func TestBoardItemsKitsPrecheckAndTipsStore(t *testing.T) {
 	t.Cleanup(func() { _, _ = pg.Exec(`DELETE FROM board_kits WHERE id=$1`, preserved.ID) })
 	if preserved.TaskID != 0 || preserved.SourceTaskName != "exploit target" || !strings.Contains(preserved.Content, "recvuntil") {
 		t.Fatalf("unexpected preserved kit after task delete: %+v", preserved)
+	}
+}
+
+func TestSeedKitsFromFileIdempotent(t *testing.T) {
+	dsn, _, err := DSN()
+	if err != nil {
+		t.Skip("test database required")
+	}
+	pg, err := Open(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pg.Close()
+
+	ctx := context.Background()
+	testDir := t.TempDir()
+	seedPath := filepath.Join(testDir, "test-kits.json")
+
+	kits := []BoardKit{
+		{
+			Name:           "test_exp.py",
+			Path:           "/opt/ctf/kits/test_exp.py",
+			Summary:        "test exploit tool",
+			Content:        "import sys\nprint('pwned')\n",
+			SHA256:         "deadbeef",
+			Verified:       true,
+			SourceTaskName: "test task",
+		},
+	}
+	data, err := json.Marshal(kits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(seedPath, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := pg.SeedKitsFromFile(ctx, seedPath)
+	if err != nil {
+		t.Fatalf("first seed failed: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 kit inserted, got %d", n)
+	}
+	t.Cleanup(func() { _, _ = pg.Exec(`DELETE FROM board_kits WHERE name='test_exp.py' AND task_id IS NULL`) })
+
+	// Second seed should be idempotent
+	n2, err := pg.SeedKitsFromFile(ctx, seedPath)
+	if err != nil {
+		t.Fatalf("second seed failed: %v", err)
+	}
+	if n2 != 0 {
+		t.Fatalf("expected 0 kits inserted on rerun, got %d", n2)
+	}
+
+	allKits, err := pg.ListAllBoardKits(ctx, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, k := range allKits {
+		if k.Name == "test_exp.py" {
+			found = true
+			if k.TaskID != 0 || k.SourceTaskName != "test task" || !strings.Contains(k.Content, "pwned") {
+				t.Fatalf("unexpected kit contents: %+v", k)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected test_exp.py to be in ListAllBoardKits")
 	}
 }

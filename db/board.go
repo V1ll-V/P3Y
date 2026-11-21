@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 )
@@ -387,6 +388,82 @@ func (d *DB) BackfillBoardKitSnapshot(ctx context.Context, kitID int64, sha256, 
 		WHERE id = $1
 	`, kitID, strings.TrimSpace(sha256), utf8Clean(content), utf8Clean(strings.TrimSpace(sourceTaskName)))
 	return err
+}
+
+// SeedKitsFromFile idempotently imports BoardKit entries from a JSON array file (e.g. bundled
+// local arsenal /app/kits-seed.json in hosted benchmark images), deduplicating by kit name for
+// unassigned/system kits (task_id IS NULL).
+func (d *DB) SeedKitsFromFile(ctx context.Context, path string) (int, error) {
+	if d == nil {
+		return 0, nil
+	}
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return 0, nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" {
+		return 0, nil
+	}
+	var kits []BoardKit
+	if err := json.Unmarshal([]byte(trimmed), &kits); err != nil {
+		return 0, fmt.Errorf("parse kits seed %s: %w", path, err)
+	}
+	if len(kits) == 0 {
+		return 0, nil
+	}
+	existing := map[string]int64{}
+	rows, err := d.QueryContext(ctx, `SELECT id, LOWER(TRIM(name)) FROM board_kits WHERE task_id IS NULL`)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var name string
+		if rows.Scan(&id, &name) == nil && name != "" {
+			existing[name] = id
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	inserted := 0
+	for _, k := range kits {
+		key := strings.ToLower(strings.TrimSpace(k.Name))
+		if key == "" {
+			continue
+		}
+		if existingID, ok := existing[key]; ok {
+			if k.Content != "" || k.SHA256 != "" || k.SourceTaskName != "" {
+				_ = d.BackfillBoardKitSnapshot(ctx, existingID, k.SHA256, k.Content, k.SourceTaskName)
+			}
+			continue
+		}
+		meta := normalizeJSONObject(k.Meta)
+		srcName := utf8Clean(strings.TrimSpace(k.SourceTaskName))
+		if srcName == "" {
+			srcName = "built-in kit"
+		}
+		_, err := d.ExecContext(ctx, `
+			INSERT INTO board_kits (task_id, source_task_name, name, path, summary, content, sha256, verified, meta_json)
+			VALUES (NULL, $1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+		`, srcName, strings.TrimSpace(k.Name), strings.TrimSpace(k.Path), strings.TrimSpace(k.Summary),
+			utf8Clean(k.Content), strings.TrimSpace(k.SHA256), k.Verified, string(meta))
+		if err != nil {
+			return inserted, err
+		}
+		existing[key] = 1
+		inserted++
+	}
+	return inserted, nil
 }
 
 func scanBoardKits(rows *sql.Rows) ([]BoardKit, error) {
