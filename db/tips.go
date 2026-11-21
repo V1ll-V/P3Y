@@ -323,7 +323,7 @@ func (d *DB) SeedDefaultTips(ctx context.Context) error {
 			Category: "web",
 			Tags:     []string{"web", "http", "ssti", "php", "python", "sql"},
 			Title:    "Web 探测留痕与 WAF 字符集差分",
-			Pitfall:  "盲目目录扫描噪音大且易触发限流；优先用 http_send/ctf_http 测单点回显并利用 traffic_search 回看响应细节，遇到过滤时先验证最小可用字符集。",
+			Pitfall:  "盲目目录扫描噪音大且易触发限流；优先用 ctf_http 测单点回显并利用 traffic_search 回看响应细节，遇到过滤时先验证最小可用字符集。",
 		},
 		{
 			Category: "misc",

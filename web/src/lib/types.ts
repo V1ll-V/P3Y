@@ -1842,10 +1842,12 @@ export interface BoardItem {
 export interface BoardKit {
   id: number;
   task_id: number;
+  source_task_name?: string;
   savepoint_id?: number;
   name: string;
   path: string;
   summary: string;
+  content?: string;
   sha256?: string;
   verified: boolean;
   meta_json?: Record<string, unknown>;

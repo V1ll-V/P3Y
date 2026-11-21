@@ -35,17 +35,21 @@ type BoardItem struct {
 
 // BoardKit represents a verified reusable workspace artifact (e.g. interact.py,
 // symbols.json, stage1_leak.py, exp.py) anchored to a task / savepoint.
+// When its originating task is deleted, TaskID becomes 0 while Content and
+// SourceTaskName remain preserved in the global kit library.
 type BoardKit struct {
-	ID          int64           `json:"id"`
-	TaskID      int64           `json:"task_id"`
-	SavepointID *int64          `json:"savepoint_id,omitempty"`
-	Name        string          `json:"name"`
-	Path        string          `json:"path"`
-	Summary     string          `json:"summary"`
-	SHA256      string          `json:"sha256,omitempty"`
-	Verified    bool            `json:"verified"`
-	Meta        json.RawMessage `json:"meta_json,omitempty"`
-	CreatedAt   time.Time       `json:"created_at"`
+	ID             int64           `json:"id"`
+	TaskID         int64           `json:"task_id"`
+	SourceTaskName string          `json:"source_task_name,omitempty"`
+	SavepointID    *int64          `json:"savepoint_id,omitempty"`
+	Name           string          `json:"name"`
+	Path           string          `json:"path"`
+	Summary        string          `json:"summary"`
+	Content        string          `json:"content,omitempty"`
+	SHA256         string          `json:"sha256,omitempty"`
+	Verified       bool            `json:"verified"`
+	Meta           json.RawMessage `json:"meta_json,omitempty"`
+	CreatedAt      time.Time       `json:"created_at"`
 }
 
 func validBoardKind(kind string) bool {
@@ -323,6 +327,8 @@ func (d *DB) UpsertBoardKit(ctx context.Context, kit BoardKit) (*BoardKit, error
 	kit.Name = strings.TrimSpace(kit.Name)
 	kit.Path = strings.TrimSpace(kit.Path)
 	kit.Summary = strings.TrimSpace(kit.Summary)
+	kit.Content = utf8Clean(kit.Content)
+	kit.SourceTaskName = utf8Clean(strings.TrimSpace(kit.SourceTaskName))
 	if kit.Name == "" {
 		return nil, fmt.Errorf("kit name is required")
 	}
@@ -338,18 +344,24 @@ func (d *DB) UpsertBoardKit(ctx context.Context, kit BoardKit) (*BoardKit, error
 	var outSP sql.NullInt64
 	var outMeta string
 	err := d.QueryRowContext(ctx, `
-		INSERT INTO board_kits (task_id, savepoint_id, name, path, summary, sha256, verified, meta_json)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+		INSERT INTO board_kits (task_id, source_task_name, savepoint_id, name, path, summary, content, sha256, verified, meta_json)
+		VALUES (
+			$1,
+			COALESCE(NULLIF($2, ''), (SELECT COALESCE(NULLIF(name, ''), LEFT(goal, 80)) FROM tasks WHERE id=$1), ''),
+			$3, $4, $5, $6, $7, $8, $9, $10::jsonb
+		)
 		ON CONFLICT (task_id, name) DO UPDATE SET
-			savepoint_id = EXCLUDED.savepoint_id,
-			path         = EXCLUDED.path,
-			summary      = EXCLUDED.summary,
-			sha256       = EXCLUDED.sha256,
-			verified     = EXCLUDED.verified,
-			meta_json    = EXCLUDED.meta_json
-		RETURNING id, task_id, savepoint_id, name, path, summary, sha256, verified, meta_json::text, created_at
-	`, kit.TaskID, sp, kit.Name, kit.Path, kit.Summary, strings.TrimSpace(kit.SHA256), kit.Verified, string(meta),
-	).Scan(&out.ID, &out.TaskID, &outSP, &out.Name, &out.Path, &out.Summary, &out.SHA256, &out.Verified, &outMeta, &out.CreatedAt)
+			source_task_name = CASE WHEN EXCLUDED.source_task_name <> '' THEN EXCLUDED.source_task_name ELSE board_kits.source_task_name END,
+			savepoint_id     = EXCLUDED.savepoint_id,
+			path             = EXCLUDED.path,
+			summary          = EXCLUDED.summary,
+			content          = CASE WHEN EXCLUDED.content <> '' THEN EXCLUDED.content ELSE board_kits.content END,
+			sha256           = CASE WHEN EXCLUDED.sha256 <> '' THEN EXCLUDED.sha256 ELSE board_kits.sha256 END,
+			verified         = EXCLUDED.verified,
+			meta_json        = EXCLUDED.meta_json
+		RETURNING id, COALESCE(task_id, 0), source_task_name, savepoint_id, name, path, summary, content, sha256, verified, meta_json::text, created_at
+	`, kit.TaskID, kit.SourceTaskName, sp, kit.Name, kit.Path, kit.Summary, kit.Content, strings.TrimSpace(kit.SHA256), kit.Verified, string(meta),
+	).Scan(&out.ID, &out.TaskID, &out.SourceTaskName, &outSP, &out.Name, &out.Path, &out.Summary, &out.Content, &out.SHA256, &out.Verified, &outMeta, &out.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -361,25 +373,30 @@ func (d *DB) UpsertBoardKit(ctx context.Context, kit BoardKit) (*BoardKit, error
 	return &out, nil
 }
 
-// ListBoardKits lists all kits saved for taskID.
-func (d *DB) ListBoardKits(ctx context.Context, taskID int64) ([]BoardKit, error) {
-	if d == nil || taskID <= 0 {
-		return nil, nil
+// BackfillBoardKitSnapshot populates missing sha256, content, or source_task_name
+// on an existing kit row (used prior to task deletion so legacy kits stay reusable).
+func (d *DB) BackfillBoardKitSnapshot(ctx context.Context, kitID int64, sha256, content, sourceTaskName string) error {
+	if d == nil || kitID <= 0 {
+		return nil
 	}
-	rows, err := d.QueryContext(ctx, `
-		SELECT id, task_id, savepoint_id, name, path, summary, sha256, verified, meta_json::text, created_at
-		FROM board_kits WHERE task_id=$1 ORDER BY id ASC
-	`, taskID)
-	if err != nil {
-		return nil, err
-	}
+	_, err := d.ExecContext(ctx, `
+		UPDATE board_kits
+		SET sha256           = CASE WHEN sha256 = '' AND $2 <> '' THEN $2 ELSE sha256 END,
+		    content          = CASE WHEN content = '' AND $3 <> '' THEN $3 ELSE content END,
+		    source_task_name = CASE WHEN source_task_name = '' AND $4 <> '' THEN $4 ELSE source_task_name END
+		WHERE id = $1
+	`, kitID, strings.TrimSpace(sha256), utf8Clean(content), utf8Clean(strings.TrimSpace(sourceTaskName)))
+	return err
+}
+
+func scanBoardKits(rows *sql.Rows) ([]BoardKit, error) {
 	defer rows.Close()
 	var kits []BoardKit
 	for rows.Next() {
 		var k BoardKit
 		var sp sql.NullInt64
 		var meta string
-		if err := rows.Scan(&k.ID, &k.TaskID, &sp, &k.Name, &k.Path, &k.Summary, &k.SHA256, &k.Verified, &meta, &k.CreatedAt); err != nil {
+		if err := rows.Scan(&k.ID, &k.TaskID, &k.SourceTaskName, &sp, &k.Name, &k.Path, &k.Summary, &k.Content, &k.SHA256, &k.Verified, &meta, &k.CreatedAt); err != nil {
 			return nil, err
 		}
 		if sp.Valid {
@@ -392,7 +409,23 @@ func (d *DB) ListBoardKits(ctx context.Context, taskID int64) ([]BoardKit, error
 	return kits, rows.Err()
 }
 
-// ListAllBoardKits returns verified/recent kits across tasks (for the global Kits & Tips browser).
+// ListBoardKits lists all kits saved for taskID.
+func (d *DB) ListBoardKits(ctx context.Context, taskID int64) ([]BoardKit, error) {
+	if d == nil || taskID <= 0 {
+		return nil, nil
+	}
+	rows, err := d.QueryContext(ctx, `
+		SELECT id, COALESCE(task_id, 0), source_task_name, savepoint_id, name, path, summary, content, sha256, verified, meta_json::text, created_at
+		FROM board_kits WHERE task_id=$1 ORDER BY id ASC
+	`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	return scanBoardKits(rows)
+}
+
+// ListAllBoardKits returns verified/recent kits across tasks (including kits whose
+// originating task was deleted, for the global Kits & Tips browser).
 func (d *DB) ListAllBoardKits(ctx context.Context, limit int) ([]BoardKit, error) {
 	if d == nil {
 		return nil, nil
@@ -401,33 +434,17 @@ func (d *DB) ListAllBoardKits(ctx context.Context, limit int) ([]BoardKit, error
 		limit = 50
 	}
 	rows, err := d.QueryContext(ctx, `
-		SELECT id, task_id, savepoint_id, name, path, summary, sha256, verified, meta_json::text, created_at
+		SELECT id, COALESCE(task_id, 0), source_task_name, savepoint_id, name, path, summary, content, sha256, verified, meta_json::text, created_at
 		FROM board_kits ORDER BY id DESC LIMIT $1
 	`, limit)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var kits []BoardKit
-	for rows.Next() {
-		var k BoardKit
-		var sp sql.NullInt64
-		var meta string
-		if err := rows.Scan(&k.ID, &k.TaskID, &sp, &k.Name, &k.Path, &k.Summary, &k.SHA256, &k.Verified, &meta, &k.CreatedAt); err != nil {
-			return nil, err
-		}
-		if sp.Valid {
-			v := sp.Int64
-			k.SavepointID = &v
-		}
-		k.Meta = json.RawMessage(meta)
-		kits = append(kits, k)
-	}
-	return kits, rows.Err()
+	return scanBoardKits(rows)
 }
 
 // RenderBoardIndex builds a compact L1/L2 shared-board digest (omitting L3 Detail
-// bodies so prompt context stays lean; workers fetch L3 via board_read_detail).
+// bodies so prompt context stays lean).
 func (d *DB) RenderBoardIndex(ctx context.Context, taskID int64) string {
 	items, err := d.ListBoardItems(ctx, taskID, "")
 	kits, kerr := d.ListBoardKits(ctx, taskID)
@@ -435,7 +452,7 @@ func (d *DB) RenderBoardIndex(ctx context.Context, taskID int64) string {
 		return ""
 	}
 	var b strings.Builder
-	b.WriteString("\n【共享状态看板 Board（L1/L2 索引；详看请调 board_read_detail(item_id)）】\n")
+	b.WriteString("\n【共享状态看板 Board（Savepoint / Deadend / Kit 索引）】\n")
 	for _, it := range items {
 		badge := strings.ToUpper(it.Kind)
 		if it.Verified {

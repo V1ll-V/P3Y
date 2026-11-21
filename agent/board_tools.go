@@ -26,96 +26,6 @@ func ctfBoardTools(s *ctf.Service, pg *db.DB, task, intent int64) []actool.CoreT
 	}
 
 	return []actool.CoreTool{
-		readTool("board_read_detail", "按需读取共享状态看板节点的三层详尽内容（L3 detail、check_cmd、snapshot_id、meta_json）；item_id 为空时列出 L1/L2 索引。", obj(map[string]any{
-			"item_id": intp("要读取详情的看板节点 ID；留空则返回 L1/L2 轻量索引列表"),
-			"kind":    str("当 item_id 为空时按类型过滤：fact | step | savepoint | deadend"),
-		}), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
-			if pg == nil || task <= 0 {
-				return actool.Errorf("需要任务与数据库上下文"), nil
-			}
-			var a map[string]json.RawMessage
-			_ = json.Unmarshal(in, &a)
-			if id := int64Val(a, "item_id"); id > 0 {
-				item, err := pg.GetBoardItem(ctx, task, id)
-				if err != nil {
-					return actool.Errorf(err.Error()), nil
-				}
-				if item == nil {
-					return actool.Errorf(fmt.Sprintf("看板节点 #%d 不存在", id)), nil
-				}
-				b, _ := json.Marshal(item)
-				return actool.Text(string(b)), nil
-			}
-			items, err := pg.ListBoardItems(ctx, task, strVal(a, "kind"))
-			if err != nil {
-				return actool.Errorf(err.Error()), nil
-			}
-			// Progressive disclosure: strip L3 detail on list view.
-			type indexRow struct {
-				ID         int64  `json:"id"`
-				ParentID   *int64 `json:"parent_id,omitempty"`
-				Kind       string `json:"kind"`
-				Title      string `json:"title"`
-				Summary    string `json:"summary"`
-				SnapshotID string `json:"snapshot_id,omitempty"`
-				Verified   bool   `json:"verified"`
-				HasDetail  bool   `json:"has_detail"`
-			}
-			rows := make([]indexRow, 0, len(items))
-			for _, it := range items {
-				rows = append(rows, indexRow{
-					ID:         it.ID,
-					ParentID:   it.ParentID,
-					Kind:       it.Kind,
-					Title:      it.Title,
-					Summary:    it.Summary,
-					SnapshotID: it.SnapshotID,
-					Verified:   it.Verified,
-					HasDetail:  strings.TrimSpace(it.Detail) != "",
-				})
-			}
-			b, _ := json.Marshal(rows)
-			return actool.Text(string(b)), nil
-		}),
-
-		writeTool("board_record", "向共享状态看板写入三层结构化事实或短冲刺步骤（Title L1 / Summary L2 / Detail L3）。", obj(map[string]any{
-			"kind":      str("节点类型：fact（客观发现）或 step（短冲刺步骤），默认 fact"),
-			"title":     str("L1 一行标题（如 'libc 2.31 基址泄露'）"),
-			"summary":   str("L2 简短摘要（控制在 1~2 句话）"),
-			"detail":    str("L3 完整技术细节、寄存器/偏移/脚本输出（按需通过 board_read_detail 加载）"),
-			"parent_id": intp("可选父节点 ID（例如挂在某个 Savepoint 下）"),
-		}, "title", "summary"), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
-			if pg == nil || task <= 0 {
-				return actool.Errorf("需要任务与数据库上下文"), nil
-			}
-			var a map[string]json.RawMessage
-			_ = json.Unmarshal(in, &a)
-			kind := strVal(a, "kind")
-			if kind == "" {
-				kind = db.BoardKindFact
-			}
-			if kind != db.BoardKindFact && kind != db.BoardKindStep {
-				return actool.Errorf("board_record 仅支持 fact 或 step（存档请用 board_mark_savepoint）"), nil
-			}
-			var parentPtr *int64
-			if pid := int64Val(a, "parent_id"); pid > 0 {
-				parentPtr = &pid
-			}
-			item, err := pg.AddBoardItem(ctx, db.BoardItem{
-				TaskID:   task,
-				ParentID: parentPtr,
-				Kind:     kind,
-				Title:    strVal(a, "title"),
-				Summary:  strVal(a, "summary"),
-				Detail:   strVal(a, "detail"),
-			})
-			if err != nil {
-				return actool.Errorf(err.Error()), nil
-			}
-			b, _ := json.Marshal(item)
-			return actool.Text(string(b)), nil
-		}),
-
 		writeTool("board_mark_savepoint", "通过 0-LLM Check 确定性验真后，冻结当前容器 /work 工作区快照并创建里程碑存档点 Savepoint。", obj(map[string]any{
 			"title":       str("L1 存档点名称（如 'stage1_leak_verified'）"),
 			"summary":     str("L2 当前阶段已验证成果说明"),
@@ -276,9 +186,9 @@ func ctfBoardTools(s *ctf.Service, pg *db.DB, task, intent int64) []actool.CoreT
 				}
 				verified = true
 			}
-			sha := ""
+			sha, content := "", ""
 			if s != nil {
-				sha = s.ComputeWorkspaceFileSHA256(ctx, task, intent, kitPath)
+				sha, content = s.ReadWorkspaceFileSnapshot(ctx, task, intent, kitPath, 128*1024)
 			}
 			metaBytes, _ := json.Marshal(meta)
 			var spPtr *int64
@@ -291,6 +201,7 @@ func ctfBoardTools(s *ctf.Service, pg *db.DB, task, intent int64) []actool.CoreT
 				Name:        name,
 				Path:        kitPath,
 				Summary:     strVal(a, "summary"),
+				Content:     content,
 				SHA256:      sha,
 				Verified:    verified,
 				Meta:        metaBytes,

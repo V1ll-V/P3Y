@@ -397,8 +397,8 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// then augment with the agent's visible skills/MCP. During the SDK settlement
 	// phase, Bash is hidden via Settlement.DisabledTools (no local gating needed).
 	base := append(tsx.WorkerTools(), w.extraTools...)
-	// worker 刻意不给 MultiEdit/Glob/Grep：文件精改用 Edit、检索走 Bash(grep/find)，
-	// 收敛工具面、减少低价值调用。其余 SDK 默认工具(Read/Write/Edit/LS/Bash/Sleep)照常。
+	// 非 CTF 模式不给 MultiEdit/Glob/Grep（文件精改用 Edit、检索走 Bash）；
+	// CTF 模式由后续 ctfBase 统一替换为容器沙箱版工具（含容器内 Glob/Grep）。
 	base = append(base, defaultToolsExcept("MultiEdit", "Glob", "Grep")...)
 	runDir := ensureRunDir(w.workDir, taskID, intent.ID)
 	intentID := intent.ID
@@ -492,8 +492,8 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		UnlockSet:       def.Unlock,
 		PermissionMode:  permission.ModeBypass,
 		// WebFetch 走记录代理，其 HTTP 与 curl 一样被留痕；载入代理 CA 让经 MITM
-		// 重签的 HTTPS 证书能【正常校验通过】（而非关掉校验）。proxy 空则直连。
-		EnableWebFetch: true,
+		// 重签的 HTTPS 证书能【正常校验通过】（而非关掉校验）。CTF 模式改用 ctf_http，避免工具面重复。
+		EnableWebFetch: !ctfMode,
 		WebFetchProxy:  w.proxyAddr,
 		WebFetchCACert: w.proxyCACert,
 		// 联网搜索(可选)。ddgs 无需 key；brave-free 需 BraveKey；tavily 需 TavilyKey。

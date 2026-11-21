@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"p3y/artifacts"
+	"p3y/db"
 )
 
 func TestTaskArtifactHTTPCreateBindDownloadAndRestart(t *testing.T) {
@@ -116,5 +117,45 @@ func TestTaskArtifactHTTPCreateBindDownloadAndRestart(t *testing.T) {
 	s.Handler().ServeHTTP(w, r)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated download: %d", w.Code)
+	}
+}
+
+func TestTaskInputsDeletedAndListReadOnlyCheck(t *testing.T) {
+	root := t.TempDir()
+	m, err := NewManager(root, "")
+	if err != nil {
+		t.Skipf("postgres unavailable: %v", err)
+	}
+	defer m.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	s := New(ctx, m, t.TempDir(), t.TempDir(), t.TempDir())
+
+	created, err := m.CreateTaskWithOptions("list-fast-check", "goal", db.TaskCreateOptions{
+		Mode:              "ctf",
+		ChallengeType:     "web",
+		AttachmentBatchID: "00000000-0000-4000-8000-000000000001",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tid, _ := strconv.ParseInt(created.ID, 10, 64)
+	defer m.pg.DeleteTask(tid)
+
+	// Non-terminal task missing its attachment batch still surfaces block reason cleanly.
+	if reason := s.taskInputsListBlockReason(created, "created"); reason == "" {
+		t.Fatal("expected non-terminal task with missing batch to report blocked reason")
+	}
+	// Terminal task skips attachment/DB checks completely.
+	if reason := s.taskInputsListBlockReason(created, "done"); reason != "" {
+		t.Fatalf("expected terminal task to skip input check, got %q", reason)
+	}
+
+	// Deleted task in PG must return error from taskInputsError without panicking.
+	if err := m.pg.DeleteTask(tid); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.taskInputsError(created); err == nil {
+		t.Fatal("expected deleted task to return error from taskInputsError")
 	}
 }

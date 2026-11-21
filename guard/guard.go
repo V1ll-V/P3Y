@@ -87,9 +87,19 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 	if !g.interceptor.IsToolEnabled(ev.ToolName) {
 		return hook.Result{}
 	}
+	sandboxMode := intercept.SandboxModeFromContext(ctx)
+	if sandboxMode == "ctf" {
+		switch ev.ToolName {
+		case "Write", "Edit", "MultiEdit":
+			return hook.Result{}
+		}
+	}
 	ctx = intercept.WithCall(ctx, ev.ToolName, ev.Input)
-	dec, matched := g.interceptor.Match(ev.ToolName, ev.Input)
+	dec, matched := g.interceptor.MatchForMode(sandboxMode, ev.ToolName, ev.Input)
 	if !matched {
+		if sandboxMode == "ctf" {
+			return hook.Result{}
+		}
 		// No rule matched. Ask the LLM fallback judge (if enabled); when it is off
 		// or unwired, keep current behavior and allow.
 		d, judged := g.interceptor.Judge(ctx, ev.ToolName, ev.Input)

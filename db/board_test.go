@@ -77,10 +77,11 @@ func TestBoardItemsKitsPrecheckAndTipsStore(t *testing.T) {
 		Name:        "interact.py",
 		Path:        "/work/interact.py",
 		Summary:     "menu helper v2",
+		Content:     "def menu(io):\n    return io.recvuntil(b'> ')\n",
 		SHA256:      "def",
 		Verified:    true,
 	})
-	if err != nil || kit2.ID != kit.ID || !kit2.Verified || kit2.Summary != "menu helper v2" {
+	if err != nil || kit2.ID != kit.ID || !kit2.Verified || kit2.Summary != "menu helper v2" || !strings.Contains(kit2.Content, "recvuntil") || kit2.SourceTaskName != "exploit target" {
 		t.Fatalf("kit upsert mismatch: first=%+v second=%+v err=%v", kit, kit2, err)
 	}
 
@@ -100,5 +101,28 @@ func TestBoardItemsKitsPrecheckAndTipsStore(t *testing.T) {
 	matched, err := pg.SearchTips(ctx, "pwn", []string{"amd64", "stack_alignment"}, 3)
 	if err != nil || len(matched) == 0 || !strings.Contains(matched[0].Title, "栈 16 字节对齐") {
 		t.Fatalf("unexpected tips recall: matched=%+v err=%v", matched, err)
+	}
+
+	// 6. Deleting the task must preserve board_kits (task_id=NULL -> TaskID=0, content & source_task_name kept).
+	if err := pg.DeleteTask(task.ID); err != nil {
+		t.Fatal(err)
+	}
+	allKits, err := pg.ListAllBoardKits(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var preserved *BoardKit
+	for i := range allKits {
+		if allKits[i].ID == kit2.ID {
+			preserved = &allKits[i]
+			break
+		}
+	}
+	if preserved == nil {
+		t.Fatalf("expected kit #%d to survive task deletion", kit2.ID)
+	}
+	t.Cleanup(func() { _, _ = pg.Exec(`DELETE FROM board_kits WHERE id=$1`, preserved.ID) })
+	if preserved.TaskID != 0 || preserved.SourceTaskName != "exploit target" || !strings.Contains(preserved.Content, "recvuntil") {
+		t.Fatalf("unexpected preserved kit after task delete: %+v", preserved)
 	}
 }

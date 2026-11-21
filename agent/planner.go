@@ -206,43 +206,95 @@ func renderTriggers(ts *db.ExplorationStore, evs []TriggerEvent) string {
 			b.WriteString(fmt.Sprintf("\n- 意图 #%d 由用户删除，意图内容是：%s、删除原因是：%s。该意图已删除（不再执行）；请据此重新规划。", ev.IntentID, sm, ev.Detail))
 		default: // "done"
 			b.WriteString(fmt.Sprintf("\n- 意图 #%d（%s）的 worker 结束，输出结论：%s", ev.IntentID, intentSummary(ts, ev.IntentID), workerOutput(ts, ev.IntentID)))
-			if fids := factIDsYielded(ts, ev.IntentID); fids != "" {
-				b.WriteString(fmt.Sprintf("；本意图新产生的事实 id：%s ", fids))
+			if factsBlock := renderFactsYielded(ts, ev.IntentID); factsBlock != "" {
+				b.WriteString(factsBlock)
 			}
 		}
 	}
-	b.WriteString("\n（完整细节可 node_detail / get_worker_output / list_findings 再查。）")
+	b.WriteString("\n（完整细节可按需再查 node_detail / get_worker_output / list_findings。）")
 	return b.String()
 }
 
-// factIDsYielded lists the fact ids an intent produced this run as "#12、#15", so the
-// planner can jump straight to the round's incremental facts. Empty (best-effort) when
-// the intent yielded no facts or the lookup fails.
-func factIDsYielded(ts *db.ExplorationStore, id int64) string {
+type yieldedFact struct {
+	ID      int64
+	Summary string
+}
+
+const (
+	maxInlineTriggerFacts = 5
+	maxInlineFactRunes    = 160
+)
+
+func singleLineTrunc(s string, maxRunes int) string {
+	s = strings.Join(strings.Fields(strings.TrimSpace(s)), " ")
+	r := []rune(s)
+	if maxRunes <= 0 || len(r) <= maxRunes {
+		return s
+	}
+	return string(r[:maxRunes]) + "…"
+}
+
+func formatYieldedFacts(facts []yieldedFact) string {
+	if len(facts) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	limit := min(len(facts), maxInlineTriggerFacts)
+	for i := 0; i < limit; i++ {
+		f := facts[i]
+		sum := singleLineTrunc(f.Summary, maxInlineFactRunes)
+		if sum == "" {
+			fmt.Fprintf(&b, "\n  · 事实 #%d", f.ID)
+		} else {
+			fmt.Fprintf(&b, "\n  · 事实 #%d：%s", f.ID, sum)
+		}
+	}
+	if len(facts) > maxInlineTriggerFacts {
+		rest := make([]string, 0, len(facts)-maxInlineTriggerFacts)
+		for _, f := range facts[maxInlineTriggerFacts:] {
+			rest = append(rest, fmt.Sprintf("#%d", f.ID))
+		}
+		fmt.Fprintf(&b, "\n  · 其余新事实 id：%s", strings.Join(rest, "、"))
+	}
+	return b.String()
+}
+
+// renderFactsYielded inlines up to 5 one-line summaries for facts yielded by an
+// intent (plus trailing IDs if more), saving Planner extra node_detail round-trips.
+func renderFactsYielded(ts *db.ExplorationStore, id int64) string {
 	ids, err := ts.FactsYielded(id)
 	if err != nil || len(ids) == 0 {
 		return ""
 	}
-	parts := make([]string, len(ids))
+	facts := make([]yieldedFact, 0, len(ids))
 	for i, fid := range ids {
-		parts[i] = fmt.Sprintf("#%d", fid)
+		sum := ""
+		if i < maxInlineTriggerFacts {
+			sum = storedNodeSummary(ts, fid, "")
+		}
+		facts = append(facts, yieldedFact{ID: fid, Summary: sum})
 	}
-	return strings.Join(parts, "、")
+	return formatYieldedFacts(facts)
+}
+
+// storedNodeSummary fetches a node and returns its summary via nodeSummary (best-effort).
+func storedNodeSummary(ts *db.ExplorationStore, id int64, fallback string) string {
+	if ts == nil {
+		return fallback
+	}
+	n, err := ts.GetNode(id)
+	if err != nil || n == nil {
+		return fallback
+	}
+	if s := strings.TrimSpace(nodeSummary(n)); s != "" {
+		return s
+	}
+	return fallback
 }
 
 // intentSummary reads an intent node's one-line summary (best-effort, "?" on miss).
 func intentSummary(ts *db.ExplorationStore, id int64) string {
-	n, err := ts.GetNode(id)
-	if err != nil || n == nil {
-		return "?"
-	}
-	var p map[string]any
-	if json.Unmarshal(n.Payload, &p) == nil {
-		if s, ok := p["summary"].(string); ok && s != "" {
-			return s
-		}
-	}
-	return "?"
+	return storedNodeSummary(ts, id, "?")
 }
 
 // workerOutput returns the finished worker's conclusion for an intent — the last
@@ -384,8 +436,8 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	if origin, _ := ts.OriginFactID(); origin > 0 {
 		tsx.SetOwnerNode(origin) // planner-side anchors default to the task root (origin fact)
 	}
-	// 领域工具 + 基础默认工具集（Read/Write/Edit/MultiEdit/LS/Glob/Grep/Bash）
-	base := append(tsx.PlannerTools(), actool.DefaultTools()...)
+	// 领域工具 + 基础默认工具集（过滤掉 sleep，事件驱动 Planner 禁止轮询等待）
+	base := append(tsx.PlannerTools(), defaultToolsExcept("sleep")...)
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts)})
 	ctx, base = ctfBaseForPlanner(ctx, ts, base)
 	tools, def, cleanup := AugmentTools(ctx, "planner", base)

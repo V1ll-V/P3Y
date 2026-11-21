@@ -659,10 +659,25 @@ func (bm *BenchmarkManager) handleDeleteSession(w http.ResponseWriter, r *http.R
 	}
 	bm.stopSession(id, "stopped", "删除测评会话")
 	taskIDs, _ := bm.s.m.pg.ListBenchmarkChallengeTaskIDs(r.Context(), id)
+	deletedTasks := 0
+	failedTasks := 0
 	for _, tid := range taskIDs {
 		tidStr := strconv.FormatInt(tid, 10)
-		bm.s.engine.StopTask(tidStr)
-		_, _ = bm.s.m.DeleteTask(tidStr, DeleteTaskOptions{})
+		_, statusCode, delErr := bm.s.deleteTaskInternal(r.Context(), tidStr, DeleteTaskOptions{
+			DeleteFiles:      true,
+			DeleteLLMRecords: true,
+		})
+		if delErr != nil {
+			if statusCode == http.StatusOK {
+				deletedTasks++
+				log.Printf("[BENCH] delete session #%d task #%d partial cleanup warning: %v", id, tid, delErr)
+			} else {
+				failedTasks++
+				log.Printf("[BENCH] delete session #%d task #%d failed (%d): %v", id, tid, statusCode, delErr)
+			}
+			continue
+		}
+		deletedTasks++
 	}
 	bm.mu.Lock()
 	delete(bm.runs, id)
@@ -671,7 +686,12 @@ func (bm *BenchmarkManager) handleDeleteSession(w http.ResponseWriter, r *http.R
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"deleted": true, "id": id})
+	writeJSON(w, 200, map[string]any{
+		"deleted":       true,
+		"id":            id,
+		"deleted_tasks": deletedTasks,
+		"failed_tasks":  failedTasks,
+	})
 }
 
 func (bm *BenchmarkManager) handleExportSession(w http.ResponseWriter, r *http.Request) {
@@ -767,6 +787,17 @@ func (bm *BenchmarkManager) startSession(sessionID int64) error {
 	return nil
 }
 
+func isRemoteSessionTerminatedError(err error) bool {
+	var se *benchmark.StructuredError
+	if !errors.As(err, &se) {
+		return false
+	}
+	if se.HTTPStatus == 401 || se.Code == "ENDED" || se.Code == "EXPIRED" {
+		return true
+	}
+	return se.HTTPStatus == 409 && strings.Contains(strings.ToLower(se.Message), "already finished")
+}
+
 func (bm *BenchmarkManager) stopSession(sessionID int64, terminalStatus, reason string) {
 	bm.mu.Lock()
 	rt := bm.runs[sessionID]
@@ -842,6 +873,11 @@ func (bm *BenchmarkManager) runSessionLoop(ctx context.Context, sessionID int64,
 	}
 	_ = bm.s.m.pg.ClearBenchmarkTransientErrors(ctx, sessionID)
 	if _, serr := bm.syncChallenges(ctx, sess); serr != nil {
+		if isRemoteSessionTerminatedError(serr) {
+			_ = bm.s.m.pg.UpdateBenchmarkSessionStatus(context.Background(), sessionID, "expired", serr.Error())
+			_ = bm.s.m.pg.AppendBenchmarkEvent(context.Background(), sessionID, "", "session_expired", serr.Error(), nil)
+			return
+		}
 		_ = bm.s.m.pg.UpdateBenchmarkSessionStatus(context.Background(), sessionID, "failed", serr.Error())
 		_ = bm.s.m.pg.AppendBenchmarkEvent(context.Background(), sessionID, "", "error", "同步题目列表失败："+serr.Error(), nil)
 		return
@@ -860,8 +896,7 @@ func (bm *BenchmarkManager) runSessionLoop(ctx context.Context, sessionID int64,
 			if ctx.Err() != nil {
 				return
 			}
-			var se *benchmark.StructuredError
-			if errors.As(err, &se) && (se.HTTPStatus == 401 || se.Code == "ENDED" || se.Code == "EXPIRED") {
+			if isRemoteSessionTerminatedError(err) {
 				_ = bm.s.m.pg.UpdateBenchmarkSessionStatus(context.Background(), sessionID, "expired", err.Error())
 				_ = bm.s.m.pg.AppendBenchmarkEvent(context.Background(), sessionID, "", "session_expired", err.Error(), nil)
 				return

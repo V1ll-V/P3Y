@@ -1052,7 +1052,7 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 	if phase != "" {
 		payload["phase"] = phase
 	}
-	if t.ts != nil && phase == "exploit" {
+	if t.ts != nil {
 		if mode, challenge, _, err := t.ts.TaskInputMetadata(); err == nil && db.IsSandboxTaskMode(mode) {
 			ch := strings.ToLower(strings.TrimSpace(challenge))
 			if ch == "pwn" || ch == "reverse" {
@@ -1062,7 +1062,7 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 						continue
 					}
 					if strings.EqualFold(intentPhase(en), "exploit") {
-						return 0, fmt.Errorf("当前 %s 任务已存在处于 %s 状态的 phase=\"exploit\" 主攻意图 #%d，严禁在 Pwn/Reverse 中并跑多条 exploit 主线。请等待或查看该意图执行情况（暂停中可通知/继续，或在明确停止后再续派），切勿重复派发", ch, en.State, en.ID)
+						return 0, fmt.Errorf("当前 %s 任务已存在处于 %s 状态的 phase=\"exploit\" 主攻意图 #%d，严禁在主攻活跃期间另开任何并行或辅助意图（包括空 phase）。请用 steer_work(#%d) 纠偏、等待或让当前主攻手内部调用 ask_helper 处理脏活，切勿抢跑派发", ch, en.State, en.ID, en.ID)
 					}
 				}
 			}

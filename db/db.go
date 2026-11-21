@@ -307,6 +307,9 @@ ON CONFLICT (name) DO NOTHING`,
 	if err := d.seedDefaultInterceptRulesV4(); err != nil {
 		return fmt.Errorf("seed intercept rules v4: %w", err)
 	}
+	if err := d.seedDefaultInterceptRulesV5(); err != nil {
+		return fmt.Errorf("seed intercept rules v5: %w", err)
+	}
 	// V1 历史过渡:升级前已存在的 finding 标 legacy 来源,已判误报的转为可追溯的
 	// 人工否定。由 settings 守卫只跑一次(不能放进幂等的 schema.sql)。
 	if err := d.migrateLegacyFindingVerdicts(); err != nil {
@@ -653,8 +656,9 @@ const (
 	// shutdownRebootPattern matches shell-level shutdown/reboot/halt/poweroff/init commands
 	// while avoiding false positives on code tokens such as Python/C sock.shutdown(socket.SHUT_WR)
 	// or variable assignments like halt = True inside heredoc scripts.
-	shutdownRebootPattern   = `(?:^|["';&|]\s*|\\n\s*|\bsudo\s+)(?:/s?bin/)?(?:shutdown\s+(?:-[hHrPkcfF]+|now|\+\d+|\d{1,2}:\d{2})|(?:reboot|halt|poweroff)(?:\s+-[fpnwdhf]+|\s*(?:["';&|]|\\n|$))|init\s+[06](?:["';&|\s]|\\n|$))`
-	destructiveShellPattern = `(?i)(?:\b(?:rm\s+-rf\s+/|mkfs|dd\s+if=)|:\(\)\s*\{|>\s*/dev/sd|` + shutdownRebootPattern + `)`
+	shutdownRebootPattern         = `(?:^|["';&|]\s*|\\n\s*|\bsudo\s+)(?:/s?bin/)?(?:shutdown\s+(?:-[hHrPkcfF]+|now|\+\d+|\d{1,2}:\d{2})|(?:reboot|halt|poweroff)(?:\s+-[fpnwdhf]+|\s*(?:["';&|]|\\n|$))|init\s+[06](?:["';&|\s]|\\n|$))`
+	legacyDestructiveShellPatternV4 = `(?i)(?:\b(?:rm\s+-rf\s+/|mkfs|dd\s+if=)|:\(\)\s*\{|>\s*/dev/sd|` + shutdownRebootPattern + `)`
+	destructiveShellPattern       = `(?i)(?:\b(?:rm\s+-rf\s+/\*?(?:["'\s;&|]|$)|mkfs|dd\b[^|\n]{0,100}\bof=\s*/dev/[a-zA-Z])|:\(\)\s*\{|>\s*/dev/sd|` + shutdownRebootPattern + `)`
 )
 
 // seedDefaultInterceptRulesV4 refines the built-in shutdown/reboot patterns so legitimate
@@ -669,8 +673,22 @@ func (d *DB) seedDefaultInterceptRulesV4() error {
 		return fmt.Errorf("update shutdown rule: %w", err)
 	}
 	if _, err := d.Exec(`UPDATE intercept_rules SET pattern=$1 WHERE name=$2 AND pattern=$3`,
-		destructiveShellPattern, "[内置] 破坏性系统命令", legacyDestructiveShellPattern); err != nil {
+		legacyDestructiveShellPatternV4, "[内置] 破坏性系统命令", legacyDestructiveShellPattern); err != nil {
 		return fmt.Errorf("update destructive shell rule: %w", err)
 	}
 	return d.SetSetting("intercept_default_rules_v4", "done")
+}
+
+// seedDefaultInterceptRulesV5 narrows the destructive-shell built-in rule so dd extractions
+// of regular files/images (e.g. dd if=bzImage ... > out/vmlinux) and rm -rf /tmp/subdir
+// are not misclassified as wiping block devices or root /.
+func (d *DB) seedDefaultInterceptRulesV5() error {
+	if v, _, _ := d.GetSetting("intercept_default_rules_v5"); v == "done" {
+		return nil
+	}
+	if _, err := d.Exec(`UPDATE intercept_rules SET pattern=$1 WHERE name=$2 AND pattern IN ($3, $4)`,
+		destructiveShellPattern, "[内置] 破坏性系统命令", legacyDestructiveShellPatternV4, legacyDestructiveShellPattern); err != nil {
+		return fmt.Errorf("update destructive shell rule v5: %w", err)
+	}
+	return d.SetSetting("intercept_default_rules_v5", "done")
 }

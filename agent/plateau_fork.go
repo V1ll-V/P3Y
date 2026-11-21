@@ -291,7 +291,7 @@ func (w *Worker) runCTFPlateauFork(ctx context.Context, as *db.AssetStore, ts *d
 				DeferredTools:   def.Deferred,
 				UnlockSet:       def.Unlock,
 				PermissionMode:  permission.ModeBypass,
-				EnableWebFetch:  true,
+				EnableWebFetch:  false,
 				WebFetchProxy:   w.proxyAddr,
 				WebFetchCACert:  w.proxyCACert,
 				BashEnv:         proxyEnv(w.proxyAddr, w.proxyCACert),

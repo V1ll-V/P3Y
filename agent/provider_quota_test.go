@@ -23,6 +23,7 @@ func TestIsQuotaExhaustedMessage(t *testing.T) {
 		`RESOURCE_EXHAUSTED`,
 		`You exceeded your current quota, please check your plan and billing details.`,
 		`billing_not_active`,
+		`{"type":"error","error":{"type":"billing_error","message":"insufficient balance"}}`,
 		`credit balance is too low`,
 		`账户余额不足，请充值`,
 	}

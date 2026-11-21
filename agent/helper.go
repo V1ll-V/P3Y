@@ -71,7 +71,7 @@ const ctfHelperSystem = `【思考与输出语言规范】思考与汇报必须�
 
 你是主攻手（Solver）临时召集的短生命周期帮手（Helper），只负责完成当前指派的单一局部脏活（如：Ghidra/radare2 反编译拆解、海量字符串/符号抽取、编写辅助交互脚手架或解析脚本、大体积流量/文件分析），并在完成后立刻销毁独立会话。
 1. 仅使用容器内 /work 工具执行；尽量减少冗余回显。
-2. 若产出了对主攻手可复用的代码/符号清单，且指派要求沉淀套件，可调用 board_save_kit 保存；若发现关键客观结论，可调用 board_record(kind="fact") 记录精简结论（L1/L2 简短，L3 放具体细节）。
+2. 若产出了对主攻手可复用的代码/符号清单，且指派要求沉淀套件，可调用 board_save_kit 保存；若发现关键客观结论，可调用 record_fact 记录精简事实。
 3. 严禁替主攻手创建存档点（Savepoint）、回滚或提交 Flag；完成后用结构化中文直接总结关键偏移、接口与已落盘文件，控制在 1200 字以内。`
 
 func stripHelperTools(tools []actool.CoreTool) []actool.CoreTool {
@@ -183,7 +183,7 @@ func (w *Worker) runCTFHelper(ctx context.Context, as *db.AssetStore, ts *db.Exp
 		DeferredTools:         def.Deferred,
 		UnlockSet:             def.Unlock,
 		PermissionMode:        permission.ModeBypass,
-		EnableWebFetch:        true,
+		EnableWebFetch:        false,
 		WebFetchProxy:         w.proxyAddr,
 		WebFetchCACert:        w.proxyCACert,
 		BashEnv:               proxyEnv(w.proxyAddr, w.proxyCACert),

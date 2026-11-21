@@ -133,6 +133,8 @@ export default function KitsAndTipsPage() {
         k.name.toLowerCase().includes(q) ||
         k.path.toLowerCase().includes(q) ||
         k.summary.toLowerCase().includes(q) ||
+        (k.source_task_name ?? "").toLowerCase().includes(q) ||
+        (k.content ?? "").toLowerCase().includes(q) ||
         String(k.task_id).includes(q),
     );
   }, [kits, q]);
@@ -394,13 +396,38 @@ export default function KitsAndTipsPage() {
                     </Button>
                   </div>
                 </CardHeader>
-                <CardContent className="flex flex-col gap-2 text-sm">
+                <CardContent className="flex flex-col gap-2.5 text-sm">
                   <p className="text-foreground/90">{kit.summary || "—"}</p>
+                  {kit.content && (
+                    <div className="relative rounded-md border bg-muted/40 p-2.5">
+                      <pre className="max-h-56 overflow-auto pr-8 font-mono text-xs whitespace-pre-wrap break-all">
+                        {kit.content}
+                      </pre>
+                      <Button
+                        size="icon-xs"
+                        variant="ghost"
+                        className="absolute top-1.5 right-1.5"
+                        title="复制套件脚本内容"
+                        onClick={async () => {
+                          if (await copyText(kit.content ?? "")) toast.success("已复制套件代码");
+                        }}
+                      >
+                        <CopyIcon className="size-3.5" />
+                      </Button>
+                    </div>
+                  )}
                   <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
                     <div className="flex items-center gap-3">
-                      <Link href={`/function/tasks/detail?id=${kit.task_id}`} className="text-primary hover:underline">
-                        任务 #{kit.task_id}
-                      </Link>
+                      {kit.task_id > 0 ? (
+                        <Link href={`/function/tasks/detail?id=${kit.task_id}`} className="text-primary hover:underline">
+                          任务 #{kit.task_id}
+                          {kit.source_task_name ? ` · ${kit.source_task_name}` : ""}
+                        </Link>
+                      ) : (
+                        <span>
+                          已清理任务{kit.source_task_name ? ` · ${kit.source_task_name}` : ""}
+                        </span>
+                      )}
                       {kit.savepoint_id && <span>Savepoint #{kit.savepoint_id}</span>}
                       {kit.sha256 && <span className="font-mono">sha256:{kit.sha256.slice(0, 12)}</span>}
                     </div>

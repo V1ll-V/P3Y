@@ -44,6 +44,7 @@ type ctfCriticHooks struct {
 	mu              sync.Mutex
 	failures        []criticFailureSample
 	stagnantSamples []criticFailureSample
+	stagnantWarned  bool
 	pendingCritique string
 	critiqueCount   int
 }
@@ -77,7 +78,7 @@ func newCTFCriticHooks(inner harness.HookRunner, prov llm.Provider, pg *db.DB, t
 		taskID:            taskID,
 		intentID:          intentID,
 		threshold:         3,
-		stagnantThreshold: 10,
+		stagnantThreshold: 20,
 		advisor:           advisor,
 		emit:              emit,
 	}
@@ -85,7 +86,7 @@ func newCTFCriticHooks(inner harness.HookRunner, prov llm.Provider, pg *db.DB, t
 
 func isCTFCriticMonitoredTool(name string) bool {
 	switch name {
-	case "Bash", "ctf_python", "ctf_gdb", "http_send", "ctf_http", "http_fuzz_diff", "http_race_probe",
+	case "Bash", "ctf_gdb", "ctf_http", "http_fuzz_diff", "http_race_probe",
 		"py_repl", "ctf_probe_target", "ctf_session_send", "board_mark_savepoint":
 		return true
 	default:
@@ -204,7 +205,7 @@ func (h *ctfCriticHooks) PreToolUse(ctx context.Context, name string, input []by
 	// Always allow pivot & progress-recording tools through without blocking;
 	// only consume pendingCritique when actually injecting it to block a blind retry.
 	allowPivot := name == "board_rewind" || name == "plateau_fork" || name == "diff_local_remote" ||
-		name == "record_fact" || name == "board_record" || name == "board_mark_savepoint"
+		name == "record_fact" || name == "board_mark_savepoint"
 	if allowPivot {
 		return false, "", nil
 	}
@@ -224,10 +225,12 @@ func (h *ctfCriticHooks) PostToolUse(ctx context.Context, name string, input, re
 	if h.inner != nil {
 		h.inner.PostToolUse(ctx, name, input, result, isErr)
 	}
-	if (name == "record_fact" || name == "board_record" || name == "board_mark_savepoint" ||
-		name == "board_rewind" || name == "plateau_fork") && !isErr {
+	if (name == "record_fact" || name == "board_mark_savepoint" ||
+		name == "board_rewind" || name == "plateau_fork" ||
+		name == "Write" || name == "Edit" || name == "ctf_submit_flag" || name == "ctf_submit_exploit_proof") && !isErr {
 		h.mu.Lock()
 		h.stagnantSamples = nil
+		h.stagnantWarned = false
 		if name == "board_rewind" || name == "plateau_fork" {
 			h.failures = nil
 			h.pendingCritique = ""
@@ -246,24 +249,33 @@ func (h *ctfCriticHooks) PostToolUse(ctx context.Context, name string, input, re
 	failed, reason := classifyCTFToolFailure(name, result, isErr)
 
 	var (
-		snapshot   []criticFailureSample
-		reasonKind string
+		snapshot       []criticFailureSample
+		reasonKind     string
+		softWarnSteps  int
 	)
 	h.mu.Lock()
 	h.stagnantSamples = append(h.stagnantSamples, sample)
 	if !failed {
 		h.failures = nil
 		if h.stagnantThreshold > 0 && len(h.stagnantSamples) >= h.stagnantThreshold {
-			start := max(0, len(h.stagnantSamples)-4)
-			snapshot = append([]criticFailureSample(nil), h.stagnantSamples[start:]...)
-			h.stagnantSamples = nil
-			h.critiqueCount++
-			reasonKind = "停滞无新线索产出"
+			if !h.stagnantWarned {
+				h.stagnantWarned = true
+				softWarnSteps = len(h.stagnantSamples)
+				h.stagnantSamples = nil
+			} else {
+				h.stagnantWarned = false
+				start := max(0, len(h.stagnantSamples)-4)
+				snapshot = append([]criticFailureSample(nil), h.stagnantSamples[start:]...)
+				h.stagnantSamples = nil
+				h.critiqueCount++
+				reasonKind = "停滞无新线索产出"
+			}
 		}
 	} else {
 		sample.Output = reason
 		h.failures = append(h.failures, sample)
 		if len(h.failures) >= h.threshold {
+			h.stagnantWarned = false
 			snapshot = append([]criticFailureSample(nil), h.failures...)
 			h.failures = nil
 			h.stagnantSamples = nil
@@ -273,6 +285,17 @@ func (h *ctfCriticHooks) PostToolUse(ctx context.Context, name string, input, re
 	}
 	roundNum := h.critiqueCount
 	h.mu.Unlock()
+
+	if softWarnSteps > 0 && len(snapshot) == 0 {
+		if h.emit != nil {
+			h.emit(db.Activity{
+				Worker:  "critic",
+				Kind:    "critic",
+				Summary: fmt.Sprintf("Critic 轻量提醒（已连续执行 %d 步未落盘或记录新事实，请确认方向有效）", softWarnSteps),
+			})
+		}
+		return
+	}
 
 	if len(snapshot) == 0 {
 		return

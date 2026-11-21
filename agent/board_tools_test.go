@@ -92,6 +92,9 @@ func TestBoardToolsSavepointRewindKitAndProgressiveDetail(t *testing.T) {
 	for _, tl := range ctfBoardTools(svc, pg, task.ID, 1) {
 		toolsMap[tl.Name()] = tl
 	}
+	if toolsMap["board_record"] != nil || toolsMap["board_read_detail"] != nil {
+		t.Fatal("board_record and board_read_detail must not be exposed after blackboard unification")
+	}
 
 	// 1. Failing Check rejects Savepoint creation!
 	checkPass = false
@@ -139,17 +142,13 @@ func TestBoardToolsSavepointRewindKitAndProgressiveDetail(t *testing.T) {
 		t.Fatalf("expected rewind_count=1, got %s", rwRes.Content[0].Text)
 	}
 
-	// 5. Progressive disclosure: list omits L3, item_id fetch includes L3
-	listRes, err := toolsMap["board_read_detail"].Call(t.Context(), json.RawMessage(`{}`), nil)
-	if err != nil || listRes.IsError {
-		t.Fatalf("board_read_detail list failed: %+v err=%v", listRes, err)
+	// 5. Progressive disclosure via DB store: RenderBoardIndex omits L3, GetBoardItem returns L3.
+	digest := pg.RenderBoardIndex(t.Context(), task.ID)
+	if !strings.Contains(digest, "stage1 leak") || !strings.Contains(digest, "[detail#") || strings.Contains(digest, "LONG_L3_DETAIL_XYZ") {
+		t.Fatalf("unexpected RenderBoardIndex progressive disclosure: %s", digest)
 	}
-	if strings.Contains(listRes.Content[0].Text, "LONG_L3_DETAIL_XYZ") {
-		t.Fatalf("L3 detail must not appear in index listing: %s", listRes.Content[0].Text)
-	}
-	detailIn, _ := json.Marshal(map[string]any{"item_id": sp.ID})
-	detRes, err := toolsMap["board_read_detail"].Call(t.Context(), detailIn, nil)
-	if err != nil || detRes.IsError || !strings.Contains(detRes.Content[0].Text, "LONG_L3_DETAIL_XYZ") {
-		t.Fatalf("expected L3 detail when item_id queried, got %+v err=%v", detRes, err)
+	stored, err := pg.GetBoardItem(t.Context(), task.ID, sp.ID)
+	if err != nil || stored == nil || !strings.Contains(stored.Detail, "LONG_L3_DETAIL_XYZ") {
+		t.Fatalf("expected L3 detail via pg.GetBoardItem, got %+v err=%v", stored, err)
 	}
 }

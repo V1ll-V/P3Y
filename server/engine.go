@@ -76,11 +76,30 @@ const (
 
 var errWorkControlConflict = errors.New("work control conflict")
 
-// retryableWorkerModelError excludes errors already handled by the task router.
-// In particular, a quota error after partial streaming advances the task cursor
-// for the next LLM call but must not replay this whole intent on the backup.
+// isNonRetryableAuthError identifies deterministic authentication/authorization
+// errors (401/403) that will never recover across short retries.
+func isNonRetryableAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"status 401", "status 403", "invalid_api_key", "authentication_error",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// retryableWorkerModelError excludes errors already handled by the task router,
+// as well as deterministic quota/billing or auth errors.
 func retryableWorkerModelError(reason harness.TerminalReason, err error) bool {
-	return reason == harness.ReasonModelError && !isTaskLLMRuntimeError(err)
+	return reason == harness.ReasonModelError &&
+		!isTaskLLMRuntimeError(err) &&
+		!isQuotaExhaustedError(err) &&
+		!isNonRetryableAuthError(err)
 }
 
 // Engine drives the event-driven exploration loop with real LLM agents
@@ -346,23 +365,28 @@ func (e *Engine) Resume(t *Task) {
 // it if a prior pause cancelled it.
 func (e *Engine) execContextFor(parent context.Context, taskID string) context.Context {
 	zeroTouch := false
+	mode := ""
 	if e.m != nil {
 		if t, ok := e.m.Task(taskID); ok && t != nil {
 			zeroTouch = t.ZeroTouch
+			mode = t.Mode
 		}
+	}
+	wrap := func(c context.Context) context.Context {
+		return intercept.WithSandboxMode(intercept.WithZeroTouch(c, zeroTouch), mode)
 	}
 	e.execMu.Lock()
 	defer e.execMu.Unlock()
 	if e.IsPaused(taskID) {
 		// never hand out a live context while paused (guards the claim→Execute race)
-		c, cancel := context.WithCancelCause(intercept.WithZeroTouch(parent, zeroTouch))
+		c, cancel := context.WithCancelCause(wrap(parent))
 		cancel(agent.AbortPausedRaceGuard)
 		return c
 	}
 	if c := e.execCtx[taskID]; c != nil && c.Err() == nil {
-		return intercept.WithZeroTouch(c, zeroTouch)
+		return wrap(c)
 	}
-	c, cancel := context.WithCancelCause(intercept.WithZeroTouch(parent, zeroTouch))
+	c, cancel := context.WithCancelCause(wrap(parent))
 	e.execCtx[taskID] = c
 	e.execCancel[taskID] = cancel
 	return c
@@ -514,6 +538,33 @@ func transitionIntentState(store *db.ExplorationStore, intentID int64, expected,
 		return fmt.Errorf("%w: 意图 %d 不再是 %s 状态", db.ErrIntentStateConflict, intentID, expected)
 	}
 	return nil
+}
+
+func isIntentTerminalState(state string) bool {
+	switch state {
+	case "done", "stopped", "exhausted", "blocked", "deleted":
+		return true
+	default:
+		return false
+	}
+}
+
+// transitionIntentToTerminal transitions a running intent to a terminal state
+// idempotently: if a concurrent shutdown/cancellation already settled the intent
+// into a terminal state, it returns nil instead of failing with ErrIntentStateConflict.
+func transitionIntentToTerminal(store *db.ExplorationStore, intentID int64, targetState string) error {
+	err := transitionIntentState(store, intentID, "running", targetState)
+	if !errors.Is(err, db.ErrIntentStateConflict) {
+		return err
+	}
+	node, getErr := store.GetNode(intentID)
+	if getErr != nil || node == nil {
+		return err
+	}
+	if isIntentTerminalState(node.State) {
+		return nil
+	}
+	return err
 }
 
 // SteerWork queues a mid-run course-correction for the work running intentID (the
@@ -852,6 +903,26 @@ func resetPlannerTimer(timer *time.Timer, d time.Duration) {
 	timer.Reset(d)
 }
 
+func shouldSkipHeartbeatForPausedIntents(store *db.ExplorationStore) bool {
+	if store == nil {
+		return false
+	}
+	intents, err := store.ListByKind(db.KindIntent, 200)
+	if err != nil {
+		return false
+	}
+	hasPaused := false
+	for _, it := range intents {
+		switch it.State {
+		case "open", "running":
+			return false
+		case "paused":
+			hasPaused = true
+		}
+	}
+	return hasPaused
+}
+
 func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 	interval := plannerHeartbeatInterval(t)
 	// 心跳定时器在 loop 入口臂 = 从任务 start 计时:即使是跳过首轮 planner 的 seed 任务
@@ -916,6 +987,10 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 				e.enterClosing(ctx, t, db.ClosingGoalSatisfied)
 			}
 			return // goalless 分支永不进入 planner.Plan
+		}
+		// 只有 paused 意图（无 open/running）时，跳过周期心跳规划，避免用户手工接管期间空唤醒 Planner。
+		if src == "heartbeat" && shouldSkipHeartbeatForPausedIntents(t.Store) {
+			return
 		}
 		if !e.beginTaskOperation(t.ID) {
 			return
@@ -1096,9 +1171,10 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	for attempt := 1; attempt <= maxRetries &&
 		retryableWorkerModelError(reason, err) &&
 		workCtx.Err() == nil && ectx.Err() == nil && !e.IsPaused(t.ID) && !e.isSettling(t.ID); attempt++ {
+		delay := min(retryBackoff*time.Duration(1<<(attempt-1)), 30*time.Second)
 		log.Printf("[worker %s] task %s 意图 #%d model_error 收场，%v 后重试 (%d/%d)",
-			name, t.ID, intent.ID, retryBackoff, attempt, maxRetries)
-		if sleepCtx(workCtx, retryBackoff) {
+			name, t.ID, intent.ID, delay, attempt, maxRetries)
+		if sleepCtx(workCtx, delay) {
 			break // 退避期间被取消（终止/暂停）→ 交给下方分支处理
 		}
 		e.BeginLLMCall(t.ID)
@@ -1169,7 +1245,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	if ectx.Err() != nil && e.isSettling(t.ID) {
 		reason, _ := e.closingSnapshot(t.ID)
 		finalState := intentFinalStateOnClosing(reason)
-		if err := transitionIntentState(t.Store, intent.ID, "running", finalState); err != nil {
+		if err := transitionIntentToTerminal(t.Store, intent.ID, finalState); err != nil {
 			log.Printf("[worker %s] task %s 意图 #%d 收尾状态落库失败: %v", name, t.ID, intent.ID, err)
 		}
 		log.Printf("[worker %s] task %s 意图 #%d 因任务收尾结束(%s)，写回 %s", name, t.ID, intent.ID, finalState, wrote)
@@ -1179,7 +1255,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	// 任务已判完成(done via 常规路径)→ 上面 cancelExec 取消了本 run。意图结果已无意义,
 	// 标 stopped(不是 blocked),别污染已完成任务的意图状态。
 	if ectx.Err() != nil && isTerminalStatus(e.m.TaskStatus(t.ID)) {
-		if err := transitionIntentState(t.Store, intent.ID, "running", "stopped"); err != nil {
+		if err := transitionIntentToTerminal(t.Store, intent.ID, "stopped"); err != nil {
 			log.Printf("[worker %s] task %s 意图 #%d 终态停止落库失败: %v", name, t.ID, intent.ID, err)
 		}
 		log.Printf("[worker %s] task %s 意图 #%d 因任务已完成而取消(stopped)", name, t.ID, intent.ID)
@@ -1188,7 +1264,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	}
 	// killed by the planner: mark stopped (don't write back results, don't auto-reclaim).
 	if killed {
-		if err := transitionIntentState(t.Store, intent.ID, "running", "stopped"); err != nil {
+		if err := transitionIntentToTerminal(t.Store, intent.ID, "stopped"); err != nil {
 			log.Printf("[worker %s] task %s 意图 #%d planner 停止落库失败: %v", name, t.ID, intent.ID, err)
 		}
 		log.Printf("[worker %s] task %s 意图 #%d 被终止(stopped)", name, t.ID, intent.ID)
@@ -1219,7 +1295,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		state = "exhausted"
 		log.Printf("[worker %s] intent %d 运行超时(exhausted)，收尾后写回 %s", name, intent.ID, wrote)
 	}
-	if state == "blocked" && isTaskLLMChainExhausted(err) {
+	if state == "blocked" && (isTaskLLMChainExhausted(err) || isQuotaExhaustedError(err)) {
 		_ = t.Store.SetIntentBlockedReason(intent.ID, db.IntentBlockedLLMQuota)
 	} else {
 		if stateErr := transitionIntentState(t.Store, intent.ID, "running", state); stateErr != nil {

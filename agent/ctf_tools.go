@@ -86,7 +86,7 @@ func ctfToolPackOf(name string) string {
 	switch name {
 	case "ctf_binary_info", "ctf_pwn_triage", "ctf_gdb", "ctf_decompile", "ctf_radare2", "diff_local_remote":
 		return ctfPackBinary
-	case "ctf_http", "http_send", "http_fuzz_diff", "http_race_probe":
+	case "ctf_http", "http_fuzz_diff", "http_race_probe":
 		return ctfPackWeb
 	case "ctf_pcap_analyze":
 		return ctfPackCryptoMisc
@@ -172,7 +172,7 @@ func stripCTFPlannerBase(base []actool.CoreTool) []actool.CoreTool {
 			continue
 		}
 		switch name {
-		case "Bash", "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "LS", "http_send",
+		case "Bash", "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "LS", "sleep", "graph_overview", "http_send",
 			"http_fuzz_diff", "http_race_probe", "diff_local_remote", "py_repl",
 			"ask_helper", "plateau_fork",
 			"board_mark_savepoint", "board_rewind", "board_save_kit",
@@ -209,7 +209,7 @@ func ctfBaseForPlanner(ctx context.Context, ts *db.ExplorationStore, base []acto
 	return context.WithValue(ctx, ctfRunKey{}, true), filtered
 }
 
-var ctfExecutionTools = []string{"Bash", "Write", "Edit", "Grep", "Glob", "ctf_http", "http_send", "http_fuzz_diff", "http_race_probe", "diff_local_remote", "py_repl", "ask_helper", "plateau_fork", "ctf_binary_info", "ctf_pwn_triage", "ctf_gdb", "ctf_python", "ctf_decompile", "ctf_radare2", "Read", "LS", "ctf_tools", "ctf_unlock_toolpack", "ctf_run_background", "ctf_job_status", "ctf_job_stop", "ctf_probe_target", "ctf_session_start", "ctf_session_send", "ctf_session_read", "ctf_session_close", "ctf_pcap_analyze", "board_mark_savepoint", "board_rewind", "board_save_kit"}
+var ctfExecutionTools = []string{"Bash", "Write", "Edit", "Grep", "Glob", "ctf_http", "http_fuzz_diff", "http_race_probe", "diff_local_remote", "py_repl", "ask_helper", "plateau_fork", "ctf_binary_info", "ctf_pwn_triage", "ctf_gdb", "ctf_decompile", "ctf_radare2", "Read", "LS", "ctf_tools", "ctf_unlock_toolpack", "ctf_run_background", "ctf_job_status", "ctf_job_stop", "ctf_probe_target", "ctf_session_start", "ctf_session_send", "ctf_session_read", "ctf_session_close", "ctf_pcap_analyze", "board_mark_savepoint", "board_rewind", "board_save_kit"}
 
 func buildCTFGDBScript(userCommands string) string {
 	const gdbTailPy = `python
@@ -439,8 +439,7 @@ func ctfToolsWithUnlock(s *ctf.Service, task, intent int64, verifyMode string, u
 	}
 	tools := []actool.CoreTool{
 		commandTool("ctf_http", "在本题独立容器中请求 HTTP/HTTPS 题目，保存响应头、正文、状态码及实际执行 ID。响应中的 Flag 自动成为待确认候选；启用流量录制时同步进入 MITM FTS5 流量库。支持 GET/POST、URL 编码 query/form、请求头和意图内 Cookie；默认不跟随重定向，响应上限 8 MiB。", httpSchema, ctfHTTPCommand),
-		commandTool("http_send", "统一 HTTP/HTTPS 探测与重放工具（容器内执行，自动保留响应头/正文/execution_id 并同步进入流量录制与 Flag 自动提取）。", httpSchema, ctfHTTPCommand),
-		commandTool("Bash", "在本题专属 Pwn/RE/Web 容器 /work 中执行 Bash。具备 GDB、pwntools、Ghidra、radare2、angr 等；日志和脚本自动进入 WP。无法访问 p3y 的配置、密钥或 Docker。超时会终止该容器的进程。", obj(map[string]any{"command": str("命令；附件路径见输入清单"), "timeout": intp("超时毫秒，最多 300000")}, "command"), func(a map[string]json.RawMessage) (string, int, error) {
+		commandTool("Bash", "在本题专属 Pwn/RE/Web 容器 /work 中执行 Bash。具备 GDB、pwntools（/opt/ctf/pwn/bin/python）、angr/Z3/Unicorn（/opt/ctf/re/bin/python）、Ghidra、radare2 等；日志和脚本自动进入 WP。无法访问 p3y 的配置、密钥或 Docker。超时会终止该容器的进程。", obj(map[string]any{"command": str("命令；附件路径见输入清单"), "timeout": intp("超时毫秒，最多 300000")}, "command"), func(a map[string]json.RawMessage) (string, int, error) {
 			return text(a, "command"), min(num(a, "timeout", 120000)/1000, 300), nil
 		}),
 		commandTool("ctf_binary_info", "真实检查 ELF/PE 架构、依赖、符号及保护；不执行样本。", obj(map[string]any{"path": str("二进制路径")}, "path"), func(a map[string]json.RawMessage) (string, int, error) {
@@ -483,21 +482,6 @@ func ctfToolsWithUnlock(s *ctf.Service, task, intent int64, verifyMode string, u
 			p, err := file(a)
 			script := s.TranslateSandboxWorkPaths(context.Background(), task, intent, buildCTFGDBScript(text(a, "commands")))
 			return "printf %s " + quote(base64.StdEncoding.EncodeToString([]byte(script))) + " | base64 -d > debug.gdb\ngdb -q -nx -batch -x debug.gdb -- " + quote(p), num(a, "timeout_seconds", 120), err
-		}),
-		commandTool("ctf_python", "运行并留存实际 Python 求解脚本。pwn 使用 pwntools/ROP；reverse 使用 angr 10（from angr import claripy）、Z3、Unicorn、Keystone。", obj(map[string]any{"script": str("Python 源码"), "profile": str("pwn 或 reverse"), "filename": str("脚本文件名，默认 solve.py"), "timeout_seconds": intp("最多 300 秒")}, "script"), func(a map[string]json.RawMessage) (string, int, error) {
-			name := text(a, "filename")
-			if name == "" {
-				name = "solve.py"
-			}
-			if path.Base(name) != name || !strings.HasSuffix(name, ".py") {
-				return "", 0, fmt.Errorf("请使用简单的 .py 文件名")
-			}
-			python := "/opt/ctf/pwn/bin/python"
-			if text(a, "profile") == "reverse" {
-				python = "/opt/ctf/re/bin/python"
-			}
-			script := s.TranslateSandboxWorkPaths(context.Background(), task, intent, text(a, "script"))
-			return "printf %s " + quote(base64.StdEncoding.EncodeToString([]byte(script))) + " | base64 -d > " + quote(name) + "\n" + python + " " + quote(name), num(a, "timeout_seconds", 120), nil
 		}),
 		commandTool("ctf_decompile", "使用 Ghidra headless 实际分析并反编译指定函数，自动启用持久分析缓存（首次全量导入约 15s，后续单函数约 5s）。stripped/复杂逻辑二进制务必优先调用它，而非在 Bash 用 objdump 盲看汇编。函数名为空时取前 5 个函数。", obj(map[string]any{"path": str("二进制路径"), "function": str("函数名，可为空"), "limit": intp("最多 20 个函数")}, "path"), func(a map[string]json.RawMessage) (string, int, error) {
 			p, err := file(a)
@@ -1000,7 +984,7 @@ print("\n".join(out))`
 			p, err := scopedPath(a)
 			return "ls -lah -- " + quote(p), 30, err
 		}),
-		writeTool("ctf_unlock_toolpack", "当当前题型需要跨领域工具时按需解锁对应工具包（例如 Web 题遇到 ELF 附件需解锁 binary，或 Pwn 题需要 Web/流量分析工具）。可选 pack：binary (ctf_binary_info/ctf_pwn_triage/ctf_gdb/ctf_decompile/ctf_radare2)、web (ctf_http/http_send)、crypto_misc (ctf_pcap_analyze)、all。", obj(map[string]any{
+		writeTool("ctf_unlock_toolpack", "当当前题型需要跨领域工具时按需解锁对应工具包（例如 Web 题遇到 ELF 附件需解锁 binary，或 Pwn 题需要 Web/流量分析工具）。可选 pack：binary (ctf_binary_info/ctf_pwn_triage/ctf_gdb/ctf_decompile/ctf_radare2)、web (ctf_http/http_fuzz_diff/http_race_probe)、crypto_misc (ctf_pcap_analyze)、all。", obj(map[string]any{
 			"pack": str("要解锁的领域工具包：binary | web | crypto_misc | all"),
 		}, "pack"), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a map[string]json.RawMessage
@@ -1008,7 +992,7 @@ print("\n".join(out))`
 			pack := strings.ToLower(strings.TrimSpace(text(a, "pack")))
 			packTools := map[string][]string{
 				ctfPackBinary:     {"ctf_binary_info", "ctf_pwn_triage", "ctf_gdb", "ctf_decompile", "ctf_radare2", "diff_local_remote"},
-				ctfPackWeb:        {"ctf_http", "http_send", "http_fuzz_diff", "http_race_probe"},
+				ctfPackWeb:        {"ctf_http", "http_fuzz_diff", "http_race_probe"},
 				ctfPackCryptoMisc: {"ctf_pcap_analyze"},
 			}
 			var unlockNames []string

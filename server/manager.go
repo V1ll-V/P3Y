@@ -1481,6 +1481,12 @@ func (m *Manager) DeleteTask(id string, opts DeleteTaskOptions) (DeleteTaskResul
 		return result, nil
 	}
 
+	// Preserve board_kits code/hash/task name snapshot BEFORE stageTaskFiles moves
+	// or deletes the task workspace directory on disk.
+	if pgdb.IsSandboxTaskMode(registered.Mode) {
+		m.preserveTaskBoardKitsBeforeDelete(n, registered)
+	}
+
 	var fileStage *taskFileDeleteStage
 	if opts.DeleteFiles {
 		fileStage, err = stageTaskFiles(m.dir, id, registered.ExplorationID)
@@ -1544,6 +1550,31 @@ func (m *Manager) DeleteTask(id string, opts DeleteTaskOptions) (DeleteTaskResul
 		return result, &taskDeleteCommittedError{err: err}
 	}
 	return result, nil
+}
+
+func (m *Manager) preserveTaskBoardKitsBeforeDelete(taskID int64, registered *pgdb.Task) {
+	if m == nil || m.pg == nil || taskID <= 0 || registered == nil {
+		return
+	}
+	kits, err := m.pg.ListBoardKits(context.Background(), taskID)
+	if err != nil || len(kits) == 0 {
+		return
+	}
+	sourceName := strings.TrimSpace(registered.Name)
+	if sourceName == "" {
+		sourceName = strings.TrimSpace(registered.Goal)
+		if r := []rune(sourceName); len(r) > 80 {
+			sourceName = string(r[:80])
+		}
+	}
+	ctfSvc := ctf.New(m.dir, m.pg)
+	for _, k := range kits {
+		if k.Content != "" && k.SourceTaskName != "" && k.SHA256 != "" {
+			continue
+		}
+		sha, content := ctfSvc.ReadWorkspaceFileSnapshot(context.Background(), taskID, 0, k.Path, 128*1024)
+		_ = m.pg.BackfillBoardKitSnapshot(context.Background(), k.ID, sha, content, sourceName)
+	}
 }
 
 // taskDeleteCommittedError means PostgreSQL deletion succeeded but purging one

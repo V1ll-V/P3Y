@@ -48,6 +48,23 @@ func TestDeleteEndpointPathPattern(t *testing.T) {
 func TestShutdownRebootAndDestructivePatterns(t *testing.T) {
 	reShutdown := regexp.MustCompile(shutdownRebootPattern)
 	reDestructive := regexp.MustCompile(destructiveShellPattern)
+	for _, s := range []string{
+		`{"command":"dd if=/dev/zero of=/dev/sda bs=1M"}`,
+		`{"command":"rm -rf /"}`,
+		`{"command":"rm -rf /*"}`,
+	} {
+		if !reDestructive.MatchString(s) {
+			t.Errorf("destructiveShellPattern 应命中却放行: %s", s)
+		}
+	}
+	for _, s := range []string{
+		`{"command":"cd /work/k66 && dd if=bzImage bs=1 skip=16057 2>/dev/null | gzip -dc > out/vmlinux"}`,
+		`{"command":"cd /tmp && rm -rf cpy315 && mkdir cpy315"}`,
+	} {
+		if reDestructive.MatchString(s) {
+			t.Errorf("destructiveShellPattern 误拦: %s", s)
+		}
+	}
 
 	hit := []string{
 		`{"command":"shutdown -h now"}`,

@@ -361,7 +361,7 @@ func IsQuotaExhaustedMessage(message string) bool {
 	}
 	markers := []string{
 		"insufficient_quota", "quota_exceeded", "quota exceeded", "quota exhausted",
-		"exceeded your current quota", "billing_hard_limit_reached",
+		"exceeded your current quota", "billing_hard_limit_reached", "billing_error",
 		"billing hard limit", "billing_not_active", "credit balance", "insufficient credit",
 		"insufficient balance", "balance is too low", "payment required", "status 402",
 		"余额不足", "额度不足", "额度已用尽", "欠费",

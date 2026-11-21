@@ -31,8 +31,9 @@ type ctxKey int
 // ConvIDKey stores the active conversation ID in a context.Context so the
 // interceptor can associate "ask" pending records with the right conversation.
 const (
-	ConvIDKey    ctxKey = 0
-	ZeroTouchKey ctxKey = 10
+	ConvIDKey      ctxKey = 0
+	ZeroTouchKey   ctxKey = 10
+	SandboxModeKey ctxKey = 11
 )
 
 // WithConvID returns a child context carrying convID.
@@ -49,6 +50,18 @@ func WithZeroTouch(ctx context.Context, enabled bool) context.Context {
 // ZeroTouchFromContext reports whether ctx runs in zero-interaction mode.
 func ZeroTouchFromContext(ctx context.Context) bool {
 	v, _ := ctx.Value(ZeroTouchKey).(bool)
+	return v
+}
+
+// WithSandboxMode attaches the task execution mode (e.g. "ctf", "pentest", "ad")
+// so downstream guard/intercept checks can apply mode-appropriate policies.
+func WithSandboxMode(ctx context.Context, mode string) context.Context {
+	return context.WithValue(ctx, SandboxModeKey, mode)
+}
+
+// SandboxModeFromContext extracts the task execution mode ("" if absent).
+func SandboxModeFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(SandboxModeKey).(string)
 	return v
 }
 
@@ -521,11 +534,40 @@ func judgeActionLabel(action string) string {
 // Returns (Decision, true) for the first matching enabled rule, or
 // (Decision{}, false) if no rule matches.
 func (i *Interceptor) Match(toolName string, input []byte) (Decision, bool) {
+	return i.MatchForMode("", toolName, input)
+}
+
+// MatchForMode evaluates the rule list (priority DESC) against a tool call using
+// mode-scoped built-in rule filtering. When mode == "ctf", user-defined rules still
+// apply while built-in rules are restricted to container self-destruction safeguards.
+func (i *Interceptor) MatchForMode(mode, toolName string, input []byte) (Decision, bool) {
 	rules, err := i.rules()
 	if err != nil || len(rules) == 0 {
 		return Decision{}, false
 	}
+	return matchRulesForMode(rules, mode, toolName, input)
+}
+
+func isCTFAllowedBuiltinRule(name string) bool {
+	switch name {
+	case "[内置] 磁盘格式化 mkfs",
+		"[内置] Fork 炸弹",
+		"[内置] 杀死全部进程",
+		"[内置] 磁盘擦除 shred / wipe",
+		"[内置] 覆写磁盘设备 dd",
+		"[内置] 破坏性系统命令":
+		return true
+	default:
+		return false
+	}
+}
+
+func matchRulesForMode(rules []compiledRule, mode, toolName string, input []byte) (Decision, bool) {
+	ctfMode := strings.EqualFold(strings.TrimSpace(mode), "ctf")
 	for _, r := range rules {
+		if ctfMode && strings.HasPrefix(r.Name, "[内置]") && !isCTFAllowedBuiltinRule(r.Name) {
+			continue
+		}
 		if ruleMatches(r, toolName, input) {
 			msg := r.Message
 			if msg == "" {

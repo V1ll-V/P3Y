@@ -98,6 +98,8 @@ func TestCTFBaseForPlannerStripsExecutionTools(t *testing.T) {
 		readTool("LS", "ls", obj(nil), nil),
 		readTool("ctf_python", "py", obj(nil), nil),
 		readTool("ctf_http", "http", obj(nil), nil),
+		readTool("sleep", "sleep", obj(nil), nil),
+		readTool("graph_overview", "overview", obj(nil), nil),
 		readTool("add_intent", "add intent", obj(nil), nil),
 		readTool("record_fact", "record fact", obj(nil), nil),
 	}
@@ -109,7 +111,7 @@ func TestCTFBaseForPlannerStripsExecutionTools(t *testing.T) {
 	if !names["add_intent"] {
 		t.Fatal("expected add_intent to be preserved for CTF planner")
 	}
-	for _, forbidden := range []string{"Bash", "Read", "LS", "ctf_python", "ctf_http", "ctf_pcap"} {
+	for _, forbidden := range []string{"Bash", "Read", "LS", "sleep", "graph_overview", "ctf_python", "ctf_http", "ctf_pcap"} {
 		if names[forbidden] {
 			t.Fatalf("expected execution tool %s to be stripped from CTF planner", forbidden)
 		}
@@ -190,13 +192,22 @@ func TestCTFGraphOverviewPausedAndPwnExploitMutex(t *testing.T) {
 	ts := NewToolSet(es, "planner")
 	ts.SetTaskID(task.ID)
 
+	// 尚无 exploit 意图前，允许派发 phase="recon"
+	reconID, err := ts.addOneIntent(intentItem{Summary: "light recon", Phase: "recon"})
+	if err != nil || reconID <= 0 {
+		t.Fatalf("add recon before exploit failed: id=%d err=%v", reconID, err)
+	}
+
 	id1, err := ts.addOneIntent(intentItem{Summary: "main exploit", Phase: "exploit"})
 	if err != nil || id1 <= 0 {
 		t.Fatalf("add first exploit failed: id=%d err=%v", id1, err)
 	}
-	// 第二条在首条 open 时必须拒绝
+	// 第二条在首条 open 时必须拒绝（无论 phase="exploit" 还是空 phase="" 的辅助意图）
 	if _, err = ts.addOneIntent(intentItem{Summary: "dup exploit", Phase: "exploit"}); err == nil {
 		t.Fatal("expected second exploit intent to be rejected while first is open")
+	}
+	if _, err = ts.addOneIntent(intentItem{Summary: "parallel helper bypass", Phase: ""}); err == nil {
+		t.Fatal("expected empty-phase helper intent to be rejected while exploit is open")
 	}
 	// 模拟用户暂停第一条主攻意图
 	if _, err = pg.Exec(`UPDATE exploration_nodes SET state='paused', owner='work#1' WHERE id=$1`, id1); err != nil {
@@ -209,6 +220,9 @@ func TestCTFGraphOverviewPausedAndPwnExploitMutex(t *testing.T) {
 	}
 	if _, err = ts.addOneIntent(intentItem{Summary: "dup while paused", Phase: "exploit"}); err == nil {
 		t.Fatal("expected second exploit intent to be rejected while first is paused")
+	}
+	if _, err = ts.addOneIntent(intentItem{Summary: "helper while paused", Phase: ""}); err == nil {
+		t.Fatal("expected empty-phase helper intent to be rejected while exploit is paused")
 	}
 	// 第一条明确 exhausted 后应允许续派一条主攻意图
 	if _, err = pg.Exec(`UPDATE exploration_nodes SET state='exhausted' WHERE id=$1`, id1); err != nil {
@@ -265,8 +279,11 @@ func TestCTFDomainToolpacksAndWebSkillUnlock(t *testing.T) {
 	for _, tl := range tools {
 		mounted[tl.Name()] = tl
 	}
-	if mounted["Skill"] == nil || mounted["mcp__playwright__navigate"] == nil || mounted["http_send"] == nil || mounted["Edit"] == nil {
-		t.Fatalf("expected Skill, playwright MCP, http_send, Edit mounted for web task; got keys=%v", len(mounted))
+	if mounted["Skill"] == nil || mounted["mcp__playwright__navigate"] == nil || mounted["ctf_http"] == nil || mounted["Edit"] == nil {
+		t.Fatalf("expected Skill, playwright MCP, ctf_http, Edit mounted for web task; got keys=%v", len(mounted))
+	}
+	if mounted["http_send"] != nil || mounted["ctf_python"] != nil {
+		t.Fatal("redundant http_send / ctf_python must not be mounted in CTF worker tools")
 	}
 	if mounted["mcp__host_shell__exec"] != nil {
 		t.Fatal("host shell MCP must remain blocked in web CTF")
@@ -280,7 +297,7 @@ func TestCTFDomainToolpacksAndWebSkillUnlock(t *testing.T) {
 			t.Fatalf("expected non-web tool %s to be deferred on web task", wantDef)
 		}
 	}
-	if deferredSet["ctf_http"] || deferredSet["http_send"] || deferredSet["Bash"] || deferredSet["Edit"] {
+	if deferredSet["ctf_http"] || deferredSet["Bash"] || deferredSet["Edit"] {
 		t.Fatalf("web/base tools must not be deferred: %v", def.Deferred)
 	}
 	for _, n := range def.GlobalNames {

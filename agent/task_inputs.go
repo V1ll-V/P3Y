@@ -156,7 +156,7 @@ func taskInputContextForRole(root string, ts *db.ExplorationStore, taskID, inten
 				if tunnelIP != "" {
 					callbackHint = fmt.Sprintf("【OOB / SSRF / 反弹 Shell 回连铁律】当前容器与 VPN 共享网络命名空间，真实赛题内网回连 IP 为 `%s`（网卡 `%s`，可用 `ip -4 addr show %s` 核实）。需要让靶机 SSRF/RCE/XXE 回连本机以窃取认证头或回传数据时，必须在容器内监听 `0.0.0.0:<端口>` 并让靶机访问 `http://%s:<端口>`！严禁使用 eth0 的 `10.220.x.x` 地址（靶机无法路由）。", tunnelIP, ifaceLabel, ifaceLabel, tunnelIP)
 				}
-				fmt.Fprintf(&b, "\n【赛题专属 %s VPN 已连接】配置文件=%s | 网卡=%s | 隧道IP=%s | DNS=%s | 内部路由=%s\n说明：本任务的工具容器（ctf_http、ctf_probe_target、ctf_python、ctf_bash、ctf_session_start 等）已接入该赛题独立隔离 %s 隧道网络，可直接解析并访问赛题内网域名与目标端口（无需宿主机代理）。%s 严禁试图读取或修改 VPN 私钥/证书/隧道网卡。\n",
+				fmt.Fprintf(&b, "\n【赛题专属 %s VPN 已连接】配置文件=%s | 网卡=%s | 隧道IP=%s | DNS=%s | 内部路由=%s\n说明：本任务的工具容器（ctf_http、ctf_probe_target、Bash、py_repl、ctf_session_start 等）已接入该赛题独立隔离 %s 隧道网络，可直接解析并访问赛题内网域名与目标端口（无需宿主机代理）。%s 严禁试图读取或修改 VPN 私钥/证书/隧道网卡。\n",
 					kindLabel, vpnFilename, ifaceLabel, addrLabel, strings.Join(prof.DNS, ", "), routesLabel, kindLabel, callbackHint)
 			}
 		}

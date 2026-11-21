@@ -141,9 +141,23 @@ func (s *Server) pgDeleteTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "invalid JSON: "+err.Error())
 		return
 	}
-	if !s.beginTaskDelete(id) {
-		writeErr(w, http.StatusConflict, "任务正在删除")
+	result, statusCode, err := s.deleteTaskInternal(r.Context(), id, opts)
+	if err != nil {
+		var committed *taskDeleteCommittedError
+		if statusCode == http.StatusOK && errors.As(err, &committed) {
+			writeCommittedTaskDelete(w, result, err)
+			return
+		}
+		writeErr(w, statusCode, err.Error())
 		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) deleteTaskInternal(ctx context.Context, id string, opts DeleteTaskOptions) (DeleteTaskResult, int, error) {
+	var result DeleteTaskResult
+	if !s.beginTaskDelete(id) {
+		return result, http.StatusConflict, errors.New("任务正在删除")
 	}
 	deleted := false
 	defer func() {
@@ -155,16 +169,14 @@ func (s *Server) pgDeleteTask(w http.ResponseWriter, r *http.Request) {
 	// Main-agent runs use a separate context from planner/workers. Cancel it, then
 	// wait until both execution domains have returned before removing transcripts.
 	s.cancelTaskChat(id, agent.AbortTaskDeleted)
-	drainCtx, cancelDrain := context.WithTimeout(r.Context(), taskDeleteDrainTimeout)
+	drainCtx, cancelDrain := context.WithTimeout(ctx, taskDeleteDrainTimeout)
 	defer cancelDrain()
 	if err := s.waitTaskQuiescent(drainCtx, id); err != nil {
-		writeErr(w, http.StatusConflict, "任务仍有运行中的 Agent，删除已取消")
-		return
+		return result, http.StatusConflict, errors.New("任务仍有运行中的 Agent，删除已取消")
 	}
 
 	if err := s.drainTaskSideQuestions(drainCtx, id); err != nil {
-		writeErr(w, http.StatusConflict, err.Error())
-		return
+		return result, http.StatusConflict, err
 	}
 	result, err := s.m.DeleteTask(id, opts)
 	if err != nil {
@@ -177,11 +189,9 @@ func (s *Server) pgDeleteTask(w http.ResponseWriter, r *http.Request) {
 			delete(s.taskAgents, id)
 			s.taskAgentMu.Unlock()
 			deleted = true
-			writeCommittedTaskDelete(w, result, err)
-			return
+			return result, http.StatusOK, err
 		}
-		writeErr(w, 500, err.Error())
-		return
+		return result, http.StatusInternalServerError, err
 	}
 	// Manager has removed the task from the registry, so no new API operation can
 	// resolve it. Now stop and join every task-owned Engine goroutine and clear its
@@ -191,7 +201,7 @@ func (s *Server) pgDeleteTask(w http.ResponseWriter, r *http.Request) {
 	delete(s.taskAgents, id)
 	s.taskAgentMu.Unlock()
 	deleted = true
-	writeJSON(w, 200, result)
+	return result, http.StatusOK, nil
 }
 
 func writeCommittedTaskDelete(w http.ResponseWriter, result DeleteTaskResult, err error) {

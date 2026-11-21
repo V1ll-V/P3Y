@@ -1165,7 +1165,7 @@ func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
 	dtos := make([]TaskDTO, 0, len(list))
 	for _, t := range list {
 		dto := taskDTO(t, s.resolvedTaskStatus(t))
-		dto.InputsBlockedReason = s.taskInputsBlockReason(t)
+		dto.InputsBlockedReason = s.taskInputsListBlockReason(t, dto.Status)
 		applyTaskArchiveBlocker(&dto, archiveBlockers)
 		metric := metrics[t.ExpID]
 		dto.Tokens = tokenTotalDTO(metric.Tokens)

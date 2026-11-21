@@ -120,8 +120,8 @@ func TestStage4Critic3FailureHook(t *testing.T) {
 	}
 
 	failRes := []byte(`{"exit_code":1,"stderr_excerpt":"EOFError: got EOF"}`)
-	hooks.PostToolUse(t.Context(), "ctf_python", []byte(`{"code":"exploit1"}`), failRes, false)
-	hooks.PostToolUse(t.Context(), "ctf_python", []byte(`{"code":"exploit2"}`), failRes, false)
+	hooks.PostToolUse(t.Context(), "py_repl", []byte(`{"code":"exploit1"}`), failRes, false)
+	hooks.PostToolUse(t.Context(), "py_repl", []byte(`{"code":"exploit2"}`), failRes, false)
 	if advisorCalls != 0 {
 		t.Fatal("critic should not trigger before 3 consecutive failures")
 	}
@@ -140,15 +140,15 @@ func TestStage4Critic3FailureHook(t *testing.T) {
 	}
 
 	// Next non-pivot tool must receive the blocking critique once.
-	blockRetry, msg, _ := hooks.PreToolUse(t.Context(), "ctf_python", []byte(`{}`))
+	blockRetry, msg, _ := hooks.PreToolUse(t.Context(), "py_repl", []byte(`{}`))
 	if !blockRetry || !strings.Contains(msg, "Critic 反向证伪提醒 #1") {
 		t.Fatalf("expected PreToolUse block with critique, got block=%v msg=%q", blockRetry, msg)
 	}
 
 	// Consumed once -> subsequent call allowed; success resets any accumulated failures.
-	hooks.PostToolUse(t.Context(), "ctf_python", []byte(`{}`), failRes, false)
-	hooks.PostToolUse(t.Context(), "ctf_python", []byte(`{}`), []byte(`{"exit_code":0,"stdout_excerpt":"ok"}`), false)
-	hooks.PostToolUse(t.Context(), "ctf_python", []byte(`{}`), failRes, false)
+	hooks.PostToolUse(t.Context(), "py_repl", []byte(`{}`), failRes, false)
+	hooks.PostToolUse(t.Context(), "py_repl", []byte(`{}`), []byte(`{"exit_code":0,"stdout_excerpt":"ok"}`), false)
+	hooks.PostToolUse(t.Context(), "py_repl", []byte(`{}`), failRes, false)
 	if advisorCalls != 1 {
 		t.Fatalf("expected clean exit=0 to reset failure streak, advisorCalls=%d", advisorCalls)
 	}
@@ -167,7 +167,10 @@ func TestStage4Critic3FailureHook(t *testing.T) {
 
 func TestStage4CriticSoftFailureAndStagnation(t *testing.T) {
 	advisorCalls := 0
-	hooks := newCTFCriticHooks(nil, nil, nil, 0, 0, nil)
+	var activities []db.Activity
+	hooks := newCTFCriticHooks(nil, nil, nil, 0, 0, func(a db.Activity) {
+		activities = append(activities, a)
+	})
 	hooks.advisor = func(_ context.Context, _ string) (string, error) {
 		advisorCalls++
 		return "不要继续死等 502 或吞错空转。", nil
@@ -185,20 +188,53 @@ func TestStage4CriticSoftFailureAndStagnation(t *testing.T) {
 		t.Fatalf("expected PreToolUse critique after soft failures, got %q", msg)
 	}
 
-	// 9 clean calls + record_fact resets stagnation counter; 10 calls without fact triggers critic #2.
+	// 19 clean calls + Write/Edit/record_fact resets stagnation counter.
 	okRes := []byte(`{"exit_code":0,"stdout_excerpt":"200 OK empty"}`)
-	for i := 0; i < 9; i++ {
+	for i := 0; i < 19; i++ {
+		hooks.PostToolUse(t.Context(), "ctf_http", []byte(`{}`), okRes, false)
+	}
+	hooks.PostToolUse(t.Context(), "Write", []byte(`{"file_path":"/work/exp.py"}`), []byte(`{"ok":true}`), false)
+	if advisorCalls != 1 {
+		t.Fatalf("expected Write progress to reset stagnation counter, got advisorCalls=%d", advisorCalls)
+	}
+	for i := 0; i < 19; i++ {
 		hooks.PostToolUse(t.Context(), "ctf_http", []byte(`{}`), okRes, false)
 	}
 	hooks.PostToolUse(t.Context(), "record_fact", []byte(`{}`), []byte(`{"ok":true}`), false)
 	if advisorCalls != 1 {
-		t.Fatalf("expected no stagnation trigger before threshold after record_fact, got %d", advisorCalls)
+		t.Fatalf("expected record_fact progress to reset stagnation counter, got advisorCalls=%d", advisorCalls)
 	}
-	for i := 0; i < 10; i++ {
+
+	// First 20 monitored calls without progress emits lightweight reminder without calling advisor or blocking PreToolUse.
+	for i := 0; i < 20; i++ {
+		hooks.PostToolUse(t.Context(), "ctf_http", []byte(`{}`), okRes, false)
+	}
+	if advisorCalls != 1 {
+		t.Fatalf("expected first stagnation threshold (20) to skip blocking LLM advisor, got advisorCalls=%d", advisorCalls)
+	}
+	if block, msg, _ := hooks.PreToolUse(t.Context(), "ctf_http", []byte(`{}`)); block || msg != "" {
+		t.Fatalf("expected first stagnation warning to be non-blocking, got block=%v msg=%q", block, msg)
+	}
+	foundSoftWarn := false
+	for _, a := range activities {
+		if strings.Contains(a.Summary, "轻量提醒") {
+			foundSoftWarn = true
+			break
+		}
+	}
+	if !foundSoftWarn {
+		t.Fatalf("expected lightweight stagnation activity emit, got %+v", activities)
+	}
+
+	// Second consecutive 20 monitored calls without progress (40 total) triggers blocking critic advisor.
+	for i := 0; i < 20; i++ {
 		hooks.PostToolUse(t.Context(), "ctf_http", []byte(`{}`), okRes, false)
 	}
 	if advisorCalls != 2 {
-		t.Fatalf("expected 10 monitored calls without fact/board progress to trigger critic #2, got %d", advisorCalls)
+		t.Fatalf("expected second consecutive stagnation (40 calls) to trigger critic #2, got advisorCalls=%d", advisorCalls)
+	}
+	if block, msg, _ := hooks.PreToolUse(t.Context(), "ctf_http", []byte(`{}`)); !block || !strings.Contains(msg, "Critic 反向证伪提醒 #2") {
+		t.Fatalf("expected blocking critique on repeated stagnation, got block=%v msg=%q", block, msg)
 	}
 }
 
@@ -507,13 +543,13 @@ func TestFormatCTFExecToolResultAndCriticStdoutVisibility(t *testing.T) {
 		t.Fatal("expected soft 502 in stdout field to be detected as failure")
 	}
 
-	// Pending critique must NOT block progress-recording tools (record_fact / board_record).
+	// Pending critique must NOT block progress-recording tools (record_fact / board_mark_savepoint).
 	hooks := newCTFCriticHooks(nil, nil, nil, 0, 0, nil)
 	hooks.pendingCritique = "【Critic 反向证伪提醒 #1】test"
 	if block, _, _ := hooks.PreToolUse(t.Context(), "record_fact", []byte(`{}`)); block {
 		t.Fatal("record_fact must bypass pending critic block")
 	}
-	if block, _, _ := hooks.PreToolUse(t.Context(), "board_record", []byte(`{}`)); block {
-		t.Fatal("board_record must bypass pending critic block")
+	if block, _, _ := hooks.PreToolUse(t.Context(), "board_mark_savepoint", []byte(`{}`)); block {
+		t.Fatal("board_mark_savepoint must bypass pending critic block")
 	}
 }

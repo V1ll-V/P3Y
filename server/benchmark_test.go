@@ -8,12 +8,15 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"p3y/benchmark"
+	"p3y/ctf"
 	"p3y/db"
 )
 
@@ -1400,5 +1403,207 @@ func TestPickChallengeQueueDifficultyOrdering(t *testing.T) {
 			}
 			t.Fatalf("unexpected mixed difficulty order: want %v, got %v", wantMixed, gotCodes)
 		}
+	}
+}
+
+func TestIsRemoteSessionTerminatedError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "409 already finished",
+			err:  &benchmark.StructuredError{HTTPStatus: 409, Code: "invalid_state", Message: "task task_202611l7cuoht9dx already finished"},
+			want: true,
+		},
+		{
+			name: "409 instance cap not terminal",
+			err:  &benchmark.StructuredError{HTTPStatus: 409, Code: "invalid_state", Message: "max active challenge instances reached (3)"},
+			want: false,
+		},
+		{
+			name: "401 unauthorized",
+			err:  &benchmark.StructuredError{HTTPStatus: 401, Message: "expired"},
+			want: true,
+		},
+		{
+			name: "ENDED code",
+			err:  &benchmark.StructuredError{HTTPStatus: 400, Code: "ENDED", Message: "session ended"},
+			want: true,
+		},
+	}
+	for _, tc := range cases {
+		if got := isRemoteSessionTerminatedError(tc.err); got != tc.want {
+			t.Fatalf("%s: got %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestBenchmarkDeleteSessionCascadesTasksAndPreservesKitsAndTips(t *testing.T) {
+	dataDir := t.TempDir()
+	m, err := NewManager(dataDir, "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) - skipping", err)
+	}
+	defer m.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := New(ctx, m, dataDir, dataDir, dataDir)
+	token, err := signJWT(s.jwtKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sess, err := s.m.pg.CreateBenchmarkSession(t.Context(), db.BenchmarkSessionCreate{
+		Name:          "delete-cascade-test",
+		Provider:      "tsecbench",
+		BaseURL:       "https://tsecbench.example",
+		MaxConcurrent: 1,
+		HintPolicy:    "never",
+	})
+	if err != nil {
+		t.Fatalf("CreateBenchmarkSession: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = s.m.pg.DeleteBenchmarkSession(context.Background(), sess.ID)
+	})
+
+	if err := s.m.pg.SyncBenchmarkChallenges(t.Context(), sess.ID, []db.BenchmarkChallengeUpsert{{
+		UniqueCode:     "ch-del-1",
+		Title:          "ch-del-1",
+		Description:    "Web test",
+		Category:       "web",
+		SubmissionType: "flag",
+		TotalScore:     100,
+		FlagCount:      1,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create 3 linked tasks: history-only (no benchmark_session_id), bound, and legacy session-linked.
+	tHistory, err := s.m.CreateTaskWithOptions("hist-task", "goal", db.TaskCreateOptions{Mode: "ctf", ChallengeType: "web"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tBound, err := s.m.CreateTaskWithOptions("bound-task", "goal", db.TaskCreateOptions{
+		Name: "[ch-del-1] bound", Mode: "ctf", ChallengeType: "web", BenchmarkSessionID: &sess.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tLegacy, err := s.m.CreateTaskWithOptions("legacy-task", "goal", db.TaskCreateOptions{
+		Mode: "ctf", ChallengeType: "web", BenchmarkSessionID: &sess.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	histID, _ := strconv.ParseInt(tHistory.ID, 10, 64)
+	boundID, _ := strconv.ParseInt(tBound.ID, 10, 64)
+	legacyID, _ := strconv.ParseInt(tLegacy.ID, 10, 64)
+
+	if err := s.m.pg.BindBenchmarkChallengeTask(t.Context(), sess.ID, "ch-del-1", histID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.m.pg.BindBenchmarkChallengeTask(t.Context(), sess.ID, "ch-del-1", boundID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create workspace file + legacy Kit (without pre-populated Content) + TipCard tied to tBound.
+	ctfSvc := ctf.New(dataDir, s.m.pg)
+	workDir := ctfSvc.EffectiveWorkDir(t.Context(), boundID, 0)
+	if err := os.MkdirAll(workDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	kitBody := "import requests\nprint('exploit ready')\n"
+	if err := os.WriteFile(filepath.Join(workDir, "exp.py"), []byte(kitBody), 0640); err != nil {
+		t.Fatal(err)
+	}
+	kit, err := s.m.pg.UpsertBoardKit(t.Context(), db.BoardKit{
+		TaskID:   boundID,
+		Name:     "exp.py",
+		Path:     "/work/exp.py",
+		Summary:  "preserved exploit script",
+		Verified: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = s.m.pg.Exec(`DELETE FROM board_kits WHERE id=$1`, kit.ID) })
+
+	tip, err := s.m.pg.CreateTipCard(t.Context(), db.TipCard{
+		Category:     "web",
+		Tags:         []string{"ssti"},
+		Title:        "Survived Tip Card",
+		Pitfall:      "Must survive benchmark deletion",
+		SourceTaskID: &boundID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.m.pg.DeleteTipCard(context.Background(), tip.ID) })
+
+	req := httptest.NewRequest("DELETE", "/api/benchmarks/"+strconv.FormatInt(sess.ID, 10), nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("DELETE benchmark %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Deleted      bool `json:"deleted"`
+		DeletedTasks int  `json:"deleted_tasks"`
+		FailedTasks  int  `json:"failed_tasks"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Deleted || resp.DeletedTasks != 3 || resp.FailedTasks != 0 {
+		t.Fatalf("unexpected delete summary: %+v", resp)
+	}
+
+	for _, tid := range []int64{histID, boundID, legacyID} {
+		row, err := s.m.pg.GetTask(tid)
+		if err != nil || row != nil {
+			t.Fatalf("expected task #%d deleted, got row=%+v err=%v", tid, row, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "tasks", tBound.ID)); !os.IsNotExist(err) {
+		t.Fatalf("expected task files directory removed after session delete, stat err=%v", err)
+	}
+
+	kits, err := s.m.pg.ListAllBoardKits(t.Context(), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var savedKit *db.BoardKit
+	for i := range kits {
+		if kits[i].ID == kit.ID {
+			savedKit = &kits[i]
+			break
+		}
+	}
+	if savedKit == nil {
+		t.Fatalf("expected kit #%d to survive benchmark session delete", kit.ID)
+	}
+	if savedKit.TaskID != 0 || savedKit.Content != kitBody || savedKit.SourceTaskName != "[ch-del-1] bound" {
+		t.Fatalf("unexpected preserved kit snapshot: %+v", savedKit)
+	}
+
+	tips, err := s.m.pg.ListTips(t.Context(), "web", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundTip := false
+	for _, tc := range tips {
+		if tc.ID == tip.ID {
+			foundTip = true
+			break
+		}
+	}
+	if !foundTip {
+		t.Fatalf("expected tip #%d to survive benchmark session delete", tip.ID)
 	}
 }

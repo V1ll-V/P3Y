@@ -43,6 +43,9 @@ func (m *Manager) taskInputsError(t *Task) error {
 		if e != nil {
 			return e
 		}
+		if row == nil {
+			return errors.New("任务不存在")
+		}
 		m.mirrorCTFLifecycle(t, row)
 		return nil
 	}
@@ -51,6 +54,19 @@ func (m *Manager) taskInputsError(t *Task) error {
 
 func (s *Server) taskInputsBlockReason(t *Task) string {
 	if err := s.m.taskInputsError(t); err != nil {
+		return "附件未就绪：" + err.Error()
+	}
+	return ""
+}
+
+// taskInputsListBlockReason performs a fast, read-only attachment check for the
+// task list endpoint without running ctf.Service.Sync, RunPrecheck, or row-lock
+// DB writes on every historical task.
+func (s *Server) taskInputsListBlockReason(t *Task, status string) string {
+	if t == nil || isTerminalStatus(status) {
+		return ""
+	}
+	if err := s.artifactStore().Check(t.ID, t.AttachmentBatchID); err != nil {
 		return "附件未就绪：" + err.Error()
 	}
 	return ""

@@ -1713,18 +1713,34 @@ CREATE INDEX IF NOT EXISTS idx_board_items_task ON board_items(task_id, id);
 CREATE INDEX IF NOT EXISTS idx_board_items_kind ON board_items(task_id, kind);
 
 CREATE TABLE IF NOT EXISTS board_kits (
-    id           BIGSERIAL PRIMARY KEY,
-    task_id      BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-    savepoint_id BIGINT,
-    name         TEXT NOT NULL,
-    path         TEXT NOT NULL DEFAULT '',
-    summary      TEXT NOT NULL DEFAULT '',
-    sha256       TEXT NOT NULL DEFAULT '',
-    verified     BOOLEAN NOT NULL DEFAULT FALSE,
-    meta_json    JSONB NOT NULL DEFAULT '{}'::jsonb,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    id               BIGSERIAL PRIMARY KEY,
+    task_id          BIGINT REFERENCES tasks(id) ON DELETE SET NULL,
+    source_task_name TEXT NOT NULL DEFAULT '',
+    savepoint_id     BIGINT,
+    name             TEXT NOT NULL,
+    path             TEXT NOT NULL DEFAULT '',
+    summary          TEXT NOT NULL DEFAULT '',
+    content          TEXT NOT NULL DEFAULT '',
+    sha256           TEXT NOT NULL DEFAULT '',
+    verified         BOOLEAN NOT NULL DEFAULT FALSE,
+    meta_json        JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (task_id, name)
 );
+ALTER TABLE board_kits ADD COLUMN IF NOT EXISTS content TEXT NOT NULL DEFAULT '';
+ALTER TABLE board_kits ADD COLUMN IF NOT EXISTS source_task_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE board_kits ALTER COLUMN task_id DROP NOT NULL;
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'board_kits_task_id_fkey' AND confdeltype <> 'n'
+    ) THEN
+        ALTER TABLE board_kits DROP CONSTRAINT board_kits_task_id_fkey;
+        ALTER TABLE board_kits ADD CONSTRAINT board_kits_task_id_fkey
+            FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE SET NULL;
+    END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS idx_board_kits_task ON board_kits(task_id, id);
 
 CREATE TABLE IF NOT EXISTS tips_cards (

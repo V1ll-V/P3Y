@@ -318,7 +318,19 @@ func (d *DB) DeleteBenchmarkSession(ctx context.Context, id int64) error {
 }
 
 func (d *DB) ListBenchmarkChallengeTaskIDs(ctx context.Context, sessionID int64) ([]int64, error) {
-	rows, err := d.QueryContext(ctx, `SELECT DISTINCT id FROM tasks WHERE benchmark_session_id=$1 AND deleted_at IS NULL`, sessionID)
+	rows, err := d.QueryContext(ctx, `
+		SELECT DISTINCT t.id
+		FROM tasks t
+		WHERE t.deleted_at IS NULL AND (
+			t.benchmark_session_id = $1
+			OR t.id IN (
+				SELECT bound_task_id FROM benchmark_challenges WHERE session_id = $1 AND bound_task_id IS NOT NULL
+				UNION
+				SELECT unnest(history_task_ids) FROM benchmark_challenges WHERE session_id = $1
+			)
+		)
+		ORDER BY t.id ASC
+	`, sessionID)
 	if err != nil {
 		return nil, err
 	}
