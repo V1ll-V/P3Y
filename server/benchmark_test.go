@@ -1607,3 +1607,162 @@ func TestBenchmarkDeleteSessionCascadesTasksAndPreservesKitsAndTips(t *testing.T
 		t.Fatalf("expected tip #%d to survive benchmark session delete", tip.ID)
 	}
 }
+
+func TestBenchmarkStartSingleChallengeIsolated(t *testing.T) {
+	startedCodes := map[string]int{}
+	closedCodes := map[string]int{}
+	mockTSec := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/openapi/v1/challenges":
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{
+					"unique_code":      "ch-single-a",
+					"description":      "Single target A",
+					"difficulty":       "easy",
+					"level":            1,
+					"total_score":      100,
+					"flag_count":       1,
+					"is_completed":     false,
+					"container_status": "stopped",
+				},
+				{
+					"unique_code":      "ch-single-b",
+					"description":      "Single target B",
+					"difficulty":       "hard",
+					"level":            3,
+					"total_score":      300,
+					"flag_count":       1,
+					"is_completed":     false,
+					"container_status": "stopped",
+				},
+			})
+		case r.Method == "POST" && r.URL.Path == "/openapi/v1/challenges/start":
+			code := r.URL.Query().Get("unique_code")
+			startedCodes[code]++
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":            "available",
+				"container_addr":    []string{"127.0.0.1:9111"},
+				"remaining_seconds": 1800,
+			})
+		case r.Method == "POST" && r.URL.Path == "/openapi/v1/challenges/close":
+			code := r.URL.Query().Get("unique_code")
+			closedCodes[code]++
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+		case r.Method == "POST" && r.URL.Path == "/openapi/v1/challenges/submit":
+			var body struct {
+				UniqueCode string `json:"unique_code"`
+				Flag       string `json:"flag"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body.UniqueCode == "ch-single-a" && body.Flag == "flag{single-ok}" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"correct":            true,
+					"awarded":            100,
+					"cumulative_score":   100,
+					"correct_flag_count": 1,
+					"total_flag_count":   1,
+				})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"correct": false, "message": "wrong"})
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer mockTSec.Close()
+
+	dataDir := t.TempDir()
+	m, err := NewManager(dataDir, "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) - skipping", err)
+	}
+	defer m.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := New(ctx, m, dataDir, dataDir, dataDir)
+	token, err := signJWT(s.jwtKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Create session with auto_start=false (syncs both challenges, stays idle).
+	createBody := fmt.Sprintf(`{"name":"single-test","provider":"tsecbench","base_url":%q,"token":"tok-single","max_concurrent":2,"auto_start":false}`, mockTSec.URL)
+	req := httptest.NewRequest("POST", "/api/benchmarks", strings.NewReader(createBody))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 && rec.Code != 201 {
+		t.Fatalf("POST /api/benchmarks %d: %s", rec.Code, rec.Body.String())
+	}
+	var sess db.BenchmarkSession
+	if err := json.Unmarshal(rec.Body.Bytes(), &sess); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		s.bench.stopSession(sess.ID, "stopped", "test cleanup")
+		if ids, err := s.m.pg.ListBenchmarkChallengeTaskIDs(context.Background(), sess.ID); err == nil {
+			for _, tid := range ids {
+				_, _ = s.m.DeleteTask(strconv.FormatInt(tid, 10), DeleteTaskOptions{DeleteFiles: true, DeleteLLMRecords: true})
+			}
+		}
+		_ = s.m.pg.DeleteBenchmarkSession(context.Background(), sess.ID)
+	})
+
+	// 2. Start ONLY ch-single-a via single-challenge endpoint.
+	startReq := httptest.NewRequest("POST", fmt.Sprintf("/api/benchmarks/%d/challenges/ch-single-a/start", sess.ID), nil)
+	startReq.Header.Set("Authorization", "Bearer "+token)
+	startRec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(startRec, startReq)
+	if startRec.Code != 200 {
+		t.Fatalf("POST start single challenge %d: %s", startRec.Code, startRec.Body.String())
+	}
+	var startResp struct {
+		Launched bool                 `json:"launched"`
+		TaskID   *int64               `json:"task_id"`
+		Ch       *db.BenchmarkChallenge `json:"challenge"`
+	}
+	if err := json.Unmarshal(startRec.Body.Bytes(), &startResp); err != nil {
+		t.Fatal(err)
+	}
+	if !startResp.Launched || startResp.TaskID == nil || *startResp.TaskID <= 0 {
+		t.Fatalf("unexpected start response: %+v", startResp)
+	}
+	if startedCodes["ch-single-a"] != 1 || startedCodes["ch-single-b"] != 0 {
+		t.Fatalf("expected only ch-single-a container started, got %+v", startedCodes)
+	}
+
+	// Verify ch-single-b remains completely untouched and session stays idle.
+	chB, err := s.m.pg.GetBenchmarkChallenge(t.Context(), sess.ID, "ch-single-b")
+	if err != nil || chB == nil || chB.BoundTaskID != nil {
+		t.Fatalf("expected ch-single-b untouched, got %+v err=%v", chB, err)
+	}
+	sessAfter, _ := s.m.pg.GetBenchmarkSession(t.Context(), sess.ID)
+	if sessAfter == nil || sessAfter.Status != "created" {
+		t.Fatalf("expected session status to remain created, got %+v", sessAfter)
+	}
+
+	// 3. Duplicate start while ch-single-a is running must return 409 Conflict.
+	dupReq := httptest.NewRequest("POST", fmt.Sprintf("/api/benchmarks/%d/challenges/ch-single-a/start", sess.ID), nil)
+	dupReq.Header.Set("Authorization", "Bearer "+token)
+	dupRec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(dupRec, dupReq)
+	if dupRec.Code != 409 {
+		t.Fatalf("expected 409 on duplicate start, got %d: %s", dupRec.Code, dupRec.Body.String())
+	}
+
+	// 4. Auto-submission hook works seamlessly even without full session loop running.
+	msg, handled, herr := s.bench.handleFlagCandidate(t.Context(), *startResp.TaskID, "unit-test", "flag{single-ok}", "")
+	if herr != nil || !handled || !strings.Contains(msg, `"correct":true`) {
+		t.Fatalf("expected auto-submit to succeed, msg=%s handled=%v err=%v", msg, handled, herr)
+	}
+	chA, _ := s.m.pg.GetBenchmarkChallenge(t.Context(), sess.ID, "ch-single-a")
+	if chA == nil || !chA.IsCompleted || chA.CumulativeScore != 100 {
+		t.Fatalf("expected ch-single-a completed with 100 pts, got %+v", chA)
+	}
+	if closedCodes["ch-single-a"] == 0 {
+		t.Fatalf("expected ch-single-a environment closed after solve, closed=%+v", closedCodes)
+	}
+}

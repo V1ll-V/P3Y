@@ -120,6 +120,7 @@ import type {
   RepeaterRunResult,
   CatcherScanResult,
   PatchVerifyResult,
+  BenchmarkChallenge,
   BenchmarkDetailResponse,
   BenchmarkParsedSkill,
   BenchmarkProviderKind,
@@ -1550,6 +1551,10 @@ export const api = {
     payload: { max_concurrent?: number; per_challenge_timeout?: number },
   ) => http<BenchmarkSession>(`/benchmarks/${id}`, { method: "PATCH", body: JSON.stringify(payload) }),
   benchmarkStartSession: (id: number | string) => post<BenchmarkSession>(`/benchmarks/${id}/start`),
+  benchmarkStartChallenge: (id: number | string, uniqueCode: string) =>
+    post<{ launched: boolean; challenge?: BenchmarkChallenge; task_id?: number }>(
+      `/benchmarks/${id}/challenges/${encodeURIComponent(uniqueCode)}/start`,
+    ),
   benchmarkStopSession: (id: number | string) => post<BenchmarkSession>(`/benchmarks/${id}/stop`),
   benchmarkSyncSession: (id: number | string) =>
     post<{ synced: number; session: BenchmarkSession }>(`/benchmarks/${id}/sync`),

@@ -79,6 +79,7 @@ function BenchmarkDetailInner() {
   const [data, setData] = React.useState<BenchmarkDetailResponse | null>(null);
   const [loading, setLoading] = React.useState(true);
   const [busy, setBusy] = React.useState(false);
+  const [startingCode, setStartingCode] = React.useState<string | null>(null);
   const [filter, setFilter] = React.useState<"all" | "completed" | "active" | "pending" | "error">("all");
   const [settingsOpen, setSettingsOpen] = React.useState(false);
   const [editConcurrent, setEditConcurrent] = React.useState(3);
@@ -678,6 +679,39 @@ function BenchmarkDetailInner() {
                           <span title={c.hint_content || "已用 Hint"}>
                             <LightbulbIcon className="h-3.5 w-3.5 text-amber-500" />
                           </span>
+                        )}
+                        {!c.is_completed && !active && !isNoFlagChallenge(c) && (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-6 px-2 text-[11px]"
+                            disabled={busy || startingCode !== null}
+                            onClick={async () => {
+                              setStartingCode(c.unique_code);
+                              try {
+                                const res = await api.benchmarkStartChallenge(session.id, c.unique_code);
+                                if (res.launched) {
+                                  toast.success(
+                                    `已单独启动 ${c.title}${res.task_id ? `（任务 #${res.task_id}）` : ""}`,
+                                  );
+                                } else {
+                                  toast.info(`${c.title} 已由平台跳过或完成`);
+                                }
+                                await load();
+                              } catch (err) {
+                                toast.error(err instanceof Error ? err.message : "单题启动失败");
+                              } finally {
+                                setStartingCode(null);
+                              }
+                            }}
+                          >
+                            {startingCode === c.unique_code ? (
+                              <Loader2Icon className="mr-1 h-3 w-3 animate-spin" />
+                            ) : (
+                              <PlayIcon className="mr-1 h-3 w-3" />
+                            )}
+                            启动此题
+                          </Button>
                         )}
                       </div>
                     </td>

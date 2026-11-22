@@ -39,6 +39,8 @@ type benchSessionRuntime struct {
 	lastEnvPoll      map[string]time.Time
 	taskStartAt      map[string]time.Time
 	lastHintAttempt  map[string]time.Time
+	startingCodes    map[string]bool
+	singleWatch      map[string]context.CancelFunc
 }
 
 // BenchmarkManager orchestrates unattended zero-touch multi-platform benchmark
@@ -75,6 +77,7 @@ func (s *Server) registerBenchmarkRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/benchmarks/{id}", s.bench.handleGetSession)
 	mux.HandleFunc("PATCH /api/benchmarks/{id}", s.bench.handleUpdateSession)
 	mux.HandleFunc("POST /api/benchmarks/{id}/start", s.bench.handleStartSession)
+	mux.HandleFunc("POST /api/benchmarks/{id}/challenges/{code}/start", s.bench.handleStartChallenge)
 	mux.HandleFunc("POST /api/benchmarks/{id}/stop", s.bench.handleStopSession)
 	mux.HandleFunc("POST /api/benchmarks/{id}/sync", s.bench.handleSyncSession)
 	mux.HandleFunc("POST /api/benchmarks/{id}/retry-failed", s.bench.handleRetryFailed)
@@ -210,11 +213,13 @@ func (bm *BenchmarkManager) runtimeFor(sess *db.BenchmarkSession) (*benchSession
 		return nil, err
 	}
 	rt := &benchSessionRuntime{
-		sessionID:   sess.ID,
-		prov:        prov,
-		cfg:         cfg,
-		lastEnvPoll: map[string]time.Time{},
-		taskStartAt: map[string]time.Time{},
+		sessionID:     sess.ID,
+		prov:          prov,
+		cfg:           cfg,
+		lastEnvPoll:   map[string]time.Time{},
+		taskStartAt:   map[string]time.Time{},
+		startingCodes: map[string]bool{},
+		singleWatch:   map[string]context.CancelFunc{},
 	}
 	bm.runs[sess.ID] = rt
 	return rt, nil
@@ -435,6 +440,209 @@ func (bm *BenchmarkManager) handleStartSession(w http.ResponseWriter, r *http.Re
 	}
 	sess, _ := bm.s.m.pg.GetBenchmarkSession(r.Context(), id)
 	writeJSON(w, 200, sess)
+}
+
+func (bm *BenchmarkManager) handleStartChallenge(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeErr(w, 400, "无效的测评会话 ID")
+		return
+	}
+	code := strings.TrimSpace(r.PathValue("code"))
+	if code == "" {
+		writeErr(w, 400, "无效的题目标识")
+		return
+	}
+	ctx := r.Context()
+	sess, err := bm.s.m.pg.GetBenchmarkSession(ctx, id)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if sess == nil {
+		writeErr(w, 404, "测评会话不存在")
+		return
+	}
+	ch, err := bm.s.m.pg.GetBenchmarkChallenge(ctx, id, code)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if ch == nil {
+		writeErr(w, 404, "题目不存在于该测评会话")
+		return
+	}
+	if ch.IsCompleted {
+		writeErr(w, 400, "该题目已完成，无需重复启动")
+		return
+	}
+	if isNoFlagBenchmarkChallenge(ch) {
+		writeErr(w, 400, "该题目声明无 Flag，无需启动")
+		return
+	}
+	if ch.BoundTaskID != nil {
+		if t, ok := bm.s.m.Task(strconv.FormatInt(*ch.BoundTaskID, 10)); ok && !isTerminalStatus(t.lifecycleSnapshot().Status) {
+			writeErr(w, 409, fmt.Sprintf("该题目已在运行中（任务 #%d）", *ch.BoundTaskID))
+			return
+		}
+	}
+
+	rt, err := bm.runtimeFor(sess)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	bm.mu.Lock()
+	if rt.startingCodes == nil {
+		rt.startingCodes = map[string]bool{}
+	}
+	if rt.startingCodes[code] {
+		bm.mu.Unlock()
+		writeErr(w, 409, "该题目正在启动中，请稍候")
+		return
+	}
+	rt.startingCodes[code] = true
+	bm.mu.Unlock()
+	defer func() {
+		bm.mu.Lock()
+		delete(rt.startingCodes, code)
+		bm.mu.Unlock()
+	}()
+
+	// Reset prior failure/retry backoff metadata while preserving history_task_ids memory chain.
+	if ch.LastError != "" || ch.NextRetryAt != nil || ch.AutoRetryCount > 0 {
+		if rerr := bm.s.m.pg.ResetBenchmarkChallengeForRetry(ctx, id, code); rerr == nil {
+			if reloaded, gerr := bm.s.m.pg.GetBenchmarkChallenge(ctx, id, code); gerr == nil && reloaded != nil {
+				ch = reloaded
+			}
+		}
+	}
+
+	// Count currently active platform containers so we respect max_concurrent slot limit.
+	challenges, err := bm.s.m.pg.ListBenchmarkChallenges(ctx, id)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	activeContainers := 0
+	for _, c := range challenges {
+		if c.UniqueCode == code {
+			continue
+		}
+		if c.ContainerStatus == "available" || c.ContainerStatus == "pending" {
+			activeContainers++
+		}
+	}
+	effectiveSlots := sess.MaxConcurrent
+	if effectiveSlots <= 0 {
+		effectiveSlots = 1
+	}
+
+	startCtx, cancel := context.WithTimeout(bm.s.ctx, 90*time.Second)
+	defer cancel()
+	launched, _, err := bm.startChallengeSlot(startCtx, rt, sess, ch, effectiveSlots, activeContainers)
+	if err != nil {
+		if errors.Is(err, errBenchmarkQuotaDeferred) {
+			writeErr(w, 409, "当前并发容器槽位已满，请先等待或停止其他正在运行的题目")
+			return
+		}
+		_ = bm.s.m.pg.AppendBenchmarkEvent(context.Background(), id, code, "slot_error", err.Error(), nil)
+		writeErr(w, 502, err.Error())
+		return
+	}
+
+	reloaded, _ := bm.s.m.pg.GetBenchmarkChallenge(context.Background(), id, code)
+	if reloaded == nil {
+		reloaded = ch
+	}
+	if launched {
+		_ = bm.s.m.pg.AppendBenchmarkEvent(context.Background(), id, code, "challenge_single_started",
+			fmt.Sprintf("已手动单独启动题目 %s（仅运行此题，不触发整套调度）", reloaded.Title), nil)
+		bm.ensureSingleChallengeWatch(id, rt, code)
+	}
+	writeJSON(w, 200, map[string]any{
+		"launched":  launched,
+		"challenge": reloaded,
+		"task_id":   reloaded.BoundTaskID,
+	})
+}
+
+// ensureSingleChallengeWatch runs a lightweight per-challenge monitor when a single
+// challenge is started manually without the full session scheduler loop, handling
+// container TTL renewal, optional stagnant Hint fetching, and container cleanup on exit.
+func (bm *BenchmarkManager) ensureSingleChallengeWatch(sessionID int64, rt *benchSessionRuntime, uniqueCode string) {
+	bm.mu.Lock()
+	if rt.cancel != nil {
+		// Full session loop is already active and will monitor this challenge.
+		bm.mu.Unlock()
+		return
+	}
+	if rt.singleWatch == nil {
+		rt.singleWatch = map[string]context.CancelFunc{}
+	}
+	if prev, ok := rt.singleWatch[uniqueCode]; ok && prev != nil {
+		prev()
+	}
+	wCtx, wCancel := context.WithCancel(bm.s.ctx)
+	rt.singleWatch[uniqueCode] = wCancel
+	bm.mu.Unlock()
+
+	go func() {
+		defer func() {
+			wCancel()
+			bm.mu.Lock()
+			delete(rt.singleWatch, uniqueCode)
+			bm.mu.Unlock()
+		}()
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-wCtx.Done():
+				return
+			case <-ticker.C:
+			}
+			// If full session loop started later, yield monitoring to it.
+			bm.mu.Lock()
+			fullRunning := rt.cancel != nil
+			bm.mu.Unlock()
+			if fullRunning {
+				return
+			}
+			sess, err := bm.s.m.pg.GetBenchmarkSession(wCtx, sessionID)
+			if err != nil || sess == nil {
+				return
+			}
+			ch, err := bm.s.m.pg.GetBenchmarkChallenge(wCtx, sessionID, uniqueCode)
+			if err != nil || ch == nil {
+				return
+			}
+			if ch.IsCompleted {
+				if ch.ContainerStatus == "available" || ch.ContainerStatus == "pending" {
+					_ = rt.prov.CloseEnvironment(wCtx, uniqueCode)
+					_ = bm.s.m.pg.UpdateBenchmarkChallengeEnv(wCtx, sessionID, uniqueCode, "stopped", nil, nil, "")
+				}
+				return
+			}
+			boundRunning := false
+			if ch.BoundTaskID != nil {
+				if t, ok := bm.s.m.Task(strconv.FormatInt(*ch.BoundTaskID, 10)); ok && !isTerminalStatus(t.lifecycleSnapshot().Status) {
+					boundRunning = true
+				}
+			}
+			if !boundRunning {
+				if ch.ContainerStatus == "available" || ch.ContainerStatus == "pending" {
+					_ = rt.prov.CloseEnvironment(wCtx, uniqueCode)
+					_ = bm.s.m.pg.UpdateBenchmarkChallengeEnv(wCtx, sessionID, uniqueCode, "stopped", nil, nil, "")
+				}
+				return
+			}
+			if ch.ContainerStatus == "available" || ch.ContainerStatus == "pending" {
+				bm.refreshActiveEnv(wCtx, rt, sess, ch)
+			}
+			bm.checkChallengeTimeoutAndHint(wCtx, rt, sess, ch, false)
+		}
+	}()
 }
 
 func (bm *BenchmarkManager) handleStopSession(w http.ResponseWriter, r *http.Request) {
@@ -801,9 +1009,17 @@ func isRemoteSessionTerminatedError(err error) bool {
 func (bm *BenchmarkManager) stopSession(sessionID int64, terminalStatus, reason string) {
 	bm.mu.Lock()
 	rt := bm.runs[sessionID]
-	if rt != nil && rt.cancel != nil {
-		rt.cancel()
-		rt.cancel = nil
+	if rt != nil {
+		if rt.cancel != nil {
+			rt.cancel()
+			rt.cancel = nil
+		}
+		for code, wCancel := range rt.singleWatch {
+			if wCancel != nil {
+				wCancel()
+			}
+			delete(rt.singleWatch, code)
+		}
 	}
 	bm.mu.Unlock()
 
