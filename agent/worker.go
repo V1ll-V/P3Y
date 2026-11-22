@@ -471,7 +471,11 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	system, boundary := deferredSystem(sysBody, def)
 	// 任务级 deadline(经 ctx 注入)夹逼本 run 的墙钟预算 + 决定收尾词(见 taskclock.go)。
 	tc := taskClockFrom(ctx)
-	maxDur, clamped := clampMaxDuration(tc.DeadlineUnix, w.runTimeout)
+	runBudget := w.runTimeout
+	if ctfMode {
+		runBudget = ctfRunBudgetForTask(ctx, w.workDir, ts, taskID, phase, runBudget)
+	}
+	maxDur, clamped := clampMaxDuration(tc.DeadlineUnix, runBudget)
 	settle := wrapupSettlement("worker", ctfExecutionTools)
 	if tc.DeadlineUnix > 0 {
 		settle = wrapupSettlementForTask("worker", ctfExecutionTools, clamped)

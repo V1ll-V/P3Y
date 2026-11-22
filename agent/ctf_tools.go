@@ -1043,6 +1043,24 @@ print("\n".join(out))`
 	return filtered
 }
 
+// ctfRunBudgetForTask extends the per-intent wall-clock budget to 30m only for
+// non-recon intents inside multi-stage CTF tasks that have already verified at
+// least one stage flag, keeping single-flag and recon budgets unchanged.
+func ctfRunBudgetForTask(ctx context.Context, workDir string, ts *db.ExplorationStore, taskID int64, phase string, base time.Duration) time.Duration {
+	if base <= 0 || base >= 30*time.Minute || phase == "recon" || ts == nil || taskID <= 0 {
+		return base
+	}
+	pg := ts.Database()
+	if pg == nil {
+		return base
+	}
+	prog, err := ctf.New(workDir, pg).Progress(ctx, taskID)
+	if err == nil && prog.AcceptedFlagCount >= 1 {
+		return 30 * time.Minute
+	}
+	return base
+}
+
 // Legacy run-directory instructions are superseded by the CTF execution scope.
 func ctfPrompt(root string, task, intent int64) string {
 	return fmt.Sprintf(`

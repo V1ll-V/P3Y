@@ -38,6 +38,7 @@ type benchSessionRuntime struct {
 	toolsLoaded      bool
 	lastEnvPoll      map[string]time.Time
 	taskStartAt      map[string]time.Time
+	lastFlagAt       map[string]time.Time
 	lastHintAttempt  map[string]time.Time
 	startingCodes    map[string]bool
 	singleWatch      map[string]context.CancelFunc
@@ -218,6 +219,7 @@ func (bm *BenchmarkManager) runtimeFor(sess *db.BenchmarkSession) (*benchSession
 		cfg:           cfg,
 		lastEnvPoll:   map[string]time.Time{},
 		taskStartAt:   map[string]time.Time{},
+		lastFlagAt:    map[string]time.Time{},
 		startingCodes: map[string]bool{},
 		singleWatch:   map[string]context.CancelFunc{},
 	}
@@ -1464,8 +1466,31 @@ func (bm *BenchmarkManager) checkChallengeTimeoutAndHint(ctx context.Context, rt
 	elapsed := time.Since(started)
 	timeout, isFirstPass := effectiveChallengeTimeout(sess, ch)
 	if sess.HintPolicy == "stagnant_only" && !isFirstPass && !ch.HintUsed && timeout > 0 {
+		// For multi-flag challenges that have already solved at least one stage flag,
+		// measure Hint stagnation from the latest accepted flag instead of task start,
+		// so actively progressing multi-stage solves do not suffer premature -10% hint penalties.
+		hintElapsed := elapsed
+		if ch.FlagCount > 1 && ch.CorrectFlagCount > 0 {
+			bm.mu.Lock()
+			if rt.lastFlagAt == nil {
+				rt.lastFlagAt = map[string]time.Time{}
+			}
+			lastSolved := rt.lastFlagAt[ch.UniqueCode]
+			bm.mu.Unlock()
+			if lastSolved.IsZero() {
+				if dbTS, qerr := bm.s.m.pg.LastAcceptedBenchmarkSubmissionAt(ctx, sess.ID, ch.UniqueCode); qerr == nil && !dbTS.IsZero() {
+					lastSolved = dbTS
+					bm.mu.Lock()
+					rt.lastFlagAt[ch.UniqueCode] = dbTS
+					bm.mu.Unlock()
+				}
+			}
+			if !lastSolved.IsZero() && lastSolved.After(started) {
+				hintElapsed = time.Since(lastSolved)
+			}
+		}
 		earlyWindow := min(20*time.Minute, timeout/2)
-		shouldFetch := elapsed >= timeout/2 || (earlyWindow > 0 && elapsed >= earlyWindow && bm.isChallengeStagnant(ctx, *ch.BoundTaskID))
+		shouldFetch := hintElapsed >= timeout/2 || (earlyWindow > 0 && hintElapsed >= earlyWindow && bm.isChallengeStagnant(ctx, *ch.BoundTaskID))
 		if shouldFetch {
 			bm.mu.Lock()
 			if rt.lastHintAttempt == nil {
@@ -1486,7 +1511,7 @@ func (bm *BenchmarkManager) checkChallengeTimeoutAndHint(ctx context.Context, rt
 					ch.HintUsed = true
 					ch.HintContent = cleanHint
 					if cleanHint != "" {
-						_ = bm.s.m.pg.AppendBenchmarkEvent(ctx, sess.ID, ch.UniqueCode, "hint_fetched", "停滞自动获取题目 Hint", map[string]any{"hint": cleanHint, "elapsed_sec": int(elapsed.Seconds())})
+						_ = bm.s.m.pg.AppendBenchmarkEvent(ctx, sess.ID, ch.UniqueCode, "hint_fetched", "停滞自动获取题目 Hint", map[string]any{"hint": cleanHint, "elapsed_sec": int(elapsed.Seconds()), "hint_elapsed_sec": int(hintElapsed.Seconds())})
 						if t, ok := bm.s.m.Task(strconv.FormatInt(*ch.BoundTaskID, 10)); ok {
 							_, _ = t.Store.AddNode("fact", map[string]any{
 								"summary": "【平台 Hint 提示】" + cleanHint,
@@ -2367,6 +2392,12 @@ func (bm *BenchmarkManager) submitToPlatform(ctx context.Context, sess *db.Bench
 	_ = bm.s.m.pg.UpdateBenchmarkChallengeProgress(ctx, sess.ID, ch.UniqueCode, newScore, newCorrectFlags, totalFlags, completed)
 
 	if res.Correct {
+		bm.mu.Lock()
+		if rt.lastFlagAt == nil {
+			rt.lastFlagAt = map[string]time.Time{}
+		}
+		rt.lastFlagAt[ch.UniqueCode] = time.Now()
+		bm.mu.Unlock()
 		candNote := "平台验证通过"
 		if normalizedFrom != "" {
 			candNote = fmt.Sprintf("自动归一化前缀 %s -> %s 平台验证通过", normalizedFrom, recordedAnswer)

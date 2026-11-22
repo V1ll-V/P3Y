@@ -1766,3 +1766,86 @@ func TestBenchmarkStartSingleChallengeIsolated(t *testing.T) {
 		t.Fatalf("expected ch-single-a environment closed after solve, closed=%+v", closedCodes)
 	}
 }
+
+func TestBenchmarkMultiStageHintResetsOnFlagProgress(t *testing.T) {
+	dataDir := t.TempDir()
+	m, err := NewManager(dataDir, "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) - skipping", err)
+	}
+	defer m.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := New(ctx, m, dataDir, dataDir, dataDir)
+
+	sess, err := s.m.pg.CreateBenchmarkSession(t.Context(), db.BenchmarkSessionCreate{
+		Name:                "multi-stage-hint-reset",
+		Provider:            "tsecbench",
+		BaseURL:             "https://tsecbench.example",
+		MaxConcurrent:       2,
+		HintPolicy:          "stagnant_only",
+		PerChallengeTimeout: 5400,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.m.pg.DeleteBenchmarkSession(context.Background(), sess.ID) })
+
+	if err := s.m.pg.SyncBenchmarkChallenges(t.Context(), sess.ID, []db.BenchmarkChallengeUpsert{{
+		UniqueCode:       "multi-hint-1",
+		Title:            "multi-hint-1",
+		Description:      "4-stage lab",
+		Category:         "web",
+		SubmissionType:   "flag",
+		TotalScore:       1200,
+		FlagCount:        4,
+		CorrectFlagCount: 1,
+		IsCompleted:      false,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	task, err := s.m.CreateTaskWithOptions("multi-hint-task", "goal", db.TaskCreateOptions{
+		Mode:               "ctf",
+		ChallengeType:      "web",
+		BenchmarkSessionID: &sess.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tid, _ := strconv.ParseInt(task.ID, 10, 64)
+	t.Cleanup(func() { _, _ = s.m.DeleteTask(task.ID, DeleteTaskOptions{DeleteFiles: true}) })
+	if err := s.m.pg.BindBenchmarkChallengeTask(t.Context(), sess.ID, "multi-hint-1", tid); err != nil {
+		t.Fatal(err)
+	}
+	// Create 1 exhausted intent so isChallengeStagnant() returns true.
+	if _, err := task.Store.AddNode("intent", map[string]any{"title": "prior stage"}, 0, "exhausted", "planner", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	prov := &mockStagnantHintProvider{}
+	rt := &benchSessionRuntime{
+		sessionID:   sess.ID,
+		prov:        prov,
+		lastEnvPoll: map[string]time.Time{},
+		taskStartAt: map[string]time.Time{"multi-hint-1": time.Now().Add(-25 * time.Minute)},
+		lastFlagAt:  map[string]time.Time{"multi-hint-1": time.Now().Add(-5 * time.Minute)},
+	}
+	ch, err := s.m.pg.GetBenchmarkChallenge(t.Context(), sess.ID, "multi-hint-1")
+	if err != nil || ch == nil {
+		t.Fatalf("GetBenchmarkChallenge: %v", err)
+	}
+
+	// 25 min since task start, but only 5 min since last accepted flag -> must NOT request Hint!
+	s.bench.checkChallengeTimeoutAndHint(t.Context(), rt, sess, ch, false)
+	if prov.hintCalls != 0 {
+		t.Fatalf("expected 0 GetHint calls when stage flag solved 5m ago, got %d", prov.hintCalls)
+	}
+
+	// Now simulate 22 min elapsed since last accepted flag -> MUST request Hint!
+	rt.lastFlagAt["multi-hint-1"] = time.Now().Add(-22 * time.Minute)
+	s.bench.checkChallengeTimeoutAndHint(t.Context(), rt, sess, ch, false)
+	if prov.hintCalls != 1 {
+		t.Fatalf("expected 1 GetHint call after 22m stagnation since last flag, got %d", prov.hintCalls)
+	}
+}

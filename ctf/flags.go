@@ -80,7 +80,11 @@ func ExtractFlags(text string, limit int) []string {
 			if loc[0] > 0 && isIdentChar(s[loc[0]-1]) {
 				continue
 			}
-			add(s[loc[0]:loc[1]])
+			cand := s[loc[0]:loc[1]]
+			if isLikelyNonLiteralFlag(cand) {
+				continue
+			}
+			add(cand)
 		}
 	}
 	extractMatches(text)
@@ -108,6 +112,34 @@ func ExtractFlags(text string, limit int) []string {
 	return out
 }
 
+// isLikelyNonLiteralFlag filters out obvious regex patterns (e.g. flag{[a-zA-Z0-9_-]*},
+// flag{[^}]+}) and truncated log excerpts (e.g. flag{fd7f...}) so they never get
+// auto-submitted as candidate flags, while preserving legitimate symbols inside real flags.
+func isLikelyNonLiteralFlag(value string) bool {
+	v := strings.TrimSpace(value)
+	l := strings.IndexByte(v, '{')
+	if l < 0 || !strings.HasSuffix(v, "}") {
+		return false
+	}
+	body := v[l+1 : len(v)-1]
+	if body == "" {
+		return true
+	}
+	if strings.Contains(body, "...") || strings.Contains(body, "…") {
+		return true
+	}
+	lower := strings.ToLower(body)
+	for _, pat := range []string{
+		"[a-z", "[0-9", "[^", "]*", "]+", "]?",
+		`\w`, `\d`, `\s`, ".*", ".+",
+	} {
+		if strings.Contains(lower, pat) {
+			return true
+		}
+	}
+	return false
+}
+
 // IsSelfConstructedMockFlag reports whether flag appears verbatim inside command
 // (e.g. a local dummy /tmp/flag test literal) or is an obvious single-character
 // repeated probe filler such as FLAG{AAAA} / FLAG{BBBB}, and therefore should not
@@ -116,6 +148,9 @@ func IsSelfConstructedMockFlag(command, value string) bool {
 	v := strings.TrimSpace(value)
 	if v == "" {
 		return false
+	}
+	if isLikelyNonLiteralFlag(v) {
+		return true
 	}
 	if command != "" && strings.Contains(strings.ToLower(command), strings.ToLower(v)) {
 		return true

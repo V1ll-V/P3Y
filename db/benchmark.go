@@ -763,6 +763,21 @@ WHERE session_id=$1 AND unique_code=$2 AND http_status > 0 AND correct = false
 	return n, err
 }
 
+// LastAcceptedBenchmarkSubmissionAt returns the timestamp of the most recent
+// accepted submission for a challenge (zero time if none yet), used to reset
+// multi-stage Hint stagnation windows after each stage flag is solved.
+func (d *DB) LastAcceptedBenchmarkSubmissionAt(ctx context.Context, sessionID int64, uniqueCode string) (time.Time, error) {
+	var ts sql.NullTime
+	err := d.QueryRowContext(ctx, `
+SELECT MAX(created_at) FROM benchmark_submissions
+WHERE session_id=$1 AND unique_code=$2 AND correct = true`,
+		sessionID, uniqueCode).Scan(&ts)
+	if err != nil || !ts.Valid {
+		return time.Time{}, err
+	}
+	return ts.Time, nil
+}
+
 func (d *DB) RecordBenchmarkSubmission(ctx context.Context, s BenchmarkSubmission) error {
 	h := benchmarkAnswerHash(s.SubFlagID, s.AnswerValue)
 	_, err := d.ExecContext(ctx, `
