@@ -397,13 +397,6 @@ func TestExtractIntentTagsFiltersNegativeClausesAndMatchesSpecifics(t *testing.T
 			t.Fatalf("forbidden/negative tag %q leaked into ExtractIntentTags: %v", forbid, tags)
 		}
 	}
-	// Word boundary check: "fast" / "cast" / "ajwt2" must NOT trigger short ASCII tags.
-	noise := ExtractIntentTags("fast cast my_handlebars_nope_no_match ajwt2 htmls")
-	if len(noise) != 0 {
-		// note: "my_handlebars_nope_no_match" actually contains "handlebars" substring because handlebars is long,
-		// so test pure short-word boundaries without handlebars:
-		t.Logf("noise=%v", noise)
-	}
 	shortNoise := ExtractIntentTags("fast cast ajwt2 htmls dexter rscx lfia")
 	if len(shortNoise) != 0 {
 		t.Fatalf("expected zero tags for boundary noise input, got %v", shortNoise)

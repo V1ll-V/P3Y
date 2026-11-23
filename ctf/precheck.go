@@ -92,7 +92,7 @@ var sharedTextTagRules = []textTagRule{
 	{tag: "nextjs", needles: []string{"nextjs", "next.js", "_next", "x-middleware-subrequest"}},
 	{tag: "middleware", needles: []string{"middleware", "中间件"}},
 	{tag: "ssrf", needles: []string{"ssrf", "server-side request", "服务端请求伪造"}},
-	{tag: "react", needles: []string{"react", "flight", "next.js", "rsc"}},
+	{tag: "react", needles: []string{"react", "reactjs", "flight", "next.js", "rsc"}, wordBoundary: true},
 	{tag: "rsc", needles: []string{"react flight", "flight 协议", "next-action", "cve-2025-55182", "rsc"}, wordBoundary: true},
 	{tag: "nodejs", needles: []string{"node.js", "nodejs", "express", "nextjs"}},
 	{tag: "nginx", needles: []string{"nginx", "x-accel-redirect"}},
