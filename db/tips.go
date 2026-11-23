@@ -132,20 +132,58 @@ func isCoarseCategoryTag(tag string) bool {
 	}
 }
 
+func isGenericSearchTag(tag string) bool {
+	if isCoarseCategoryTag(tag) {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(tag)) {
+	case "remote", "text", "zip", "kit", "recon", "internal", "network", "connect", "exploit", "diff", "probe", "mobile":
+		return true
+	default:
+		return false
+	}
+}
+
+// TipSearchOptions customizes tip retrieval relevance, category scope, deduplication, and score gating.
+type TipSearchOptions struct {
+	Category      string
+	Tags          []string
+	Limit         int
+	ExcludeIDs    map[int64]bool
+	CrossCategory bool
+	ExactTagsOnly bool
+	MinScore      float64
+}
+
 // SearchTips retrieves up to limit relevant tip cards scored by category/tag relevance plus Bayesian solve rate.
 func (d *DB) SearchTips(ctx context.Context, category string, tags []string, limit int) ([]TipCard, error) {
+	return d.SearchTipsWithOptions(ctx, TipSearchOptions{
+		Category: category,
+		Tags:     tags,
+		Limit:    limit,
+	})
+}
+
+// SearchTipsWithOptions retrieves relevant tip cards with optional exact-tag, cross-category,
+// exclusion, and minimum tag-score thresholds (read-only; callers decide whether to record hits).
+func (d *DB) SearchTipsWithOptions(ctx context.Context, opts TipSearchOptions) ([]TipCard, error) {
 	if d == nil {
 		return nil, nil
 	}
+	limit := opts.Limit
 	if limit <= 0 || limit > 20 {
 		limit = 5
 	}
-	all, err := d.ListTips(ctx, category, 200)
+	listCat := opts.Category
+	if opts.CrossCategory {
+		listCat = "all"
+	}
+	all, err := d.ListTips(ctx, listCat, 200)
 	if err != nil || len(all) == 0 {
 		return all, err
 	}
-	wantTags := normalizeTags(tags)
-	wantCat := strings.ToLower(strings.TrimSpace(category))
+	wantTags := normalizeTags(opts.Tags)
+	wantCat := strings.ToLower(strings.TrimSpace(opts.Category))
 
 	type scored struct {
 		card  TipCard
@@ -153,6 +191,9 @@ func (d *DB) SearchTips(ctx context.Context, category string, tags []string, lim
 	}
 	ranked := make([]scored, 0, len(all))
 	for _, c := range all {
+		if opts.ExcludeIDs[c.ID] {
+			continue
+		}
 		catBonus := 0.0
 		if wantCat != "" && wantCat != "auto" && c.Category == wantCat {
 			catBonus = 3.0
@@ -164,16 +205,23 @@ func (d *DB) SearchTips(ctx context.Context, category string, tags []string, lim
 		}
 		tagMatchScore := 0.0
 		for _, wt := range wantTags {
-			if isCoarseCategoryTag(wt) {
+			if opts.ExactTagsOnly {
+				if isGenericSearchTag(wt) {
+					continue
+				}
+			} else if isCoarseCategoryTag(wt) {
 				continue
 			}
 			if cardTagSet[wt] {
 				tagMatchScore += 5.0
-			} else if strings.Contains(hay, wt) {
+			} else if !opts.ExactTagsOnly && strings.Contains(hay, wt) {
 				tagMatchScore += 2.0
 			}
 		}
 		if len(wantTags) > 0 && tagMatchScore == 0 {
+			continue
+		}
+		if opts.MinScore > 0 && tagMatchScore < opts.MinScore {
 			continue
 		}
 		relScore := catBonus + tagMatchScore

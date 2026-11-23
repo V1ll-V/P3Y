@@ -102,14 +102,7 @@ func taskInputContextForRole(root string, ts *db.ExplorationStore, taskID, inten
 					fmt.Fprintf(&b, "识别靶标: %s\n", strings.Join(pre.Targets, ", "))
 				}
 				if len(pre.MatchedTips) > 0 {
-					b.WriteString("【命中避坑卡 Tips】\n")
-					limit := min(len(pre.MatchedTips), 3)
-					for _, tip := range pre.MatchedTips[:limit] {
-						fmt.Fprintf(&b, "- [%s] %s：%s\n", tip.Category, tip.Title, tip.Pitfall)
-						if code := strings.TrimSpace(tip.PatternCode); code != "" {
-							fmt.Fprintf(&b, "  参考模板：`%s`\n", strings.ReplaceAll(code, "\n", " ; "))
-						}
-					}
+					b.WriteString(formatTipCardsSection("【命中避坑卡 Tips】", pre.MatchedTips, 3))
 				}
 			}
 		}
@@ -215,4 +208,80 @@ func ctfPlannerStrategyHint(challenge string) string {
 	default:
 		return "请结合下方附件与态势决定并发拆分策略：互不依赖的表面侦察可并行派发；强因果耦合的分析与本地/远程联调应归入同一主攻意图，避免重复搭建环境。"
 	}
+}
+
+func formatTipCardsSection(header string, cards []db.TipCard, maxCards int) string {
+	if len(cards) == 0 {
+		return ""
+	}
+	if maxCards > 0 && len(cards) > maxCards {
+		cards = cards[:maxCards]
+	}
+	var b strings.Builder
+	b.WriteString(header)
+	b.WriteByte('\n')
+	for _, tip := range cards {
+		fmt.Fprintf(&b, "- [%s] %s：%s\n", tip.Category, tip.Title, tip.Pitfall)
+		if code := strings.TrimSpace(tip.PatternCode); code != "" {
+			fmt.Fprintf(&b, "  参考模板：`%s`\n", strings.ReplaceAll(code, "\n", " ; "))
+		}
+	}
+	return b.String()
+}
+
+// renderIntentSecondaryTips incrementally recalls up to 2 technique/kit TipCards matching
+// affirmative tags in the assigned Worker intent (read-only lookup; excludes cards already
+// shown by Phase-0 Precheck so hit_count and KV cache stay clean).
+func renderIntentSecondaryTips(ctx context.Context, ts *db.ExplorationStore, taskID int64, intent *db.Node) string {
+	if ts == nil || ts.Database() == nil || intent == nil || len(intent.Payload) == 0 {
+		return ""
+	}
+	var payload struct {
+		Summary string `json:"summary"`
+		Target  string `json:"target"`
+	}
+	var intentTexts []string
+	if json.Unmarshal(intent.Payload, &payload) == nil && (payload.Summary != "" || payload.Target != "") {
+		intentTexts = []string{payload.Summary, payload.Target}
+	} else {
+		intentTexts = []string{string(intent.Payload)}
+	}
+	tags := ctf.ExtractIntentTags(intentTexts...)
+	if len(tags) == 0 {
+		return ""
+	}
+	pg := ts.Database()
+	_, challenge, _, err := ts.TaskInputMetadata()
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return ""
+	}
+	cat := strings.ToLower(strings.TrimSpace(challenge))
+	excludeIDs := map[int64]bool{}
+	if taskID > 0 {
+		if preRaw, perr := pg.TaskPrecheck(ctx, taskID); perr == nil && len(preRaw) > 0 {
+			var pre ctf.PrecheckResult
+			if json.Unmarshal(preRaw, &pre) == nil {
+				if c := strings.ToLower(strings.TrimSpace(pre.InferredCategory)); c != "" && c != "auto" {
+					cat = c
+				}
+				shown := min(len(pre.MatchedTips), 3)
+				for _, tip := range pre.MatchedTips[:shown] {
+					excludeIDs[tip.ID] = true
+				}
+			}
+		}
+	}
+	cards, err := pg.SearchTipsWithOptions(ctx, db.TipSearchOptions{
+		Category:      cat,
+		Tags:          tags,
+		Limit:         2,
+		ExcludeIDs:    excludeIDs,
+		CrossCategory: true,
+		ExactTagsOnly: true,
+		MinScore:      5.0,
+	})
+	if err != nil || len(cards) == 0 {
+		return ""
+	}
+	return "\n" + formatTipCardsSection("【按本意图特征增量召回的专项武库 / 套件】", cards, 2)
 }

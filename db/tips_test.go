@@ -280,3 +280,90 @@ func TestSeedTipsFromFileIdempotent(t *testing.T) {
 		t.Fatalf("expected 0 inserted on second SeedTipsFromFile call, got %d", n2)
 	}
 }
+
+func TestSearchTipsWithOptionsExactCrossCategoryAndExclude(t *testing.T) {
+	d, _, err := DSN()
+	if err != nil {
+		t.Skip("test database required")
+	}
+	pg, err := Open(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pg.Close()
+
+	ctx := context.Background()
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	cWeb, err := pg.CreateTipCard(ctx, TipCard{
+		Category:    "web",
+		Tags:        []string{"lfi_" + suffix, "php", "remote"},
+		Title:       "LFI Card " + suffix,
+		Pitfall:     "Contains keyword uniquehay" + suffix,
+		PatternCode: "php_filter_chain_generator",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cMisc, err := pg.CreateTipCard(ctx, TipCard{
+		Category:    "misc",
+		Tags:        []string{"pcap_" + suffix, "remote"},
+		Title:       "Cross-Category PCAP Card " + suffix,
+		Pitfall:     "Analyze evidence.pcap",
+		PatternCode: "python3 /opt/ctf/kits/parse_pcap.py evidence.pcap",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = pg.DeleteTipCard(context.Background(), cWeb.ID)
+		_ = pg.DeleteTipCard(context.Background(), cMisc.ID)
+	})
+
+	// 1. Generic tag alone ("remote") with ExactTagsOnly + MinScore 5.0 must match NOTHING.
+	none, err := pg.SearchTipsWithOptions(ctx, TipSearchOptions{
+		Category:      "web",
+		Tags:          []string{"remote", "internal", "kit"},
+		Limit:         5,
+		CrossCategory: true,
+		ExactTagsOnly: true,
+		MinScore:      5.0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range none {
+		if c.ID == cWeb.ID || c.ID == cMisc.ID {
+			t.Fatalf("generic tags should not match under ExactTagsOnly+MinScore=5, got %+v", c)
+		}
+	}
+
+	// 2. Substring-only pitfall match ("uniquehay"+suffix) must NOT match when ExactTagsOnly=true.
+	noSub, err := pg.SearchTipsWithOptions(ctx, TipSearchOptions{
+		Category:      "web",
+		Tags:          []string{"uniquehay" + suffix},
+		Limit:         5,
+		ExactTagsOnly: true,
+		MinScore:      5.0,
+	})
+	if err != nil || len(noSub) != 0 {
+		t.Fatalf("expected 0 substring matches under ExactTagsOnly, got %+v err=%v", noSub, err)
+	}
+
+	// 3. CrossCategory recalls misc PCAP card even when preferred category is "web",
+	// and ExcludeIDs omits Phase-0 shown card without bumping hit_count.
+	got, err := pg.SearchTipsWithOptions(ctx, TipSearchOptions{
+		Category:      "web",
+		Tags:          []string{"lfi_" + suffix, "pcap_" + suffix},
+		Limit:         5,
+		ExcludeIDs:    map[int64]bool{cWeb.ID: true},
+		CrossCategory: true,
+		ExactTagsOnly: true,
+		MinScore:      5.0,
+	})
+	if err != nil || len(got) != 1 || got[0].ID != cMisc.ID {
+		t.Fatalf("expected only excluded-filtered cMisc (#%d), got %+v err=%v", cMisc.ID, got, err)
+	}
+	if got[0].HitCount != 0 {
+		t.Fatalf("expected read-only SearchTipsWithOptions not to increment hit_count, got %d", got[0].HitCount)
+	}
+}

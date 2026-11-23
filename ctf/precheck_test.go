@@ -377,3 +377,35 @@ func TestBaselinePlaceholderFlagsRemoteVsStaticAndMockFiller(t *testing.T) {
 		t.Fatalf("expected sibling fallback artifact /work/exp_ready.py, got %+v", recent)
 	}
 }
+
+func TestExtractIntentTagsFiltersNegativeClausesAndMatchesSpecifics(t *testing.T) {
+	// Orthogonal / exclusion remarks mentioning SSH, SSTI, LDAPS must be stripped,
+	// while affirmative targets (LFI, port forwarding, JWT) must be extracted accurately.
+	summary := `利用已确认的 services.php?lang= LFI(....// 双层绕过) 并通过 php://filter 读取源码，配合 jwt resettoken 与 端口转发 跳板隧道 做内网横向（与 #2096 面板扫描正交，且不重复其 SSH 爆破；已排除 SSTI 和 LDAPS）。fast last cast`
+	tags := ExtractIntentTags(summary)
+	got := map[string]bool{}
+	for _, tg := range tags {
+		got[tg] = true
+	}
+	for _, want := range []string{"lfi", "filter_chain", "php", "jwt", "tunnel", "pivot"} {
+		if !got[want] {
+			t.Fatalf("expected tag %q in ExtractIntentTags(%s), got %v", want, summary, tags)
+		}
+	}
+	for _, forbid := range []string{"ssti", "ldaps", "handlebars"} {
+		if got[forbid] {
+			t.Fatalf("forbidden/negative tag %q leaked into ExtractIntentTags: %v", forbid, tags)
+		}
+	}
+	// Word boundary check: "fast" / "cast" / "ajwt2" must NOT trigger short ASCII tags.
+	noise := ExtractIntentTags("fast cast my_handlebars_nope_no_match ajwt2 htmls")
+	if len(noise) != 0 {
+		// note: "my_handlebars_nope_no_match" actually contains "handlebars" substring because handlebars is long,
+		// so test pure short-word boundaries without handlebars:
+		t.Logf("noise=%v", noise)
+	}
+	shortNoise := ExtractIntentTags("fast cast ajwt2 htmls dexter rscx lfia")
+	if len(shortNoise) != 0 {
+		t.Fatalf("expected zero tags for boundary noise input, got %v", shortNoise)
+	}
+}

@@ -82,47 +82,174 @@ func extractTargets(texts ...string) []string {
 	return out
 }
 
-func extractTextTags(texts ...string) []string {
-	joined := strings.ToLower(strings.Join(texts, "\n"))
-	rules := []struct {
-		tag     string
-		needles []string
-	}{
-		{"nextjs", []string{"nextjs", "next.js", "_next", "x-middleware-subrequest"}},
-		{"middleware", []string{"middleware", "中间件"}},
-		{"ssrf", []string{"ssrf", "server-side request", "服务端请求伪造"}},
-		{"react", []string{"react", "flight", "next.js", "rsc"}},
-		{"nodejs", []string{"node.js", "nodejs", "express", "nextjs"}},
-		{"nginx", []string{"nginx", "x-accel-redirect"}},
-		{"php", []string{"php", "php_serialize", ".php"}},
-		{"session", []string{"session", "phpsessid", "cookie"}},
-		{"unserialize", []string{"unserialize", "反序列化", "php_serialize"}},
-		{"lfi", []string{"lfi", "php://filter", "include(", "文件包含"}},
-		{"postgres", []string{"postgres", "postgresql", "pg_read_file", "dblink"}},
-		{"dblink", []string{"dblink"}},
-		{"sql", []string{"sql", "sqli", "注入", "postgres", "mysql", "sqlite"}},
-		{"waf", []string{"waf", "防火墙", "拦截"}},
-		{"python", []string{"python", "bottle", "flask", "jinja", "werkzeug"}},
-		{"bottle", []string{"bottle"}},
-		{"jinja2", []string{"jinja", "flask"}},
-		{"ssti", []string{"ssti", "模板注入", "template injection", "bottle", "jinja"}},
-		{"captcha", []string{"captcha", "验证码"}},
-		{"pow", []string{"proof of work", "工作量证明", "pow"}},
-		{"race_condition", []string{"race condition", "race_condition", "竞态", "并发", "双花"}},
-		{"pwn", []string{"pwn", "rop", "glibc", "seccomp", "execve", "shellcode", "heap", "llvm", "rustc", "uaf"}},
-		{"reverse", []string{"reverse", "逆向", "crackme", "反编译", "decompile"}},
-		{"crypto", []string{"crypto", "密码", "3pc", "mpc", "mp-spdz", "elliptic", "lattice", "lwe", "rsa"}},
+type textTagRule struct {
+	tag          string
+	needles      []string
+	wordBoundary bool
+}
+
+var sharedTextTagRules = []textTagRule{
+	{tag: "nextjs", needles: []string{"nextjs", "next.js", "_next", "x-middleware-subrequest"}},
+	{tag: "middleware", needles: []string{"middleware", "中间件"}},
+	{tag: "ssrf", needles: []string{"ssrf", "server-side request", "服务端请求伪造"}},
+	{tag: "react", needles: []string{"react", "flight", "next.js", "rsc"}},
+	{tag: "rsc", needles: []string{"react flight", "flight 协议", "next-action", "cve-2025-55182", "rsc"}, wordBoundary: true},
+	{tag: "nodejs", needles: []string{"node.js", "nodejs", "express", "nextjs"}},
+	{tag: "nginx", needles: []string{"nginx", "x-accel-redirect"}},
+	{tag: "php", needles: []string{"php", "php_serialize", ".php"}},
+	{tag: "session", needles: []string{"session", "phpsessid", "session_upload_progress"}},
+	{tag: "unserialize", needles: []string{"unserialize", "反序列化", "php_serialize"}},
+	{tag: "lfi", needles: []string{"lfi", "php://filter", "include(", "文件包含"}, wordBoundary: true},
+	{tag: "filter_chain", needles: []string{"php://filter", "filter chain", "filter_chain"}},
+	{tag: "postgres", needles: []string{"postgres", "postgresql", "pg_read_file", "dblink"}},
+	{tag: "dblink", needles: []string{"dblink"}},
+	{tag: "sql", needles: []string{"sql", "sqli", "注入", "postgres", "mysql", "sqlite"}},
+	{tag: "waf", needles: []string{"waf", "防火墙", "拦截"}, wordBoundary: true},
+	{tag: "python", needles: []string{"python", "bottle", "flask", "jinja", "werkzeug"}},
+	{tag: "bottle", needles: []string{"bottle"}},
+	{tag: "jinja2", needles: []string{"jinja", "flask"}},
+	{tag: "handlebars", needles: []string{"handlebars", "mustachestatement", "numberliteral"}},
+	{tag: "ssti", needles: []string{"ssti", "模板注入", "template injection", "bottle", "jinja", "handlebars"}},
+	{tag: "jwt", needles: []string{"jwt", "jsonwebtoken", "alg=none", "eyjhb", "resettoken"}, wordBoundary: true},
+	{tag: "ldaps", needles: []string{"ldaps", "ldap://", "ldaps://"}, wordBoundary: true},
+	{tag: "jndi", needles: []string{"jndi", "beanfactory", "elprocessor"}, wordBoundary: true},
+	{tag: "tls", needles: []string{"tls", "sni", "自签证书", "sslcontext", "ssl=true"}, wordBoundary: true},
+	{tag: "android", needles: []string{"android", "androidmanifest", ".apk", "apk"}},
+	{tag: "axml", needles: []string{"axml", "androidmanifest"}, wordBoundary: true},
+	{tag: "dex", needles: []string{"classes.dex", "dalvik", "dex"}, wordBoundary: true},
+	{tag: "minecraft", needles: []string{"minecraft", "mcproto", "aes-cfb8"}},
+	{tag: "pcap", needles: []string{"pcap", "pcapng", "流量包", "tshark"}},
+	{tag: "portscan", needles: []string{"端口扫描", "全端口", "nmap", "masscan", "portscan"}},
+	{tag: "tunnel", needles: []string{"端口转发", "隧道", "跳板", "内网穿透", "socks5", "proxychains", "tcp_fwd", "tunnel"}},
+	{tag: "pivot", needles: []string{"内网横向", "二层网段", "深层网段", "跳板", "pivot"}},
+	{tag: "captcha", needles: []string{"captcha", "验证码"}},
+	{tag: "pow", needles: []string{"proof of work", "工作量证明", "pow"}},
+	{tag: "race_condition", needles: []string{"race condition", "race_condition", "竞态", "并发", "双花"}},
+	{tag: "pwn", needles: []string{"pwn", "rop", "glibc", "seccomp", "execve", "shellcode", "heap", "llvm", "rustc", "uaf"}},
+	{tag: "reverse", needles: []string{"reverse", "逆向", "crackme", "反编译", "decompile"}},
+	{tag: "crypto", needles: []string{"crypto", "密码", "3pc", "mpc", "mp-spdz", "elliptic", "lattice", "lwe", "rsa"}},
+}
+
+func isASCIIAlphaNum(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+}
+
+func containsNeedleWithBoundary(text, needle string, wordBoundary bool) bool {
+	if !wordBoundary {
+		return strings.Contains(text, needle)
 	}
+	checkLeft := len(needle) > 0 && isASCIIAlphaNum(needle[0])
+	checkRight := len(needle) > 0 && isASCIIAlphaNum(needle[len(needle)-1])
+	if !checkLeft && !checkRight {
+		return strings.Contains(text, needle)
+	}
+	for off := 0; off < len(text); {
+		idx := strings.Index(text[off:], needle)
+		if idx < 0 {
+			return false
+		}
+		start := off + idx
+		end := start + len(needle)
+		leftOK := !checkLeft || start == 0 || !isASCIIAlphaNum(text[start-1])
+		rightOK := !checkRight || end == len(text) || !isASCIIAlphaNum(text[end])
+		if leftOK && rightOK {
+			return true
+		}
+		off = start + 1
+	}
+	return false
+}
+
+var negativeClauseMarkers = []string{
+	"不碰", "不重复", "已排除", "排除", "正交", "刻意区分", "区别于",
+	"勿测", "避免", "并非", "不再", "跳过", "独立于", "无需", "不走",
+}
+
+func hasNegativeClauseMarker(s string) bool {
+	for _, m := range negativeClauseMarkers {
+		if strings.Contains(s, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// stripNegativeClauses drops parenthetical remarks and short comma/semicolon
+// segments containing exclusion cues (e.g. "（与 #2096 SSH 爆破正交，不重复）")
+// so rejected techniques never re-trigger mid-run tip recall.
+func stripNegativeClauses(s string) string {
+	var cleanParens strings.Builder
+	runes := []rune(s)
+	for i := 0; i < len(runes); {
+		r := runes[i]
+		if r == '(' || r == '（' {
+			depth := 1
+			j := i + 1
+			for j < len(runes) && depth > 0 {
+				if runes[j] == '(' || runes[j] == '（' {
+					depth++
+				} else if runes[j] == ')' || runes[j] == '）' {
+					depth--
+				}
+				j++
+			}
+			block := string(runes[i:j])
+			if hasNegativeClauseMarker(block) {
+				cleanParens.WriteByte(' ')
+			} else {
+				cleanParens.WriteString(block)
+			}
+			i = j
+			continue
+		}
+		cleanParens.WriteRune(r)
+		i++
+	}
+	clauses := strings.FieldsFunc(cleanParens.String(), func(r rune) bool {
+		return r == '。' || r == '；' || r == ';' || r == '\n' || r == '，' || r == ','
+	})
+	kept := make([]string, 0, len(clauses))
+	for _, cl := range clauses {
+		if hasNegativeClauseMarker(cl) {
+			continue
+		}
+		kept = append(kept, cl)
+	}
+	return strings.Join(kept, " ")
+}
+
+// ExtractTextTags extracts canonical technique/framework tags from arbitrary text.
+func ExtractTextTags(texts ...string) []string {
+	joined := strings.ToLower(strings.Join(texts, "\n"))
 	var out []string
-	for _, r := range rules {
+	for _, r := range sharedTextTagRules {
 		for _, nd := range r.needles {
-			if strings.Contains(joined, nd) {
+			if containsNeedleWithBoundary(joined, nd, r.wordBoundary) {
 				out = append(out, r.tag)
 				break
 			}
 		}
 	}
 	return out
+}
+
+// ExtractIntentTags strips orthogonal/exclusion clauses from Planner intent descriptions
+// before extracting specific technique tags for mid-run secondary tip recall.
+func ExtractIntentTags(texts ...string) []string {
+	cleaned := make([]string, 0, len(texts))
+	for _, t := range texts {
+		if s := strings.TrimSpace(stripNegativeClauses(t)); s != "" {
+			cleaned = append(cleaned, s)
+		}
+	}
+	if len(cleaned) == 0 {
+		return nil
+	}
+	return ExtractTextTags(cleaned...)
+}
+
+func extractTextTags(texts ...string) []string {
+	return ExtractTextTags(texts...)
 }
 
 func inspectArtifactFile(a artifacts.Artifact, diskPath string) PrecheckFile {

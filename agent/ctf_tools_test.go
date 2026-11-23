@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"p3y/ctf"
 	"p3y/db"
 	actool "github.com/Autumn-27/norma/tool"
 	"strings"
@@ -318,5 +319,104 @@ func TestCTFDomainToolpacksAndWebSkillUnlock(t *testing.T) {
 	}
 	if !def.Unlock.Has("ctf_decompile") || !def.Unlock.Has("ctf_pwn_triage") {
 		t.Fatal("expected binary pack tools to be unlocked in shared UnlockSet")
+	}
+}
+
+func TestRenderIntentSecondaryTipsRecallsWithoutDupOrHitBump(t *testing.T) {
+	dsn, _, err := db.DSN()
+	if err != nil {
+		t.Skip("postgres test database required")
+	}
+	pg, err := db.Open(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pg.Close()
+
+	ctx := t.Context()
+	cLFI, err := pg.CreateTipCard(ctx, db.TipCard{
+		Category:    "web",
+		Tags:        []string{"web", "lfi", "filter_chain", "kit"},
+		Title:       "[KIT] Dynamic Test LFI Filter Chain",
+		Pitfall:     "Use php_filter_chain_generator for blind include",
+		PatternCode: "python3 /opt/ctf/kits/php_filter_chain_generator.py --chain '<?php id; ?>'",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cPhase0, err := pg.CreateTipCard(ctx, db.TipCard{
+		Category:    "web",
+		Tags:        []string{"web", "session", "kit"},
+		Title:       "[KIT] Phase0 Already Shown Card",
+		Pitfall:     "Already injected by Phase-0 precheck",
+		PatternCode: "session_inject.py",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cExcluded, err := pg.CreateTipCard(ctx, db.TipCard{
+		Category:    "web",
+		Tags:        []string{"web", "handlebars", "ssti"},
+		Title:       "[KIT] Excluded Orthogonal Card",
+		Pitfall:     "Must NOT be recalled when excluded in parens",
+		PatternCode: "exp_render.py",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = pg.DeleteTipCard(context.Background(), cLFI.ID)
+		_ = pg.DeleteTipCard(context.Background(), cPhase0.ID)
+		_ = pg.DeleteTipCard(context.Background(), cExcluded.ID)
+	})
+
+	task, err := pg.CreateTaskWithOptions("secondary-recall-test", "Explore web target", db.TaskCreateOptions{
+		Mode:          "ctf",
+		ChallengeType: "web",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pg.DeleteTask(task.ID) })
+
+	// Save Phase-0 Precheck containing cPhase0 so secondary recall must deduplicate it.
+	preRaw, _ := json.Marshal(ctf.PrecheckResult{
+		TaskID:           task.ID,
+		InferredCategory: "web",
+		MatchedTips:      []db.TipCard{*cPhase0},
+	})
+	if err := pg.SaveTaskPrecheck(ctx, task.ID, preRaw); err != nil {
+		t.Fatal(err)
+	}
+
+	ts := pg.Exploration(task.ExplorationID)
+	intent := &db.Node{
+		ID: 42,
+		Payload: json.RawMessage(`{
+			"summary": "利用 services.php LFI 与 php://filter 拿 RCE，同时复用 session_inject（已排除 Handlebars SSTI，与此前正交不重复）",
+			"target": "http://10.0.181.184/services.php?lang=en"
+		}`),
+	}
+
+	rendered := renderIntentSecondaryTips(ctx, ts, task.ID, intent)
+	if !strings.Contains(rendered, "Dynamic Test LFI Filter Chain") {
+		t.Fatalf("expected LFI card recalled in secondary tips, got:\n%s", rendered)
+	}
+	if strings.Contains(rendered, "Phase0 Already Shown Card") {
+		t.Fatalf("expected Phase-0 shown card deduplicated, got:\n%s", rendered)
+	}
+	if strings.Contains(rendered, "Excluded Orthogonal Card") {
+		t.Fatalf("expected orthogonal/excluded Handlebars card NOT recalled, got:\n%s", rendered)
+	}
+
+	// Verify read-only lookup did not bump hit_count on cLFI.
+	cards, err := pg.ListTips(ctx, "web", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range cards {
+		if c.ID == cLFI.ID && c.HitCount != 0 {
+			t.Fatalf("expected read-only secondary recall not to bump HitCount, got %d", c.HitCount)
+		}
 	}
 }

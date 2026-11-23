@@ -449,6 +449,11 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		fmt.Fprintf(&brief, "\n\n【本意图专属工作目录】：%s（已自动创建，相对路径即写在此处）", runDir)
 	}
 	brief.WriteString(renderIntentTask(intent))
+	if ctfMode {
+		if secTips := renderIntentSecondaryTips(ctx, ts, taskID, intent); secTips != "" {
+			brief.WriteString(secTips)
+		}
+	}
 	if as != nil {
 		if ids := intentAssetIDs(intent); len(ids) > 0 {
 			if assets, err := as.GetByIDs(ids); err == nil && len(assets) > 0 {
